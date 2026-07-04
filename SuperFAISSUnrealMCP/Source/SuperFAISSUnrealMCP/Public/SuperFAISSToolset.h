@@ -46,12 +46,16 @@ public:
 	 * RowIndex (>= 0), or Vector (raw floats, must match the bank's dimensions).
 	 * Returns ranked hits with index, id, score, and margin (the gap to the next
 	 * hit). ScoreAsDot scores with the dot kernel regardless of bank metric — the
-	 * axis-projection path on L2 banks; identity elsewhere.
+	 * axis-projection path on L2 banks; identity elsewhere. On channel banks
+	 * (schemaVersion 2), ChannelNames + ChannelWeights (parallel arrays) rank by a
+	 * weighted combination of named channels; on Cosine channel banks each
+	 * channel's score is a true per-channel cosine. Empty = whole-row query.
 	 */
 	UFUNCTION(meta = (AICallable), Category = "SuperFAISS")
 	static FString QueryBank(const FString& BankPath, const FString& RowId,
-		int32 RowIndex, const TArray<float>& Vector, int32 K = 10,
-		bool bScoreAsDot = false);
+		int32 RowIndex, const TArray<float>& Vector,
+		const TArray<FString>& ChannelNames, const TArray<float>& ChannelWeights,
+		int32 K = 10, bool bScoreAsDot = false);
 
 	/**
 	 * Query by prototype ("the category's center"): the centroid of the listed rows
@@ -91,10 +95,32 @@ public:
 
 	/**
 	 * Health analyses for one bank: near-duplicate rows (examined rows are sampled
-	 * above SampleLimit — the report says so), low-variance dimensions. Cost scales
-	 * with bank size; run on demand, not routinely.
+	 * above SampleLimit — the report says so), low-variance dimensions; on channel
+	 * banks also per-channel near-duplicates, degenerate channels, and weak
+	 * channels (rows whose channel carries almost no energy). Cost scales with
+	 * bank size; run on demand, not routinely.
 	 */
 	UFUNCTION(meta = (AICallable), Category = "SuperFAISS")
 	static FString LintBank(const FString& BankPath, float DuplicateThreshold = 0.999f,
 		int32 SampleLimit = 4096, float VarianceEpsilon = 0.00000001f);
+
+	/**
+	 * Lists live scratch banks (runtime, mutable, in-memory — NPC memory and other
+	 * session-accumulated embeddings; they are not assets). Read-only: scratch
+	 * banks are mutated by game code, never through MCP.
+	 */
+	UFUNCTION(meta = (AICallable), Category = "SuperFAISS")
+	static FString ListScratchBanks();
+
+	/** Metadata for one live scratch bank, by the object path ListScratchBanks reported. */
+	UFUNCTION(meta = (AICallable), Category = "SuperFAISS")
+	static FString DescribeScratchBank(const FString& ScratchBankPath);
+
+	/**
+	 * Exact top-K query against a live scratch bank (by object path). Vector query
+	 * only — scratch rows carry no ids. Removed rows are excluded automatically.
+	 */
+	UFUNCTION(meta = (AICallable), Category = "SuperFAISS")
+	static FString QueryScratchBank(const FString& ScratchBankPath,
+		const TArray<float>& Vector, int32 K = 10);
 };

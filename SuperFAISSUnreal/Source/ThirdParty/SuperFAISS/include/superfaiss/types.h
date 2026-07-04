@@ -42,6 +42,18 @@ inline constexpr int32_t kAlignment = 16;
 // scan at chunk granularity. ~64 KB of row data per chunk.
 inline constexpr int32_t kChunkBytes = 64 * 1024;
 
+// A named channel's range (names live host-side; the core is name-free): a
+// contiguous element run on the 16-byte element grid. Channels are ascending and
+// non-overlapping; kMaxChannels matches kMaxSegments (channels are the bank-side
+// twin of query segments).
+struct ChannelInfo
+{
+	int32_t offset = 0;
+	int32_t length = 0;
+};
+
+inline constexpr int32_t kMaxChannels = 8;
+
 // A non-owning view of a baked bank. The library never allocates or frees bank memory.
 struct BankView
 {
@@ -52,6 +64,14 @@ struct BankView
 	int32_t paddedDims = 0;        // stride in elements; pad lanes are zero
 	Quantization quant = Quantization::Float32;
 	Metric metric = Metric::Dot;
+	// Optional channel table (schemaVersion 2 banks). For Cosine banks with channels,
+	// channelInvNorms holds count x channelCount per-row inverse sub-norms baked from
+	// the QUANTIZED rows (the reported per-channel cosine is the cosine of what the
+	// kernel actually dots); a zero-norm row channel stores 0 and scores 0 for that
+	// segment - defined, never NaN.
+	const ChannelInfo* channels = nullptr;
+	int32_t channelCount = 0;
+	const float* channelInvNorms = nullptr;
 };
 
 struct Hit
@@ -71,6 +91,23 @@ enum class ScoreAs : uint8_t
 	Dot = 1,
 };
 
+// One segment of a segmented query (the V2 unifying design): a contiguous element
+// range of the row with a scalar weight. Offsets and lengths lie on the 16-byte
+// element grid for the bank's quantization; segments are ascending, non-overlapping.
+// A mask is a range simply omitted from the list (those bytes are never read); a
+// weight-0 segment is equivalent to omission. Scores combine additively:
+// total = sum(weight_s * partial_s), valid for dot and squared-L2 alike.
+struct QuerySegment
+{
+	int32_t offset = 0; // elements
+	int32_t length = 0; // elements
+	float weight = 1.0f;
+};
+
+// Segment-count cap per query: covers the named use cases, bounds accumulator and
+// result-buffer sizing, keeps per-row loop overhead predictable. Raising is additive.
+inline constexpr int32_t kMaxSegments = 8;
+
 struct QueryParams
 {
 	int32_t k = 0;
@@ -78,6 +115,11 @@ struct QueryParams
 	// Null means no exclusions.
 	const uint32_t* excludeBits = nullptr;
 	ScoreAs scoreAs = ScoreAs::BankMetric;
+	// Optional segmented query: null means the whole row at weight 1 (the V1 path,
+	// bit-identical). The degenerate one-segment list (0, paddedDims, 1.0) is also
+	// bit-identical to the V1 path by construction.
+	const QuerySegment* segments = nullptr;
+	int32_t segmentCount = 0;
 };
 
 // The metric a query with these params is actually scored (and its hits ordered) by.

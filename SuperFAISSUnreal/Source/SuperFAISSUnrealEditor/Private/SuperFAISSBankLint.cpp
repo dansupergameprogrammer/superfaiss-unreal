@@ -140,6 +140,176 @@ bool FSuperFAISSBankLint::FindLowVarianceDims(
 	return true;
 }
 
+bool FSuperFAISSBankLint::FindNearDuplicatesInChannel(
+	const USuperFAISSVectorBank* Bank,
+	FName Channel,
+	float Threshold,
+	int32 SampleLimit,
+	FSuperFAISSLintReport& InOut)
+{
+	if (Bank == nullptr || !Bank->IsValid() || SampleLimit <= 0 ||
+		Bank->GetChannelIndex(Channel) == INDEX_NONE)
+	{
+		return false;
+	}
+	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+	if (Subsystem == nullptr)
+	{
+		return false;
+	}
+
+	const int32 Count = Bank->Count;
+	const bool bL2 = Bank->Metric == ESuperFAISSBankMetric::L2;
+	InOut.bSampled = Count > SampleLimit;
+	const int32 Stride = InOut.bSampled ? FMath::DivideAndRoundUp(Count, SampleLimit) : 1;
+
+	TArray<int32> Examined;
+	TArray<float> Queries;
+	TArray<float> RowQuery;
+	for (int32 R = 0; R < Count; R += Stride)
+	{
+		if (!Subsystem->MakeCentroidQuery(Bank, {R}, RowQuery))
+		{
+			return false;
+		}
+		Examined.Add(R);
+		Queries.Append(RowQuery);
+	}
+	InOut.RowsExamined = Examined.Num();
+
+	FSuperFAISSQueryArgs Args;
+	Args.K = 2;
+	Args.Channels = {{Channel, 1.0f}};
+	TArray<FSuperFAISSHit> Hits;
+	TArray<int32> Counts;
+	if (!Subsystem->QueryBatch(Bank, Queries, Examined.Num(), Args, Hits, Counts))
+	{
+		return false;
+	}
+
+	for (int32 E = 0; E < Examined.Num(); ++E)
+	{
+		if (Counts[E] < 2)
+		{
+			continue;
+		}
+		for (int32 i = 0; i < 2; ++i)
+		{
+			const FSuperFAISSHit& H = Hits[E * 2 + i];
+			if (H.Index == Examined[E])
+			{
+				continue;
+			}
+			const bool bTrips = bL2 ? H.Score <= Threshold : H.Score >= Threshold;
+			if (bTrips)
+			{
+				FSuperFAISSNearDuplicate Dup;
+				Dup.RowA = FMath::Min(Examined[E], H.Index);
+				Dup.RowB = FMath::Max(Examined[E], H.Index);
+				Dup.Score = H.Score;
+				Dup.Channel = Channel;
+				const bool bAlready = InOut.NearDuplicates.ContainsByPredicate(
+					[&Dup](const FSuperFAISSNearDuplicate& X)
+					{
+						return X.RowA == Dup.RowA && X.RowB == Dup.RowB &&
+							X.Channel == Dup.Channel;
+					});
+				if (!bAlready)
+				{
+					InOut.NearDuplicates.Add(Dup);
+				}
+			}
+		}
+	}
+	return true;
+}
+
+bool FSuperFAISSBankLint::FindDegenerateChannels(
+	const USuperFAISSVectorBank* Bank,
+	float VarianceEpsilon,
+	FSuperFAISSLintReport& InOut)
+{
+	if (Bank == nullptr || !Bank->IsValid() || Bank->Count <= 0 ||
+		Bank->GetChannelCount() == 0)
+	{
+		return false;
+	}
+	const superfaiss::BankView View = Bank->GetBankView();
+
+	for (int32 C = 0; C < Bank->GetChannelCount(); ++C)
+	{
+		bool bDegenerate = true;
+		const int32 Begin = Bank->ChannelOffsets[C];
+		const int32 End = FMath::Min(Begin + Bank->ChannelLengths[C], View.dims);
+		for (int32 J = Begin; J < End && bDegenerate; ++J)
+		{
+			double Mean = 0.0;
+			for (int32 R = 0; R < View.count; ++R)
+			{
+				Mean += LintRowElem(View, R, J);
+			}
+			Mean /= View.count;
+			double Var = 0.0;
+			for (int32 R = 0; R < View.count; ++R)
+			{
+				const double D = LintRowElem(View, R, J) - Mean;
+				Var += D * D;
+			}
+			Var /= View.count;
+			if (Var > VarianceEpsilon)
+			{
+				bDegenerate = false;
+			}
+		}
+		if (bDegenerate)
+		{
+			InOut.DegenerateChannels.Add(Bank->ChannelNames[C]);
+		}
+	}
+	return true;
+}
+
+bool FSuperFAISSBankLint::FindWeakChannels(
+	const USuperFAISSVectorBank* Bank,
+	float EnergyFloor,
+	FSuperFAISSLintReport& InOut)
+{
+	if (Bank == nullptr || !Bank->IsValid() ||
+		Bank->Metric != ESuperFAISSBankMetric::Cosine || Bank->GetChannelCount() == 0)
+	{
+		return false;
+	}
+	const TConstArrayView<float> InvNorms = Bank->GetChannelInvNorms();
+	const int32 ChannelCount = Bank->GetChannelCount();
+	if (InvNorms.Num() != static_cast<int64>(Bank->Count) * ChannelCount)
+	{
+		return false;
+	}
+	for (int32 C = 0; C < ChannelCount; ++C)
+	{
+		FSuperFAISSWeakChannel Weak;
+		Weak.Channel = Bank->ChannelNames[C];
+		for (int32 R = 0; R < Bank->Count; ++R)
+		{
+			const float Inv = InvNorms[static_cast<int64>(R) * ChannelCount + C];
+			// Rows are whole-normalized, so the squared sub-norm is the channel's
+			// energy fraction; inverse 0 means a zero-norm channel (fraction 0).
+			const float Fraction =
+				Inv > 0.0f ? 1.0f / (Inv * Inv) : 0.0f;
+			if (Fraction < EnergyFloor)
+			{
+				++Weak.RowsBelowFloor;
+			}
+			Weak.WorstEnergyFraction = FMath::Min(Weak.WorstEnergyFraction, Fraction);
+		}
+		if (Weak.RowsBelowFloor > 0)
+		{
+			InOut.WeakChannels.Add(Weak);
+		}
+	}
+	return true;
+}
+
 bool FSuperFAISSBankLint::FindPrototypeOverlaps(
 	TConstArrayView<const USuperFAISSPrototypeAsset*> Prototypes,
 	float Threshold,

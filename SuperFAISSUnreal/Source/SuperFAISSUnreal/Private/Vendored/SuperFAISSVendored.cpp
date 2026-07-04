@@ -15,3 +15,4 @@
 #include "../../../ThirdParty/SuperFAISS/src/query.cpp"
 #include "../../../ThirdParty/SuperFAISS/src/compose.cpp"
 #include "../../../ThirdParty/SuperFAISS/src/pca.cpp"
+#include "../../../ThirdParty/SuperFAISS/src/scratch.cpp"

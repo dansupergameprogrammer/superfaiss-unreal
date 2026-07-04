@@ -30,7 +30,10 @@ bool USuperFAISSVectorBank::InitFromSource(
 	ESuperFAISSBankQuantization InQuantization,
 	TConstArrayView<FName> InIds,
 	const FString& InSourceHash,
-	FString& OutError)
+	FString& OutError,
+	TConstArrayView<FName> InChannelNames,
+	TConstArrayView<int32> InChannelOffsets,
+	TConstArrayView<int32> InChannelLengths)
 {
 	using namespace superfaiss;
 
@@ -104,7 +107,56 @@ bool USuperFAISSVectorBank::InitFromSource(
 		}
 	}
 
-	SchemaVersion = kSchemaVersion;
+	// Channel table (schemaVersion 2): grid-aligned offsets; a length may end
+	// exactly at dims (the stored table extends it across the zero pad lanes).
+	ChannelNames.Reset();
+	ChannelOffsets.Reset();
+	ChannelLengths.Reset();
+	ChannelRecallAt10.Reset();
+	ChannelInvNorms.Reset();
+	if (InChannelNames.Num() > 0)
+	{
+		const int32 ChannelCount = InChannelNames.Num();
+		if (ChannelCount > superfaiss::kMaxChannels ||
+			InChannelOffsets.Num() != ChannelCount ||
+			InChannelLengths.Num() != ChannelCount)
+		{
+			OutError = FString::Printf(TEXT("bad channel table (%d names, %d offsets, %d lengths; max %d)"),
+				ChannelCount, InChannelOffsets.Num(), InChannelLengths.Num(),
+				superfaiss::kMaxChannels);
+			return false;
+		}
+		const int32 Grid = superfaiss::kAlignment / superfaiss::ElementSize(CoreQuant);
+		TSet<FName> UniqueNames;
+		int32 PrevEnd = 0;
+		for (int32 C = 0; C < ChannelCount; ++C)
+		{
+			const int32 Offset = InChannelOffsets[C];
+			const int32 Length = InChannelLengths[C];
+			const bool bEndsAtDims = Offset + Length == InDims;
+			if (InChannelNames[C].IsNone() || Offset < 0 || Length <= 0 ||
+				Offset % Grid != 0 || (Length % Grid != 0 && !bEndsAtDims) ||
+				Offset < PrevEnd || Offset + Length > InDims)
+			{
+				OutError = FString::Printf(
+					TEXT("channel %d ('%s') violates the channel rules (grid %d, ascending, within dims)"),
+					C, *InChannelNames[C].ToString(), Grid);
+				return false;
+			}
+			UniqueNames.Add(InChannelNames[C]);
+			PrevEnd = Offset + Length;
+		}
+		if (UniqueNames.Num() != ChannelCount)
+		{
+			OutError = TEXT("channel names are not unique");
+			return false;
+		}
+		ChannelNames = TArray<FName>(InChannelNames.GetData(), InChannelNames.Num());
+		ChannelOffsets = TArray<int32>(InChannelOffsets.GetData(), InChannelOffsets.Num());
+		ChannelLengths = TArray<int32>(InChannelLengths.GetData(), InChannelLengths.Num());
+	}
+
+	SchemaVersion = ChannelNames.Num() > 0 ? 2 : 1;
 	Dims = InDims;
 	PaddedDims = Pd;
 	Count = InCount;
@@ -115,7 +167,116 @@ bool USuperFAISSVectorBank::InitFromSource(
 	IndexBlockVersion = 0;
 	IndexBlockData.Reset();
 
+	RebuildChannelTable();
+
+	// Cosine channel banks bake per-row inverse sub-norms from the QUANTIZED payload
+	// (T-044 W2a): the reported per-channel cosine is the cosine of what the kernel
+	// dots. A zero-norm row channel stores 0 (W3 row side).
+	if (ChannelNames.Num() > 0 && InMetric == ESuperFAISSBankMetric::Cosine && InCount > 0)
+	{
+		ChannelInvNorms.SetNumZeroed(static_cast<int64>(InCount) * ChannelNames.Num());
+		superfaiss::BankView NormView;
+		NormView.rows = Payload.GetData();
+		NormView.scales = Quantization == ESuperFAISSBankQuantization::Int8
+			? Scales.GetData() : nullptr;
+		NormView.count = InCount;
+		NormView.dims = InDims;
+		NormView.paddedDims = Pd;
+		NormView.quant = CoreQuant;
+		NormView.metric = superfaiss::Metric::Cosine;
+		NormView.channels = ChannelTable.GetData();
+		NormView.channelCount = ChannelTable.Num();
+		if (ComputeChannelInverseNorms(NormView, ChannelInvNorms.GetData()) !=
+			superfaiss::Status::Ok)
+		{
+			OutError = TEXT("channel inverse-norm bake failed");
+			return false;
+		}
+	}
+
 	return ValidateContent(OutError);
+}
+
+bool USuperFAISSVectorBank::InitFromBaked(
+	const void* BakedRows,
+	const float* BakedScales,
+	int32 InCount,
+	int32 InDims,
+	ESuperFAISSBankMetric InMetric,
+	ESuperFAISSBankQuantization InQuantization,
+	const FString& InSourceHash,
+	FString& OutError)
+{
+	using namespace superfaiss;
+
+	bValidated = false;
+	OutError.Reset();
+
+	const bool bInt8 = InQuantization == ESuperFAISSBankQuantization::Int8;
+	if (InCount < 0 || InDims <= 0 || (InCount > 0 && BakedRows == nullptr) ||
+		(bInt8 && InCount > 0 && BakedScales == nullptr))
+	{
+		OutError = TEXT("bad baked-init arguments");
+		return false;
+	}
+
+	const superfaiss::Quantization CoreQuant = ToCore(InQuantization);
+	const int32 Pd = PaddedDims_Internal(InDims, CoreQuant);
+	const int64 Bytes = static_cast<int64>(InCount) * Pd * ElementSize(CoreQuant);
+	if (Bytes > MAX_int32)
+	{
+		OutError = FString::Printf(TEXT("bank payload %lld bytes exceeds the 2 GB asset limit"),
+			static_cast<long long>(Bytes));
+		return false;
+	}
+	Payload.SetNumZeroed(Bytes > 0 ? Bytes : 0);
+	if (InCount > 0)
+	{
+		FMemory::Memcpy(Payload.GetData(), BakedRows, Bytes);
+	}
+	Scales.Reset();
+	if (bInt8 && InCount > 0)
+	{
+		Scales.SetNumZeroed(InCount);
+		FMemory::Memcpy(Scales.GetData(), BakedScales, static_cast<int64>(InCount) * sizeof(float));
+	}
+
+	ChannelNames.Reset();
+	ChannelOffsets.Reset();
+	ChannelLengths.Reset();
+	ChannelRecallAt10.Reset();
+	ChannelInvNorms.Reset();
+	SchemaVersion = 1;
+	Dims = InDims;
+	PaddedDims = Pd;
+	Count = InCount;
+	Quantization = InQuantization;
+	Metric = InMetric;
+	Ids.Reset();
+	SourceHash = InSourceHash;
+	RecallAt10 = -1.0f;
+	RecallSeed = 0;
+	IndexBlockVersion = 0;
+	IndexBlockData.Reset();
+	RebuildChannelTable();
+
+	return ValidateContent(OutError);
+}
+
+void USuperFAISSVectorBank::RebuildChannelTable()
+{
+	ChannelTable.Reset();
+	for (int32 C = 0; C < ChannelNames.Num(); ++C)
+	{
+		superfaiss::ChannelInfo Info;
+		Info.offset = ChannelOffsets[C];
+		// A channel declared to end at dims extends across the zero pad lanes so its
+		// stored range stays on the element grid (pads contribute nothing).
+		Info.length = (ChannelOffsets[C] + ChannelLengths[C] == Dims)
+			? PaddedDims - ChannelOffsets[C]
+			: ChannelLengths[C];
+		ChannelTable.Add(Info);
+	}
 }
 
 int32 USuperFAISSVectorBank::PaddedDims_Internal(int32 InDims, superfaiss::Quantization Q)
@@ -160,6 +321,13 @@ superfaiss::BankView USuperFAISSVectorBank::GetBankView() const
 	View.paddedDims = PaddedDims;
 	View.quant = ToCore(Quantization);
 	View.metric = ToCore(Metric);
+	if (ChannelTable.Num() > 0)
+	{
+		View.channels = ChannelTable.GetData();
+		View.channelCount = ChannelTable.Num();
+		View.channelInvNorms =
+			ChannelInvNorms.Num() > 0 ? ChannelInvNorms.GetData() : nullptr;
+	}
 	return View;
 }
 
@@ -171,6 +339,16 @@ void USuperFAISSVectorBank::Serialize(FArchive& Ar)
 	Ar << Scales;
 	Ar << IndexBlockVersion;
 	Ar << IndexBlockData;
+	// v2 sub-block: inverse sub-norms ride behind the reserved index block, gated on
+	// the asset SchemaVersion so v1 archives are byte-identical to before.
+	if (SchemaVersion >= 2)
+	{
+		Ar << ChannelInvNorms;
+	}
+	if (Ar.IsLoading())
+	{
+		RebuildChannelTable();
+	}
 }
 
 void USuperFAISSVectorBank::PostLoad()
@@ -178,13 +356,15 @@ void USuperFAISSVectorBank::PostLoad()
 	Super::PostLoad();
 
 	FString Error;
-	if (SchemaVersion != superfaiss::kSchemaVersion)
+	// Accept schema 1 (channel-less) and 2 (channels); reject anything newer or
+	// nonsensical - reject-over-degrade (T-044 N3).
+	if (SchemaVersion < 1 || SchemaVersion > kMaxAssetSchemaVersion)
 	{
 		// Hard rejection: a version-mismatched bank never validates (plan §7).
 		bValidated = false;
 		UE_LOG(LogTemp, Error,
-			TEXT("SuperFAISSVectorBank %s: schema version %d, expected %d — bank rejected"),
-			*GetPathName(), SchemaVersion, superfaiss::kSchemaVersion);
+			TEXT("SuperFAISSVectorBank %s: schema version %d, expected 1..%d — bank rejected"),
+			*GetPathName(), SchemaVersion, kMaxAssetSchemaVersion);
 		return;
 	}
 	if (!ValidateContent(Error))

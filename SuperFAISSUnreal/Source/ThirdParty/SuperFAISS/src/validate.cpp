@@ -48,6 +48,33 @@ Status ValidateBank(const BankView& bank)
 			return Status::BadFormat;
 		}
 	}
+	if (bank.channels != nullptr || bank.channelCount != 0)
+	{
+		if (bank.channels == nullptr || bank.channelCount <= 0 ||
+			bank.channelCount > kMaxChannels)
+		{
+			return Status::BadFormat;
+		}
+		const int32_t grid = kAlignment / ElementSize(bank.quant);
+		int32_t prevEnd = 0;
+		for (int32_t c = 0; c < bank.channelCount; ++c)
+		{
+			const ChannelInfo& channel = bank.channels[c];
+			if (channel.offset < 0 || channel.length <= 0 ||
+				channel.offset % grid != 0 || channel.length % grid != 0 ||
+				channel.offset < prevEnd ||
+				static_cast<int64_t>(channel.offset) + channel.length > bank.paddedDims)
+			{
+				return Status::BadFormat;
+			}
+			prevEnd = channel.offset + channel.length;
+		}
+		// Per-channel cosine requires the baked inverse sub-norms.
+		if (bank.metric == Metric::Cosine && bank.channelInvNorms == nullptr)
+		{
+			return Status::BadFormat;
+		}
+	}
 	return Status::Ok;
 }
 
@@ -82,6 +109,47 @@ Status ValidateQuery(const BankView& bank, const float* paddedQuery)
 	if (bank.metric == Metric::Cosine && norm == 0.0)
 	{
 		return Status::ZeroNormQuery;
+	}
+	return Status::Ok;
+}
+
+Status ValidateSegments(
+	const BankView& bank,
+	const float* paddedQuery,
+	const QuerySegment* segments,
+	int32_t segmentCount)
+{
+	if (segments == nullptr || segmentCount <= 0 || segmentCount > kMaxSegments)
+	{
+		return Status::InvalidArgument;
+	}
+	const int32_t grid = kAlignment / ElementSize(bank.quant);
+	int32_t prevEnd = 0;
+	for (int32_t s = 0; s < segmentCount; ++s)
+	{
+		const QuerySegment& seg = segments[s];
+		if (seg.offset < 0 || seg.length <= 0 ||
+			seg.offset % grid != 0 || seg.length % grid != 0 ||
+			seg.offset < prevEnd ||
+			static_cast<int64_t>(seg.offset) + seg.length > bank.paddedDims ||
+			!std::isfinite(seg.weight))
+		{
+			return Status::InvalidArgument;
+		}
+		prevEnd = seg.offset + seg.length;
+
+		if (bank.metric == Metric::Cosine && seg.weight != 0.0f)
+		{
+			double norm = 0.0;
+			for (int32_t j = seg.offset; j < seg.offset + seg.length; ++j)
+			{
+				norm += static_cast<double>(paddedQuery[j]) * paddedQuery[j];
+			}
+			if (norm == 0.0)
+			{
+				return Status::ZeroNormQuery;
+			}
+		}
 	}
 	return Status::Ok;
 }

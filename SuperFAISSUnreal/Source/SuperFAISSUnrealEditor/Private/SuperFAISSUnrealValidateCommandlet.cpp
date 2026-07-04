@@ -53,11 +53,41 @@ int32 USuperFAISSUnrealValidateCommandlet::Main(const FString& Params)
 			FSuperFAISSLintReport Report;
 			FSuperFAISSBankLint::FindNearDuplicates(Bank, DupThreshold, SampleLimit, Report);
 			FSuperFAISSBankLint::FindLowVarianceDims(Bank, VarianceEpsilon, Report);
+			if (Bank->GetChannelCount() > 0)
+			{
+				float EnergyFloor = 0.01f;
+				FParse::Value(*Params, TEXT("ChannelEnergyFloor="), EnergyFloor);
+				FSuperFAISSBankLint::FindWeakChannels(Bank, EnergyFloor, Report);
+				for (const FSuperFAISSWeakChannel& Weak : Report.WeakChannels)
+				{
+					UE_LOG(LogTemp, Warning,
+						TEXT("%s: channel '%s' carries <%g of row energy in %d rows (worst %g) - per-channel scores unreliable there"),
+						*Asset.AssetName.ToString(), *Weak.Channel.ToString(),
+						EnergyFloor, Weak.RowsBelowFloor, Weak.WorstEnergyFraction);
+				}
+				// Per-channel analyses (plan section 11): channel-scoped
+				// near-duplicates and degenerate channels, same on-demand posture.
+				for (const FName& Channel : Bank->ChannelNames)
+				{
+					FSuperFAISSBankLint::FindNearDuplicatesInChannel(
+						Bank, Channel, DupThreshold, SampleLimit, Report);
+				}
+				FSuperFAISSBankLint::FindDegenerateChannels(
+					Bank, VarianceEpsilon, Report);
+				for (const FName& Dead : Report.DegenerateChannels)
+				{
+					UE_LOG(LogTemp, Warning,
+						TEXT("%s: channel '%s' is degenerate (all dims variance <= %g) - authoring noise"),
+						*Asset.AssetName.ToString(), *Dead.ToString(), VarianceEpsilon);
+				}
+			}
 			for (const FSuperFAISSNearDuplicate& Dup : Report.NearDuplicates)
 			{
 				UE_LOG(LogTemp, Warning,
-					TEXT("%s: near-duplicate rows %d and %d (runner-up score %g)"),
-					*Asset.AssetName.ToString(), Dup.RowA, Dup.RowB, Dup.Score);
+					TEXT("%s: near-duplicate rows %d and %d (runner-up score %g%s%s)"),
+					*Asset.AssetName.ToString(), Dup.RowA, Dup.RowB, Dup.Score,
+					Dup.Channel.IsNone() ? TEXT("") : TEXT(", channel "),
+					Dup.Channel.IsNone() ? TEXT("") : *Dup.Channel.ToString());
 			}
 			for (const int32 Dim : Report.LowVarianceDims)
 			{

@@ -1,5 +1,8 @@
 #include "SuperFAISSSubsystem.h"
 
+#include "SuperFAISSScratchBank.h"
+#include "Misc/ScopeExit.h"
+
 #include "Async/ParallelFor.h"
 #include "Async/TaskGraphInterfaces.h"
 #include "HAL/IConsoleManager.h"
@@ -34,6 +37,9 @@ struct USuperFAISSSubsystem::FPooledWorkspace
 	TArray<float, TAlignedHeapAllocator<16>> QueryStaging;
 	TArray<superfaiss::Hit> HitStaging;
 	TArray<int32_t> CountStaging;
+	// Scratch-bank exclusion staging: snapshot tombstones (OR'd with the caller's
+	// excludeBits) live here so the scratch path stays allocation-free once warm.
+	TArray<uint32> TombstoneStaging;
 
 	// Parallel-scan scratch, all from this one pooled workspace so the parallel path
 	// stays allocation-free once warm (Poirot T-033 constraint): per-chunk heap and
@@ -48,6 +54,84 @@ struct USuperFAISSSubsystem::FPooledWorkspace
 
 namespace
 {
+	// Resolves Args.Channels / Args.Segments to a core segment list against the
+	// bank (names resolve here, never in the kernel - plan section 5). Returns
+	// false on an unresolvable name, both forms set, or malformed ranges (the core
+	// re-validates ranges; this catches the name layer).
+	bool ResolveSegments(
+		const USuperFAISSVectorBank* Bank,
+		const FSuperFAISSQueryArgs& Args,
+		TArray<superfaiss::QuerySegment>& OutSegments)
+	{
+		OutSegments.Reset();
+		if (Args.Channels.Num() > 0 && Args.Segments.Num() > 0)
+		{
+			return false;
+		}
+		for (const FSuperFAISSChannelWeight& Entry : Args.Channels)
+		{
+			const int32 ChannelIndex = Bank->GetChannelIndex(Entry.Channel);
+			if (ChannelIndex == INDEX_NONE)
+			{
+				return false;
+			}
+			const superfaiss::BankView View = Bank->GetBankView();
+			superfaiss::QuerySegment Segment;
+			Segment.offset = View.channels[ChannelIndex].offset;
+			Segment.length = View.channels[ChannelIndex].length;
+			Segment.weight = Entry.Weight;
+			OutSegments.Add(Segment);
+		}
+		for (const FSuperFAISSSegment& Raw : Args.Segments)
+		{
+			superfaiss::QuerySegment Segment;
+			Segment.offset = Raw.Offset;
+			Segment.length = Raw.Length;
+			Segment.weight = Raw.Weight;
+			OutSegments.Add(Segment);
+		}
+		// Core validation requires ascending order; named channels resolve in table
+		// order only if the caller listed them so - sort by offset here, once.
+		OutSegments.Sort([](const superfaiss::QuerySegment& A,
+			const superfaiss::QuerySegment& B) { return A.offset < B.offset; });
+		return true;
+	}
+
+	// D-V2-1 query-side rule: on Cosine channel banks, the query's channel
+	// sub-vectors renormalize once at build so segment scores are true cosines.
+	void RenormalizeQueryChannels(
+		const USuperFAISSVectorBank* Bank,
+		const TArray<superfaiss::QuerySegment>& Segments,
+		float* PaddedQuery)
+	{
+		if (Bank->Metric != ESuperFAISSBankMetric::Cosine ||
+			Bank->GetChannelCount() == 0)
+		{
+			return;
+		}
+		for (const superfaiss::QuerySegment& Segment : Segments)
+		{
+			if (Segment.weight == 0.0f)
+			{
+				continue;
+			}
+			double Norm = 0.0;
+			for (int32 J = Segment.offset; J < Segment.offset + Segment.length; ++J)
+			{
+				Norm += static_cast<double>(PaddedQuery[J]) * PaddedQuery[J];
+			}
+			if (Norm > 0.0)
+			{
+				const double Inv = 1.0 / FMath::Sqrt(Norm);
+				for (int32 J = Segment.offset; J < Segment.offset + Segment.length; ++J)
+				{
+					PaddedQuery[J] = static_cast<float>(PaddedQuery[J] * Inv);
+				}
+			}
+			// A zero-norm sub-vector stays zero: the core rejects it (W3 query side).
+		}
+	}
+
 	// Stages an unpadded query into aligned, zero-padded scratch and runs the core
 	// query. Shared by the sync, async, and Blueprint paths.
 	bool RunQuery(
@@ -83,17 +167,57 @@ namespace
 		{
 			Scratch.HitStaging.SetNumUninitialized(Args.K);
 		}
+		int32_t HitCountForSegments = 0;
+
+		TArray<QuerySegment> Segments;
+		if (!ResolveSegments(Bank, Args, Segments))
+		{
+			return false;
+		}
+		if (Segments.Num() > 0)
+		{
+			RenormalizeQueryChannels(Bank, Segments, Scratch.QueryStaging.GetData());
+		}
 
 		QueryParams Params;
 		Params.k = Args.K;
 		Params.excludeBits = Args.ExcludeBits.Num() ? Args.ExcludeBits.GetData() : nullptr;
 		Params.scoreAs = Args.bScoreAsDot ? ScoreAs::Dot : ScoreAs::BankMetric;
+		Params.segments = Segments.Num() > 0 ? Segments.GetData() : nullptr;
+		Params.segmentCount = Segments.Num();
 
 		// Effective view for scoring/ordering under the override. Validation always
 		// runs against the bank's own view (the core applies the same split), so the
 		// serial and parallel paths reject identically.
 		BankView Scoring = View;
 		Scoring.metric = ScoringMetric(View, Params);
+
+		// Segmented queries route through the core (fold/dense split lives there);
+		// the pooled parallel fan-out below stays a V1-only fast path for now and is
+		// bypassed for segments - serial core scans are already sub-millisecond at
+		// game scale, and the fold path IS the V1 kernel.
+		if (Params.segments != nullptr)
+		{
+			const Status SegResult = Query(View, Scratch.QueryStaging.GetData(), Params,
+				Scratch.Core, Scratch.HitStaging.GetData(), &HitCountForSegments);
+			if (SegResult != Status::Ok)
+			{
+				return false;
+			}
+			const int32 N = HitCountForSegments;
+			OutHits.SetNum(N);
+			const Metric ScoredMetric = Scoring.metric;
+			for (int32 i = 0; i < N; ++i)
+			{
+				OutHits[i].Index = Scratch.HitStaging[i].index;
+				OutHits[i].Id = Bank->GetIdForIndex(Scratch.HitStaging[i].index);
+				OutHits[i].Score = Scratch.HitStaging[i].score;
+				OutHits[i].Margin = (i + 1 < N)
+					? Margin(Scratch.HitStaging[i], Scratch.HitStaging[i + 1], ScoredMetric)
+					: 0.0f;
+			}
+			return true;
+		}
 
 		// Path selection: parallel scan when configured and the bank is big enough for
 		// the fan-out to pay. ParallelFor joins before this function returns, so the
@@ -304,6 +428,119 @@ FSuperFAISSTicket USuperFAISSSubsystem::QueryAsync(
 		TStatId(), nullptr, ENamedThreads::AnyBackgroundThreadNormalTask);
 
 	return Ticket;
+}
+
+bool USuperFAISSSubsystem::QueryScratch(
+	USuperFAISSScratchBank* Bank,
+	TConstArrayView<float> UnpaddedQuery,
+	const FSuperFAISSQueryArgs& Args,
+	TArray<FSuperFAISSHit>& OutHits)
+{
+	using namespace superfaiss;
+
+	OutHits.Reset();
+	// Channels are asset-side vocabulary; scratch banks carry no channel table.
+	if (Bank == nullptr || !Bank->IsInitialized() || Args.K <= 0 ||
+		Args.Channels.Num() > 0 || UnpaddedQuery.Num() != Bank->GetDims())
+	{
+		return false;
+	}
+	// The N4 dispatch gate: a Grow/Freeze/Load waiting on the pin counter refuses
+	// new queries here, so a busy consumer cannot starve it.
+	if (!Bank->TryPin())
+	{
+		return false;
+	}
+	ON_SCOPE_EXIT { Bank->Unpin(); };
+
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+	bool bOk = false;
+	do
+	{
+		BankView View;
+		const int32 Words = ScratchBank::TombstoneWords(Bank->GetCount());
+		if (Scratch->TombstoneStaging.Num() < Words)
+		{
+			Scratch->TombstoneStaging.SetNumZeroed(Words);
+		}
+		if (Bank->Core().Snapshot(&View, Scratch->TombstoneStaging.GetData()) != Status::Ok)
+		{
+			break;
+		}
+		// Deletion is exclusion (V2-G4): the snapshot's tombstones OR the caller's own set.
+		if (Args.ExcludeBits.Num() != 0)
+		{
+			if (Args.ExcludeBits.Num() < (View.count + 31) / 32)
+			{
+				break;
+			}
+			for (int32 W = 0; W < (View.count + 31) / 32; ++W)
+			{
+				Scratch->TombstoneStaging[W] |= Args.ExcludeBits[W];
+			}
+		}
+
+		if (Scratch->QueryStaging.Num() < View.paddedDims)
+		{
+			Scratch->QueryStaging.SetNumZeroed(View.paddedDims);
+		}
+		FMemory::Memzero(Scratch->QueryStaging.GetData(), View.paddedDims * sizeof(float));
+		FMemory::Memcpy(Scratch->QueryStaging.GetData(), UnpaddedQuery.GetData(),
+			UnpaddedQuery.Num() * sizeof(float));
+		if (Scratch->HitStaging.Num() < Args.K)
+		{
+			Scratch->HitStaging.SetNumUninitialized(Args.K);
+		}
+
+		TArray<QuerySegment> Segments;
+		for (const FSuperFAISSSegment& Raw : Args.Segments)
+		{
+			QuerySegment Segment;
+			Segment.offset = Raw.Offset;
+			Segment.length = Raw.Length;
+			Segment.weight = Raw.Weight;
+			Segments.Add(Segment);
+		}
+		Segments.Sort([](const QuerySegment& A, const QuerySegment& B) {
+			return A.offset < B.offset;
+		});
+
+		QueryParams Params;
+		Params.k = Args.K;
+		Params.excludeBits = View.count > 0 ? Scratch->TombstoneStaging.GetData() : nullptr;
+		Params.scoreAs = Args.bScoreAsDot ? ScoreAs::Dot : ScoreAs::BankMetric;
+		Params.segments = Segments.Num() > 0 ? Segments.GetData() : nullptr;
+		Params.segmentCount = Segments.Num();
+
+		int32_t HitCount = 0;
+		if (Query(View, Scratch->QueryStaging.GetData(), Params, Scratch->Core,
+				Scratch->HitStaging.GetData(), &HitCount) != Status::Ok)
+		{
+			break;
+		}
+		const Metric ScoredMetric = ScoringMetric(View, Params);
+		OutHits.SetNum(HitCount);
+		for (int32 i = 0; i < HitCount; ++i)
+		{
+			OutHits[i].Index = Scratch->HitStaging[i].index;
+			OutHits[i].Id = NAME_None; // scratch rows are index-addressed (W4 contract)
+			OutHits[i].Score = Scratch->HitStaging[i].score;
+			OutHits[i].Margin = (i + 1 < HitCount)
+				? Margin(Scratch->HitStaging[i], Scratch->HitStaging[i + 1], ScoredMetric)
+				: 0.0f;
+		}
+		bOk = true;
+	} while (false);
+	ReleaseWorkspace(Scratch);
+	return bOk;
+}
+
+bool USuperFAISSSubsystem::QuerySimilarScratch(USuperFAISSScratchBank* Bank,
+	const TArray<float>& Query, int32 K, TArray<FSuperFAISSHit>& Hits)
+{
+	FSuperFAISSQueryArgs Args;
+	Args.K = K;
+	return QueryScratch(Bank, Query, Args, Hits);
 }
 
 bool USuperFAISSSubsystem::QueryBatch(
@@ -673,6 +910,59 @@ bool USuperFAISSSubsystem::QuerySimilarIntersect(const USuperFAISSVectorBank* Ba
 	FSuperFAISSQueryArgs Args;
 	Args.K = K;
 	return QueryIntersect(Bank, Concatenated, 2, Args, Hits);
+}
+
+bool USuperFAISSSubsystem::QuerySimilarChannels(const USuperFAISSVectorBank* Bank,
+	const TArray<float>& Query, const TArray<FSuperFAISSChannelWeight>& Channels,
+	int32 K, TArray<FSuperFAISSHit>& Hits)
+{
+	FSuperFAISSQueryArgs Args;
+	Args.K = K;
+	Args.Channels = Channels;
+	return QuerySync(Bank, Query, Args, Hits);
+}
+
+bool USuperFAISSSubsystem::DecomposeHit(const USuperFAISSVectorBank* Bank,
+	const TArray<float>& Query, const TArray<FSuperFAISSChannelWeight>& Channels,
+	int32 RowIndex, TArray<float>& OutContributions, float& OutTotal)
+{
+	using namespace superfaiss;
+
+	OutContributions.Reset();
+	OutTotal = 0.0f;
+	if (Bank == nullptr || !Bank->IsValid() || RowIndex < 0 || RowIndex >= Bank->Count ||
+		Query.Num() != Bank->Dims || Channels.Num() == 0)
+	{
+		return false;
+	}
+
+	FSuperFAISSQueryArgs Args;
+	Args.Channels = Channels;
+	TArray<QuerySegment> Segments;
+	if (!ResolveSegments(Bank, Args, Segments))
+	{
+		return false;
+	}
+
+	// Stage padded + renormalized exactly as the scan does, so OutTotal is the
+	// scan's own score for this row, bitwise.
+	const BankView View = Bank->GetBankView();
+	TArray<float, TAlignedHeapAllocator<16>> Staged;
+	Staged.SetNumZeroed(View.paddedDims);
+	FMemory::Memcpy(Staged.GetData(), Query.GetData(), Query.Num() * sizeof(float));
+	RenormalizeQueryChannels(Bank, Segments, Staged.GetData());
+
+	if (ValidateQuery(View, Staged.GetData()) != Status::Ok ||
+		ValidateSegments(View, Staged.GetData(), Segments.GetData(),
+			Segments.Num()) != Status::Ok)
+	{
+		return false;
+	}
+
+	OutContributions.SetNumZeroed(Segments.Num());
+	OutTotal = DecomposeRowScore(View, Staged.GetData(), RowIndex, Segments.GetData(),
+		Segments.Num(), OutContributions.GetData());
+	return true;
 }
 
 bool USuperFAISSSubsystem::QuerySimilarSync(const USuperFAISSVectorBank* Bank,

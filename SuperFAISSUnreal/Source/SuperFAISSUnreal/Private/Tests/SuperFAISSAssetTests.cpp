@@ -144,7 +144,7 @@ bool FSuperFAISSAssetVersionTest::RunTest(const FString& Parameters)
 	{
 		return true;
 	}
-	Built->SchemaVersion = superfaiss::kSchemaVersion + 1;
+	Built->SchemaVersion = USuperFAISSVectorBank::kMaxAssetSchemaVersion + 1;
 	TArray<uint8> Bytes;
 	SaveBank(Built, Bytes);
 	USuperFAISSVectorBank* Loaded = LoadBank(Bytes);

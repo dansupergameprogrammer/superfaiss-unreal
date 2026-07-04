@@ -9,6 +9,8 @@
 #include "SuperFAISSBankImport.h"
 #include "SuperFAISSBankLint.h"
 #include "SuperFAISSPrototypeAsset.h"
+#include "SuperFAISSScratchBank.h"
+#include "UObject/UObjectIterator.h"
 #include "SuperFAISSSubsystem.h"
 #include "SuperFAISSVectorBank.h"
 #include "UObject/Package.h"
@@ -161,11 +163,29 @@ FString USuperFAISSToolset::DescribeBank(const FString& BankPath)
 	Object->SetBoolField(TEXT("hasIds"), Bank->Ids.Num() > 0);
 	Object->SetNumberField(TEXT("recallAt10"), Bank->RecallAt10);
 	Object->SetStringField(TEXT("sourceHash"), Bank->SourceHash);
+	if (Bank->GetChannelCount() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> Channels;
+		for (int32 C = 0; C < Bank->GetChannelCount(); ++C)
+		{
+			const TSharedRef<FJsonObject> Channel = MakeShared<FJsonObject>();
+			Channel->SetStringField(TEXT("name"), Bank->ChannelNames[C].ToString());
+			Channel->SetNumberField(TEXT("offset"), Bank->ChannelOffsets[C]);
+			Channel->SetNumberField(TEXT("dims"), Bank->ChannelLengths[C]);
+			if (Bank->ChannelRecallAt10.IsValidIndex(C))
+			{
+				Channel->SetNumberField(TEXT("recallAt10"), Bank->ChannelRecallAt10[C]);
+			}
+			Channels.Add(MakeShared<FJsonValueObject>(Channel));
+		}
+		Object->SetArrayField(TEXT("channels"), Channels);
+	}
 	return ToJson(Object);
 }
 
 FString USuperFAISSToolset::QueryBank(const FString& BankPath, const FString& RowId,
-	int32 RowIndex, const TArray<float>& Vector, int32 K, bool bScoreAsDot)
+	int32 RowIndex, const TArray<float>& Vector, const TArray<FString>& ChannelNames,
+	const TArray<float>& ChannelWeights, int32 K, bool bScoreAsDot)
 {
 	FString Error;
 	USuperFAISSVectorBank* Bank = LoadBank(BankPath, Error);
@@ -221,7 +241,25 @@ FString USuperFAISSToolset::QueryBank(const FString& BankPath, const FString& Ro
 			return JsonError(TEXT("row extraction failed"));
 		}
 	}
-	return RunBankQuery(Bank, Query, K, bScoreAsDot);
+	if (ChannelNames.Num() != ChannelWeights.Num())
+	{
+		return JsonError(TEXT("ChannelNames and ChannelWeights must be parallel arrays"));
+	}
+	USuperFAISSSubsystem* QuerySubsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+	FSuperFAISSQueryArgs Args;
+	Args.K = FMath::Clamp(K, 1, 1000);
+	Args.bScoreAsDot = bScoreAsDot;
+	for (int32 C = 0; C < ChannelNames.Num(); ++C)
+	{
+		Args.Channels.Add({FName(*ChannelNames[C]), ChannelWeights[C]});
+	}
+	TArray<FSuperFAISSHit> Hits;
+	if (!QuerySubsystem->QuerySync(Bank, Query, Args, Hits))
+	{
+		return JsonError(TEXT(
+			"query rejected (dims mismatch, unknown channel, or invalid vector)"));
+	}
+	return HitsResult(*Bank, Hits);
 }
 
 FString USuperFAISSToolset::QueryPrototype(const FString& BankPath,
@@ -436,6 +474,18 @@ FString USuperFAISSToolset::LintBank(const FString& BankPath, float DuplicateThr
 	{
 		return JsonError(TEXT("lint failed"));
 	}
+	// Channel banks: per-channel near-duplicates, degenerate channels, weak
+	// channels (plan section 11 / T-044 W2c) - same on-demand posture.
+	if (Bank->GetChannelCount() > 0)
+	{
+		for (const FName& Channel : Bank->ChannelNames)
+		{
+			FSuperFAISSBankLint::FindNearDuplicatesInChannel(
+				Bank, Channel, DuplicateThreshold, FMath::Max(SampleLimit, 1), Report);
+		}
+		FSuperFAISSBankLint::FindDegenerateChannels(Bank, VarianceEpsilon, Report);
+		FSuperFAISSBankLint::FindWeakChannels(Bank, 0.01f, Report);
+	}
 
 	const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
 	Object->SetStringField(TEXT("bank"), Bank->GetPathName());
@@ -448,6 +498,10 @@ FString USuperFAISSToolset::LintBank(const FString& BankPath, float DuplicateThr
 		DupObject->SetNumberField(TEXT("rowA"), Dup.RowA);
 		DupObject->SetNumberField(TEXT("rowB"), Dup.RowB);
 		DupObject->SetNumberField(TEXT("score"), Dup.Score);
+		if (!Dup.Channel.IsNone())
+		{
+			DupObject->SetStringField(TEXT("channel"), Dup.Channel.ToString());
+		}
 		DupValues.Add(MakeShared<FJsonValueObject>(DupObject));
 	}
 	Object->SetArrayField(TEXT("nearDuplicates"), DupValues);
@@ -457,5 +511,126 @@ FString USuperFAISSToolset::LintBank(const FString& BankPath, float DuplicateThr
 		DimValues.Add(MakeShared<FJsonValueNumber>(Dim));
 	}
 	Object->SetArrayField(TEXT("lowVarianceDims"), DimValues);
+	if (Bank->GetChannelCount() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> DeadValues;
+		for (const FName& Dead : Report.DegenerateChannels)
+		{
+			DeadValues.Add(MakeShared<FJsonValueString>(Dead.ToString()));
+		}
+		Object->SetArrayField(TEXT("degenerateChannels"), DeadValues);
+		TArray<TSharedPtr<FJsonValue>> WeakValues;
+		for (const FSuperFAISSWeakChannel& Weak : Report.WeakChannels)
+		{
+			const TSharedRef<FJsonObject> WeakObject = MakeShared<FJsonObject>();
+			WeakObject->SetStringField(TEXT("channel"), Weak.Channel.ToString());
+			WeakObject->SetNumberField(TEXT("rowsBelowFloor"), Weak.RowsBelowFloor);
+			WeakObject->SetNumberField(TEXT("worstEnergyFraction"),
+				Weak.WorstEnergyFraction);
+			WeakValues.Add(MakeShared<FJsonValueObject>(WeakObject));
+		}
+		Object->SetArrayField(TEXT("weakChannels"), WeakValues);
+	}
+	return ToJson(Object);
+}
+
+namespace
+{
+	USuperFAISSScratchBank* FindScratchBank(const FString& Path, FString& OutError)
+	{
+		for (TObjectIterator<USuperFAISSScratchBank> It; It; ++It)
+		{
+			if (It->GetPathName() == Path)
+			{
+				return *It;
+			}
+		}
+		OutError = FString::Printf(TEXT("no live scratch bank at %s"), *Path);
+		return nullptr;
+	}
+
+	TSharedRef<FJsonObject> ScratchSummary(const USuperFAISSScratchBank& Bank)
+	{
+		const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+		Object->SetStringField(TEXT("path"), Bank.GetPathName());
+		Object->SetBoolField(TEXT("initialized"), Bank.IsInitialized());
+		Object->SetNumberField(TEXT("count"), Bank.GetCount());
+		Object->SetNumberField(TEXT("liveCount"), Bank.GetLiveCount());
+		Object->SetNumberField(TEXT("capacity"), Bank.GetCapacity());
+		Object->SetNumberField(TEXT("dims"), Bank.GetDims());
+		Object->SetStringField(TEXT("metric"), MetricName(Bank.GetMetric()));
+		Object->SetStringField(TEXT("quantization"),
+			Bank.GetQuantization() == ESuperFAISSBankQuantization::Int8 ? TEXT("Int8")
+			                                                            : TEXT("Float32"));
+		return Object;
+	}
+}
+
+FString USuperFAISSToolset::ListScratchBanks()
+{
+	const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> Banks;
+	for (TObjectIterator<USuperFAISSScratchBank> It; It; ++It)
+	{
+		Banks.Add(MakeShared<FJsonValueObject>(ScratchSummary(**It)));
+	}
+	Object->SetNumberField(TEXT("count"), Banks.Num());
+	Object->SetArrayField(TEXT("scratchBanks"), Banks);
+	return ToJson(Object);
+}
+
+FString USuperFAISSToolset::DescribeScratchBank(const FString& ScratchBankPath)
+{
+	FString Error;
+	const USuperFAISSScratchBank* Bank = FindScratchBank(ScratchBankPath, Error);
+	if (Bank == nullptr)
+	{
+		return JsonError(Error);
+	}
+	return ToJson(ScratchSummary(*Bank));
+}
+
+FString USuperFAISSToolset::QueryScratchBank(const FString& ScratchBankPath,
+	const TArray<float>& Vector, int32 K)
+{
+	FString Error;
+	USuperFAISSScratchBank* Bank = FindScratchBank(ScratchBankPath, Error);
+	if (Bank == nullptr)
+	{
+		return JsonError(Error);
+	}
+	if (!Bank->IsInitialized())
+	{
+		return JsonError(TEXT("scratch bank is not initialized"));
+	}
+	if (Vector.Num() != Bank->GetDims())
+	{
+		return JsonError(FString::Printf(TEXT("vector has %d dims; bank has %d"),
+			Vector.Num(), Bank->GetDims()));
+	}
+	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+	if (Subsystem == nullptr)
+	{
+		return JsonError(TEXT("subsystem unavailable"));
+	}
+	FSuperFAISSQueryArgs Args;
+	Args.K = FMath::Clamp(K, 1, 1000);
+	TArray<FSuperFAISSHit> Hits;
+	if (!Subsystem->QueryScratch(Bank, Vector, Args, Hits))
+	{
+		return JsonError(TEXT("query rejected (bank draining or invalid vector)"));
+	}
+	const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+	Object->SetStringField(TEXT("scratchBank"), Bank->GetPathName());
+	TArray<TSharedPtr<FJsonValue>> HitValues;
+	for (const FSuperFAISSHit& Hit : Hits)
+	{
+		const TSharedRef<FJsonObject> HitObject = MakeShared<FJsonObject>();
+		HitObject->SetNumberField(TEXT("index"), Hit.Index);
+		HitObject->SetNumberField(TEXT("score"), Hit.Score);
+		HitObject->SetNumberField(TEXT("margin"), Hit.Margin);
+		HitValues.Add(MakeShared<FJsonValueObject>(HitObject));
+	}
+	Object->SetArrayField(TEXT("hits"), HitValues);
 	return ToJson(Object);
 }

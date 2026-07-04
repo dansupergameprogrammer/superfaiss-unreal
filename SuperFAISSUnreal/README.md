@@ -67,6 +67,74 @@ Sim->QueryIntersect(Bank, ConcatenatedQueries, QueryCount, Args, Hits);
 
 Blueprint: `Make Centroid Query`, `Make Direction Query`, `Query Similar (Intersect)`.
 
+## Named channels and decomposition (v2.0)
+
+Banks whose vectors carry heterogeneous sub-spaces — "dims 0–63 are identity,
+64–99 are appearance" — can declare **named channels** in the sidecar
+(`schemaVersion: 2`). Queries then rank by a weighted combination of channels,
+and every hit can be decomposed into exact per-channel contributions:
+
+```cpp
+FSuperFAISSQueryArgs Args;
+Args.K = 10;
+Args.Channels = {{TEXT("identity"), 1.0f}, {TEXT("appearance"), 0.2f}};
+Sim->QuerySync(Bank, QueryVector, Args, Hits);
+
+// "Why did this match?" — contributions sum EXACTLY to the hit's score
+// (they are the scan's own accumulators, not a re-computation).
+TArray<float> Contributions;
+float Total;
+Sim->DecomposeHit(Bank, QueryVector, Args.Channels, Hits[0].Index, Contributions, Total);
+```
+
+On Cosine channel banks each channel's score is a **true per-channel cosine**
+(per-row inverse sub-norms are baked from the quantized payload at import, and
+the query's channel sub-vectors renormalize at query build). Weight 0 mutes a
+channel; raw element ranges (`Args.Segments`) are the C++ escape hatch.
+
+**Honest pricing:** segments are a *semantics* feature. A channel query costs
+approximately one full scan — for dot-family scoring the weights fold into the
+query exactly, so it runs the plain V1 kernels at V1 speed; masking a range
+does not make the scan faster on this row-interleaved layout (measured, not
+assumed). Per-channel recall@10 is measured at import per channel and stored
+on the asset; the `-Lint` pass reports channels too weak to trust
+(sub-norm energy floor), channel-scoped near-duplicates, and degenerate
+channels.
+
+Blueprint: `Query Similar (Channels)`, `Decompose Hit`. The Bank Inspector
+gets per-channel weight sliders, decomposition bars on every hit, and
+channel-scoped PCA projection.
+
+## Scratch banks (v2.0)
+
+`USuperFAISSScratchBank` is a mutable, fixed-capacity bank for vectors that
+accumulate at runtime — NPC memories, session embeddings. It is runtime state,
+not an asset:
+
+```cpp
+USuperFAISSScratchBank* Memory = NewObject<USuperFAISSScratchBank>(Owner);
+Memory->Init(/*Capacity*/ 512, Dims, ESuperFAISSBankMetric::Cosine,
+	ESuperFAISSBankQuantization::Float32);
+int32 Index;
+Memory->Append(Vector, Index);      // validates like the importer; index is stable
+Memory->Remove(Index);              // tombstone; removal is exclusion on later queries
+Sim->QueryScratch(Memory, QueryVector, Args, Hits);   // any thread, lock-free
+
+TArray<uint8> SaveBlob;
+Memory->SaveToBytes(SaveBlob);      // full state; LoadFromBytes rejects bad blobs
+TArray<int32> IndexMap;
+USuperFAISSVectorBank* Frozen = Memory->Freeze(IndexMap);  // graduate to content
+```
+
+One logical writer at a time; queries are lock-free readers on any thread and
+pin the bank for their flight. `Grow` preserves indices (stored indices are
+the contract); `Freeze` compacts and renumbers, returning the old-to-new map
+so stored handles survive. A frozen bank scores **bit-identically** to the
+scratch bank it came from. Determinism extends as determinism-given-history:
+same append/remove sequence + same query = bit-identical results per device.
+
+Blueprint: the full surface is BlueprintCallable, plus `Query Similar (Scratch)`.
+
 ## The query side of the encoder seam
 
 An *encoder* is anything that turns domain state — text, images, gameplay — into a
@@ -92,14 +160,18 @@ UnrealEditor-Cmd <project> -run=SuperFAISSUnrealBake -Source=<name>.wvbank.json 
 The importer validates everything (malformed data is rejected with a line-item error,
 never a partial asset), pre-normalizes Cosine banks, quantizes to int8 by default, and
 measures the quantization's recall@10 with a recorded seed — the number is stored on
-the asset (the demo bank: 0.9916).
+the asset (the demo bank: 0.9916). Channel banks declare `"schemaVersion": 2` with a
+`"channels"` array in the sidecar (see the core's FORMAT.md); per-channel recall is
+measured and stored per channel.
 
 Validate every bank in CI: `-run=SuperFAISSUnrealValidate` (non-zero exit on any
 invalid bank).
 
 Add `-Lint` for on-demand health analyses: near-duplicate rows (sampled above a
-configurable cap, never silently exhaustive), low-variance dims, and prototype
-overlap. In-editor, **Tools > SuperFAISS Bank Inspector** gives live queries with
+configurable cap, never silently exhaustive), low-variance dims, prototype overlap,
+and on channel banks: channel-scoped near-duplicates, degenerate channels, and weak
+channels (rows whose channel carries almost no energy — their per-channel cosines
+are amplified quantization noise; `-ChannelEnergyFloor=` tunes the threshold). In-editor, **Tools > SuperFAISS Bank Inspector** gives live queries with
 margins and a PCA projection point cloud of any bank; selected rows become named
 prototype assets (`USuperFAISSPrototypeAsset` — also a query provider) via the
 authoring library.
@@ -130,11 +202,14 @@ The stripped plugin compiles and the non-demo test groups pass unchanged.
 
 ## Tests
 
-`SuperFAISS.*` automation tests (26) cover kernel correctness, SIMD/scalar mirror
-equality, determinism, tie-break stability, concurrency, asset round-trips, import
-rejection, quantizer recall, performance guards, query composition (centroid,
-direction, intersection, margins), bank lint analyses, prototype authoring, a golden
-semantic query on the demo bank, and the Mass swarm's stability (F2). Run headless:
+`SuperFAISS.*` automation tests (28 in this plugin; 30 with the MCP plugin enabled)
+cover kernel correctness, SIMD/scalar mirror equality, determinism, tie-break
+stability, concurrency, asset round-trips, import rejection, quantizer recall,
+performance guards, query composition (centroid, direction, intersection, margins),
+named-channel queries and decomposition, scratch banks (including the drain gate,
+freeze bit-identity, and save/load), bank lint analyses, prototype authoring, a
+golden semantic query on the demo bank, and the Mass swarm's stability (F2). Run
+headless:
 
 ```
 UnrealEditor-Cmd <project> -ExecCmds="Automation RunTests SuperFAISS; Quit" -unattended -nullrhi

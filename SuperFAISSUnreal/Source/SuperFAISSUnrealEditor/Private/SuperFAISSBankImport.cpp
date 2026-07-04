@@ -31,6 +31,152 @@ namespace
 		return Path + TEXT(".bin");
 	}
 
+	// Per-channel seeded recall@10 (T-044 W2b): the same self-query sampling,
+	// restricted to one channel on both views - the float reference carries its own
+	// channel inverse sub-norms so both sides rank by true per-channel cosine. The
+	// honest-budget number for weak channels on int8 banks.
+	float ComputeChannelRecallAt10(
+		const TArray<float>& NormalizedRows,
+		int32 Count,
+		int32 Dims,
+		USuperFAISSVectorBank* BakedBank,
+		uint64 Seed,
+		int32 ChannelIndex)
+	{
+		using namespace superfaiss;
+
+		if (Count < 2)
+		{
+			return 1.0f;
+		}
+
+		const int32 RefPd = PaddedDims(Dims, Quantization::Float32);
+		TArray<float, TAlignedHeapAllocator<16>> RefPayload;
+		RefPayload.SetNumZeroed(Count * RefPd);
+		PadRowsFloat32(NormalizedRows.GetData(), Count, Dims, RefPd, RefPayload.GetData());
+
+		// Channel tables in each view's padded space (declared dims-space ranges;
+		// a channel ending at dims extends across that view's pad lanes).
+		TArray<ChannelInfo> RefChannels;
+		for (int32 C = 0; C < BakedBank->GetChannelCount(); ++C)
+		{
+			ChannelInfo Info;
+			Info.offset = BakedBank->ChannelOffsets[C];
+			Info.length =
+				(BakedBank->ChannelOffsets[C] + BakedBank->ChannelLengths[C] == Dims)
+					? RefPd - BakedBank->ChannelOffsets[C]
+					: BakedBank->ChannelLengths[C];
+			RefChannels.Add(Info);
+		}
+
+		BankView RefView;
+		RefView.rows = RefPayload.GetData();
+		RefView.count = Count;
+		RefView.dims = Dims;
+		RefView.paddedDims = RefPd;
+		RefView.quant = Quantization::Float32;
+		RefView.metric = Metric::Cosine;
+		RefView.channels = RefChannels.GetData();
+		RefView.channelCount = RefChannels.Num();
+		TArray<float> RefInvNorms;
+		RefInvNorms.SetNumZeroed(static_cast<int64>(Count) * RefChannels.Num());
+		if (ComputeChannelInverseNorms(RefView, RefInvNorms.GetData()) != Status::Ok)
+		{
+			return -1.0f;
+		}
+		RefView.channelInvNorms = RefInvNorms.GetData();
+
+		const BankView BakedView = BakedBank->GetBankView();
+
+		const int32 SampleCount = FMath::Min(500, Count);
+		const int32 K = FMath::Min(10, Count - 1);
+
+		TArray<float, TAlignedHeapAllocator<16>> RefQuery;
+		RefQuery.SetNumZeroed(RefPd);
+		TArray<float, TAlignedHeapAllocator<16>> BakedQuery;
+		BakedQuery.SetNumZeroed(BakedView.paddedDims);
+		Workspace RefWs, BakedWs;
+		TArray<Hit> RefHits, BakedHits;
+		RefHits.SetNumUninitialized(K);
+		BakedHits.SetNumUninitialized(K);
+		TArray<uint32> Exclude;
+		Exclude.SetNumZeroed((Count + 31) / 32);
+
+		QuerySegment RefSeg;
+		RefSeg.offset = RefChannels[ChannelIndex].offset;
+		RefSeg.length = RefChannels[ChannelIndex].length;
+		RefSeg.weight = 1.0f;
+		QuerySegment BakedSeg;
+		BakedSeg.offset = BakedView.channels[ChannelIndex].offset;
+		BakedSeg.length = BakedView.channels[ChannelIndex].length;
+		BakedSeg.weight = 1.0f;
+
+		uint64 State = Seed ? Seed : 1;
+		int32 TotalHits = 0;
+		int32 TotalPossible = 0;
+		for (int32 S = 0; S < SampleCount; ++S)
+		{
+			State ^= State >> 12;
+			State ^= State << 25;
+			State ^= State >> 27;
+			const int32 Row = static_cast<int32>((State * 0x2545F4914F6CDD1Dull) % Count);
+
+			// Skip rows whose channel is zero-norm on either side (the W3 query law
+			// would reject them; the linter floor reports them separately).
+			double SubNorm = 0.0;
+			for (int32 J = BakedBank->ChannelOffsets[ChannelIndex];
+				J < BakedBank->ChannelOffsets[ChannelIndex] +
+					BakedBank->ChannelLengths[ChannelIndex]; ++J)
+			{
+				const float V = NormalizedRows[Row * Dims + J];
+				SubNorm += static_cast<double>(V) * V;
+			}
+			if (SubNorm <= 0.0)
+			{
+				continue;
+			}
+
+			FMemory::Memzero(RefQuery.GetData(), RefPd * sizeof(float));
+			FMemory::Memzero(BakedQuery.GetData(), BakedView.paddedDims * sizeof(float));
+			FMemory::Memcpy(RefQuery.GetData(), NormalizedRows.GetData() + Row * Dims,
+				Dims * sizeof(float));
+			FMemory::Memcpy(BakedQuery.GetData(), NormalizedRows.GetData() + Row * Dims,
+				Dims * sizeof(float));
+			FMemory::Memzero(Exclude.GetData(), Exclude.Num() * sizeof(uint32));
+			Exclude[Row >> 5] |= 1u << (Row & 31);
+
+			QueryParams RefParams;
+			RefParams.k = K;
+			RefParams.excludeBits = Exclude.GetData();
+			RefParams.segments = &RefSeg;
+			RefParams.segmentCount = 1;
+			QueryParams BakedParams = RefParams;
+			BakedParams.segments = &BakedSeg;
+
+			int32_t RefN = 0, BakedN = 0;
+			if (Query(RefView, RefQuery.GetData(), RefParams, RefWs, RefHits.GetData(),
+					&RefN) != Status::Ok ||
+				Query(BakedView, BakedQuery.GetData(), BakedParams, BakedWs,
+					BakedHits.GetData(), &BakedN) != Status::Ok)
+			{
+				continue;
+			}
+			TSet<int32> RefSet;
+			for (int32 i = 0; i < RefN; ++i)
+			{
+				RefSet.Add(RefHits[i].index);
+			}
+			for (int32 i = 0; i < BakedN; ++i)
+			{
+				TotalHits += RefSet.Contains(BakedHits[i].index) ? 1 : 0;
+			}
+			TotalPossible += RefN;
+		}
+		return TotalPossible > 0
+			? static_cast<float>(TotalHits) / static_cast<float>(TotalPossible)
+			: 1.0f;
+	}
+
 	// Seeded recall@10: sample rows as self-queries, compare the baked (possibly
 	// quantized) bank's top-10 against a float32 reference bank built from the same
 	// normalized source. Reproducible: the seed is fixed and recorded on the asset.
@@ -170,10 +316,11 @@ USuperFAISSVectorBank* FSuperFAISSBankImport::Import(
 		OutError = TEXT("header is missing a required field (schemaVersion/dims/count/metric/dtype)");
 		return nullptr;
 	}
-	if (HeaderSchema != superfaiss::kSchemaVersion)
+	if (HeaderSchema < 1 || HeaderSchema > 2)
 	{
-		OutError = FString::Printf(TEXT("header schemaVersion %d, expected %d"),
-			HeaderSchema, superfaiss::kSchemaVersion);
+		OutError = FString::Printf(
+			TEXT("header schemaVersion %d, supported 1 (channel-less) or 2 (channels)"),
+			HeaderSchema);
 		return nullptr;
 	}
 	if (DtypeText != TEXT("float32"))
@@ -215,6 +362,46 @@ USuperFAISSVectorBank* FSuperFAISSBankImport::Import(
 		}
 	}
 
+	// --- Channels (schemaVersion 2) ---
+	TArray<FName> ChannelNames;
+	TArray<int32> ChannelOffsets;
+	TArray<int32> ChannelLengths;
+	const TArray<TSharedPtr<FJsonValue>>* ChannelValues = nullptr;
+	if (Header->TryGetArrayField(TEXT("channels"), ChannelValues))
+	{
+		if (HeaderSchema < 2)
+		{
+			OutError = TEXT("channels require schemaVersion 2");
+			return nullptr;
+		}
+		for (const TSharedPtr<FJsonValue>& V : *ChannelValues)
+		{
+			const TSharedPtr<FJsonObject>* ChannelObject = nullptr;
+			FString Name;
+			int32 Offset = -1;
+			int32 Length = -1;
+			if (!V.IsValid() || !V->TryGetObject(ChannelObject) ||
+				!(*ChannelObject)->TryGetStringField(TEXT("name"), Name) ||
+				!(*ChannelObject)->TryGetNumberField(TEXT("offset"), Offset) ||
+				!(*ChannelObject)->TryGetNumberField(TEXT("length"), Length) ||
+				Name.IsEmpty())
+			{
+				OutError = TEXT("malformed channel entry (name/offset/length required)");
+				return nullptr;
+			}
+			ChannelNames.Add(FName(*Name));
+			ChannelOffsets.Add(Offset);
+			ChannelLengths.Add(Length);
+		}
+		// Range/grid/order/uniqueness rules are enforced by InitFromSource with
+		// line-item errors - one validator, one truth.
+	}
+	else if (HeaderSchema >= 2)
+	{
+		OutError = TEXT("schemaVersion 2 without a channels table (declare 1 instead)");
+		return nullptr;
+	}
+
 	// --- Payload ---
 	TArray<uint8> BinBytes;
 	const FString BinPath = BinPathFor(JsonPath);
@@ -244,7 +431,8 @@ USuperFAISSVectorBank* FSuperFAISSBankImport::Import(
 
 	USuperFAISSVectorBank* Bank = NewObject<USuperFAISSVectorBank>(
 		Outer ? Outer : GetTransientPackage(), AssetName, RF_Public | RF_Standalone);
-	if (!Bank->InitFromSource(Rows, Count, Dims, Metric, Quantization, Ids, Hash, OutError))
+	if (!Bank->InitFromSource(Rows, Count, Dims, Metric, Quantization, Ids, Hash, OutError,
+			ChannelNames, ChannelOffsets, ChannelLengths))
 	{
 		Bank->ClearFlags(RF_Public | RF_Standalone);
 		Bank->MarkAsGarbage();
@@ -263,6 +451,18 @@ USuperFAISSVectorBank* FSuperFAISSBankImport::Import(
 		constexpr uint64 kRecallSeed = 0x5EEDF00DCAFEBEEFull;
 		Bank->RecallAt10 = ComputeRecallAt10(Rows, Count, Dims, Metric, Bank, kRecallSeed);
 		Bank->RecallSeed = kRecallSeed;
+
+		// Per-channel recall on int8 Cosine channel banks (T-044 W2b): the
+		// honest-budget number per channel, same seed discipline.
+		if (Bank->GetChannelCount() > 0 && Metric == ESuperFAISSBankMetric::Cosine)
+		{
+			Bank->ChannelRecallAt10.Reset();
+			for (int32 C = 0; C < Bank->GetChannelCount(); ++C)
+			{
+				Bank->ChannelRecallAt10.Add(ComputeChannelRecallAt10(
+					Rows, Count, Dims, Bank, kRecallSeed + 1 + C, C));
+			}
+		}
 		UE_LOG(LogTemp, Display,
 			TEXT("SuperFAISSBankImport %s: %d x %d %s int8, recall@10 %.4f (seed %llx)"),
 			*AssetName.ToString(), Count, Dims, *MetricText, Bank->RecallAt10, Bank->RecallSeed);

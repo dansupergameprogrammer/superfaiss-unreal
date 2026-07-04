@@ -47,6 +47,51 @@ void ScoreChunkFused(
 	const uint32_t* excludeBits,
 	TopK& inout);
 
+// Segmented scan, dense form (V2 §10 decision). NOTE the shipped split: dot-family
+// segmented scans FOLD segment weights into the query (see query.cpp) and run the
+// plain ScoreChunk at V1 speed — this dense primitive is the L2 path (weights sit
+// inside the square and cannot fold), and the substrate for slot-2 decomposition.
+// It scores each non-excluded row of one chunk over a segment
+// list — per-segment partials from the SAME per-row kernels ScoreChunk uses, combined
+// as sum(weight_s * partial_s) in segment order. The degenerate one-segment list
+// (0, paddedDims, 1.0) is bit-identical to ScoreChunk by construction (same kernel
+// entry points; x*1.0f is bitwise identity). Weight-0 segments and omitted ranges are
+// never read — masking is a bandwidth cut. Callers validate segments first
+// (ValidateSegments); kernels do not re-validate.
+void ScoreChunkSegmented(
+	const BankView& bank,
+	const float* paddedQuery,
+	int32_t chunkIndex,
+	const uint32_t* excludeBits,
+	const QuerySegment* segments,
+	int32_t segmentCount,
+	TopK& inout);
+
+// Segmented intersection: the fused worst-of law over segmented totals — each member
+// query scores through the same segmented per-row path, then worst-of in the metric's
+// better-direction. One segment list applies to every member query.
+void ScoreChunkFusedSegmented(
+	const BankView& bank,
+	const float* paddedQueries,
+	int32_t queryCount,
+	int32_t chunkIndex,
+	const uint32_t* excludeBits,
+	const QuerySegment* segments,
+	int32_t segmentCount,
+	TopK& inout);
+
+// Per-row decomposition (V2 section 6): scores one row over the segment list and
+// surfaces the post-scale post-weight per-segment contributions; the returned total
+// is their ordered sum, bit-exact by construction. Per-hit cost, not per-row: call
+// it on hits, not banks. Callers validate segments first.
+float DecomposeRowScore(
+	const BankView& bank,
+	const float* paddedQuery,
+	int32_t rowIndex,
+	const QuerySegment* segments,
+	int32_t segmentCount,
+	float* outContributions);
+
 // Kernel path selected at compile time (NEON/SSE/scalar), plus a runtime AVX2+FMA
 // upgrade on x86 hardware that supports it. Dispatch is per-device stable, so the
 // per-device determinism promise is unaffected. Exposed for tests and diagnostics.

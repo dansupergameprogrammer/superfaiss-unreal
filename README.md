@@ -16,6 +16,13 @@ Measured on the shipped demo bank (40,000 words x 100 dims, int8, ~4 MB), deskto
 editor: single query **0.13 ms**, batched **0.06 ms per query** — exact search,
 bit-deterministic, zero steady-state allocation.
 
+**New in 2.0:** named channels (rank by a weighted combination of vector sub-spaces,
+with exact per-channel decomposition of every hit and true per-channel cosines) and
+scratch banks (mutable runtime banks — append/remove/query/freeze/save — for NPC
+memory and session-accumulated embeddings). Channels are a semantics feature, not a
+speed feature: a channel query costs approximately one full scan, and the docs say
+so plainly. See the [plugin README](SuperFAISSUnreal/README.md).
+
 ![The shipped demo: one query against two GloVe banks, sub-millisecond async results](docs/demo.png)
 
 ## Repo layout
@@ -38,11 +45,12 @@ Or headless, from the repo root:
 UnrealEditor-Cmd ExampleProject/ExampleProject.uproject -ExecCmds="Automation RunTests SuperFAISS; Quit" -unattended -nullrhi
 ```
 
-26 automation tests (28 with the optional MCP toolset enabled): kernel correctness, SIMD/scalar mirror equality, determinism,
-tie-break stability, concurrency, asset round-trips, import rejection, quantizer
-recall, performance guards, query composition (centroid, direction, intersection,
-margins), bank lint analyses, prototype authoring, a golden semantic query on the
-demo bank, and the Mass swarm's stability.
+28 automation tests (30 with the optional MCP toolset enabled): kernel correctness,
+SIMD/scalar mirror equality, determinism, tie-break stability, concurrency, asset
+round-trips, import rejection, quantizer recall, performance guards, query
+composition (centroid, direction, intersection, margins), named-channel queries and
+decomposition, scratch banks, bank lint analyses, prototype authoring, a golden
+semantic query on the demo bank, and the Mass swarm's stability.
 
 ## Use it in your project
 

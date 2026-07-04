@@ -13,6 +13,7 @@
 #include "Misc/Paths.h"
 #include "Serialization/JsonSerializer.h"
 #include "SuperFAISSToolset.h"
+#include "SuperFAISSScratchBank.h"
 #include "UObject/Package.h"
 
 namespace
@@ -134,7 +135,7 @@ bool FSuperFAISSMCPToolGoldensTest::RunTest(const FString& Parameters)
 	// QueryBank by id: the F1 golden neighborhood through the tool path.
 	{
 		const TSharedPtr<FJsonObject> R = ParseTool(USuperFAISSToolset::QueryBank(
-			DemoBankPath, TEXT("wizard"), -1, {}, 5, false));
+			DemoBankPath, TEXT("wizard"), -1, {}, {}, {}, 5, false));
 		if (TestTrue(TEXT("QueryBank parses"), R.IsValid()) &&
 			TestFalse(TEXT("QueryBank not error"), R->HasField(TEXT("error"))))
 		{
@@ -185,7 +186,7 @@ bool FSuperFAISSMCPToolGoldensTest::RunTest(const FString& Parameters)
 
 			// The imported bank answers queries through the tool path.
 			const TSharedPtr<FJsonObject> Q = ParseTool(USuperFAISSToolset::QueryBank(
-				FString(ImportDest) + TEXT(".ToolImport"), TEXT("row3"), -1, {}, 3, false));
+				FString(ImportDest) + TEXT(".ToolImport"), TEXT("row3"), -1, {}, {}, {}, 3, false));
 			TestTrue(TEXT("imported bank queries"),
 				Q.IsValid() && !Q->HasField(TEXT("error")));
 		}
@@ -205,6 +206,56 @@ bool FSuperFAISSMCPToolGoldensTest::RunTest(const FString& Parameters)
 				TestFalse(FString::Printf(TEXT("content bank invalid: %s"), *Path),
 					Path.StartsWith(TEXT("/SuperFAISSUnreal/")) ||
 					Path.StartsWith(TEXT("/Game/")));
+			}
+		}
+	}
+
+	// Scratch tools (D-M3, read-only): a live scratch bank is listed, described,
+	// and queried through the tool path.
+	{
+		USuperFAISSScratchBank* Scratch = NewObject<USuperFAISSScratchBank>();
+		TestTrue(TEXT("scratch init"), Scratch->Init(8, 4,
+			ESuperFAISSBankMetric::Dot, ESuperFAISSBankQuantization::Float32));
+		int32 Index = INDEX_NONE;
+		TestTrue(TEXT("scratch append"),
+			Scratch->Append({1.0f, 0.0f, 0.0f, 0.0f}, Index));
+		TestTrue(TEXT("scratch append 2"),
+			Scratch->Append({0.0f, 1.0f, 0.0f, 0.0f}, Index));
+
+		const TSharedPtr<FJsonObject> L = ParseTool(USuperFAISSToolset::ListScratchBanks());
+		bool bListed = false;
+		if (TestTrue(TEXT("list scratch parses"), L.IsValid()))
+		{
+			for (const TSharedPtr<FJsonValue>& V : L->GetArrayField(TEXT("scratchBanks")))
+			{
+				if (V->AsObject()->GetStringField(TEXT("path")) == Scratch->GetPathName())
+				{
+					bListed = true;
+				}
+			}
+		}
+		TestTrue(TEXT("scratch bank listed"), bListed);
+
+		const TSharedPtr<FJsonObject> D =
+			ParseTool(USuperFAISSToolset::DescribeScratchBank(Scratch->GetPathName()));
+		if (TestTrue(TEXT("describe scratch parses"), D.IsValid()))
+		{
+			TestEqual(TEXT("scratch count"), (int32)D->GetNumberField(TEXT("count")), 2);
+			TestEqual(TEXT("scratch capacity"),
+				(int32)D->GetNumberField(TEXT("capacity")), 8);
+		}
+
+		const TSharedPtr<FJsonObject> Q = ParseTool(USuperFAISSToolset::QueryScratchBank(
+			Scratch->GetPathName(), {1.0f, 0.0f, 0.0f, 0.0f}, 2));
+		if (TestTrue(TEXT("query scratch parses"), Q.IsValid()) &&
+			TestFalse(TEXT("query scratch not error"), Q->HasField(TEXT("error"))))
+		{
+			const TArray<TSharedPtr<FJsonValue>>& Hits = Q->GetArrayField(TEXT("hits"));
+			TestEqual(TEXT("scratch hits"), Hits.Num(), 2);
+			if (Hits.Num() == 2)
+			{
+				TestEqual(TEXT("scratch best"),
+					(int32)Hits[0]->AsObject()->GetNumberField(TEXT("index")), 0);
 			}
 		}
 	}
@@ -236,17 +287,38 @@ bool FSuperFAISSMCPToolValidationTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("unknown bank"), IsToolError(
 		USuperFAISSToolset::DescribeBank(TEXT("/Game/DoesNotExist.DoesNotExist"))));
 	TestTrue(TEXT("unknown bank query"), IsToolError(USuperFAISSToolset::QueryBank(
-		TEXT("/Game/DoesNotExist.DoesNotExist"), TEXT("x"), -1, {}, 5, false)));
+		TEXT("/Game/DoesNotExist.DoesNotExist"), TEXT("x"), -1, {}, {}, {}, 5, false)));
 	TestTrue(TEXT("unknown id"), IsToolError(USuperFAISSToolset::QueryBank(
-		DemoBankPath, TEXT("zzz_not_a_word_zzz"), -1, {}, 5, false)));
+		DemoBankPath, TEXT("zzz_not_a_word_zzz"), -1, {}, {}, {}, 5, false)));
 	TestTrue(TEXT("two query sources"), IsToolError(USuperFAISSToolset::QueryBank(
-		DemoBankPath, TEXT("wizard"), 5, {}, 5, false)));
+		DemoBankPath, TEXT("wizard"), 5, {}, {}, {}, 5, false)));
 	TestTrue(TEXT("no query source"), IsToolError(USuperFAISSToolset::QueryBank(
-		DemoBankPath, FString(), -1, {}, 5, false)));
+		DemoBankPath, FString(), -1, {}, {}, {}, 5, false)));
 	TestTrue(TEXT("bad vector dims"), IsToolError(USuperFAISSToolset::QueryBank(
-		DemoBankPath, FString(), -1, {1.0f, 2.0f}, 5, false)));
+		DemoBankPath, FString(), -1, {1.0f, 2.0f}, {}, {}, 5, false)));
 	TestTrue(TEXT("row out of range"), IsToolError(USuperFAISSToolset::QueryBank(
-		DemoBankPath, FString(), 999999, {}, 5, false)));
+		DemoBankPath, FString(), 999999, {}, {}, {}, 5, false)));
+
+	// Channel args: mismatched parallel arrays and unknown channels are tool errors.
+	TestTrue(TEXT("channel array mismatch"), IsToolError(USuperFAISSToolset::QueryBank(
+		DemoBankPath, TEXT("wizard"), -1, {}, {TEXT("identity")}, {}, 5, false)));
+	TestTrue(TEXT("unknown channel"), IsToolError(USuperFAISSToolset::QueryBank(
+		DemoBankPath, TEXT("wizard"), -1, {}, {TEXT("identity")}, {1.0f}, 5, false)));
+
+	// Scratch tools: unknown path and bad vector are tool errors, never crashes.
+	TestTrue(TEXT("unknown scratch bank"), IsToolError(
+		USuperFAISSToolset::DescribeScratchBank(TEXT("/Engine/Transient.Nope"))));
+	TestTrue(TEXT("unknown scratch query"), IsToolError(
+		USuperFAISSToolset::QueryScratchBank(TEXT("/Engine/Transient.Nope"), {1.0f}, 3)));
+	{
+		USuperFAISSScratchBank* Scratch = NewObject<USuperFAISSScratchBank>();
+		TestTrue(TEXT("scratch v init"), Scratch->Init(4, 4,
+			ESuperFAISSBankMetric::Dot, ESuperFAISSBankQuantization::Float32));
+		int32 Index = INDEX_NONE;
+		Scratch->Append({1.0f, 0.0f, 0.0f, 0.0f}, Index);
+		TestTrue(TEXT("scratch bad dims"), IsToolError(
+			USuperFAISSToolset::QueryScratchBank(Scratch->GetPathName(), {1.0f}, 3)));
+	}
 
 	// Id queries against an id-less bank are refused (import an id-less fixture).
 	{
@@ -260,7 +332,7 @@ bool FSuperFAISSMCPToolValidationTest::RunTest(const FString& Parameters)
 			TestTrue(TEXT("id on id-less bank refused"),
 				IsToolError(USuperFAISSToolset::QueryBank(
 					FString(ImportDestIdless) + TEXT(".ToolImportIdless"), TEXT("row0"),
-					-1, {}, 3, false)));
+					-1, {}, {}, {}, 3, false)));
 		}
 		const FString IdlessFile = FPackageName::LongPackageNameToFilename(
 			ImportDestIdless, FPackageName::GetAssetPackageExtension());

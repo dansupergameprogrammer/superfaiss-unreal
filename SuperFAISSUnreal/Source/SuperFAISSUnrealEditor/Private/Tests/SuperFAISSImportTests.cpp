@@ -30,7 +30,7 @@ namespace
 		FString BinPath() const { return JsonPath.LeftChop(5) + TEXT(".bin"); }
 
 		void WriteHeader(int32 Dims, int32 Count, const FString& Metric,
-			const TArray<FString>* Ids = nullptr, int32 SchemaVersion = superfaiss::kSchemaVersion)
+			const TArray<FString>* Ids = nullptr, int32 SchemaVersion = 1)
 		{
 			FString Json = FString::Printf(
 				TEXT("{\n \"schemaVersion\": %d,\n \"dims\": %d,\n \"count\": %d,\n")
@@ -323,7 +323,7 @@ bool FSuperFAISSValidateSweepTest::RunTest(const FString& Parameters)
 
 	// Corrupt one in memory: schema bump + revalidate via PostLoad path.
 	AddExpectedError(TEXT("schema version"), EAutomationExpectedErrorFlags::Contains, 1);
-	Healthy->SchemaVersion = superfaiss::kSchemaVersion + 1;
+	Healthy->SchemaVersion = USuperFAISSVectorBank::kMaxAssetSchemaVersion + 1;
 	Healthy->PostLoad();
 	Invalid.Reset();
 	const int32 InvalidCount = FSuperFAISSBankImport::ValidateLoadedBanks(Invalid);

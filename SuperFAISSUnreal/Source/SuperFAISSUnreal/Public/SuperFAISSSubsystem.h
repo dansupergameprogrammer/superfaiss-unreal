@@ -6,6 +6,7 @@
 #include "SuperFAISSSubsystem.generated.h"
 
 class USuperFAISSVectorBank;
+class USuperFAISSScratchBank;
 
 USTRUCT(BlueprintType)
 struct FSuperFAISSHit
@@ -28,6 +29,29 @@ struct FSuperFAISSHit
 	float Margin = 0.0f;
 };
 
+// A named channel with a weight - the Blueprint-sane face of segmented queries
+// (plan section 5): names resolve once at query build, never in the kernel.
+USTRUCT(BlueprintType)
+struct FSuperFAISSChannelWeight
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Similarity")
+	FName Channel;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Similarity")
+	float Weight = 1.0f;
+};
+
+// An explicit element-range segment with a weight (C++ surface; ranges are on the
+// bank's 16-byte element grid).
+struct FSuperFAISSSegment
+{
+	int32 Offset = 0;
+	int32 Length = 0;
+	float Weight = 1.0f;
+};
+
 // C++ query options. Blueprint uses the simplified UFUNCTION surface below.
 struct FSuperFAISSQueryArgs
 {
@@ -38,6 +62,12 @@ struct FSuperFAISSQueryArgs
 	// Dot/Cosine banks; on L2 banks this is the axis-projection path (rank along a
 	// MakeDirectionQuery direction). Bank validation rules are unaffected.
 	bool bScoreAsDot = false;
+	// Segmented query (V2): named channels (resolved against the bank's channel
+	// table at query build; on Cosine channel banks the query's channel sub-vectors
+	// are renormalized and scores are true per-channel cosines) OR explicit raw
+	// ranges. Provide at most one form; empty = the whole row (the V1 path).
+	TArray<FSuperFAISSChannelWeight> Channels;
+	TArray<FSuperFAISSSegment> Segments;
 };
 
 DECLARE_DYNAMIC_DELEGATE_TwoParams(FSuperFAISSResultDelegate,
@@ -113,6 +143,18 @@ public:
 		const FSuperFAISSQueryArgs& Args,
 		TArray<FSuperFAISSHit>& OutHits);
 
+	// Scratch-bank query (V2 plan section 7): pins the bank for the flight
+	// (V2-G5), snapshots, and scans with the snapshot's tombstones OR'd into the
+	// exclusion set - deletion is exclusion. Refused while the bank is draining
+	// for a Grow/Freeze/Load (T-044 N4 - this is the one dispatch-point gate).
+	// Args.Channels is rejected (scratch banks carry no channel table);
+	// Args.Segments raw ranges work. Callable from any thread.
+	bool QueryScratch(
+		USuperFAISSScratchBank* Bank,
+		TConstArrayView<float> UnpaddedQuery,
+		const FSuperFAISSQueryArgs& Args,
+		TArray<FSuperFAISSHit>& OutHits);
+
 	// Blueprint surface. Sync is intended for small banks; Async for everything else.
 	UFUNCTION(BlueprintCallable, Category = "Similarity",
 		meta = (DisplayName = "Query Similar (Sync)"))
@@ -131,6 +173,31 @@ public:
 	bool QuerySimilarIntersect(const USuperFAISSVectorBank* Bank,
 		const TArray<float>& QueryA, const TArray<float>& QueryB, int32 K,
 		TArray<FSuperFAISSHit>& Hits);
+
+	// Named-channel query for Blueprint: rank by a weighted combination of the
+	// bank's named channels ("identity 1.0, appearance 0.2"). On Cosine channel
+	// banks each channel's score is a true per-channel cosine.
+	// Scratch-bank query for Blueprint.
+	UFUNCTION(BlueprintCallable, Category = "Similarity",
+		meta = (DisplayName = "Query Similar (Scratch)"))
+	bool QuerySimilarScratch(USuperFAISSScratchBank* Bank, const TArray<float>& Query,
+		int32 K, TArray<FSuperFAISSHit>& Hits);
+
+	UFUNCTION(BlueprintCallable, Category = "Similarity",
+		meta = (DisplayName = "Query Similar (Channels)"))
+	bool QuerySimilarChannels(const USuperFAISSVectorBank* Bank,
+		const TArray<float>& Query, const TArray<FSuperFAISSChannelWeight>& Channels,
+		int32 K, TArray<FSuperFAISSHit>& Hits);
+
+	// Decomposition ("why did this match"): per-channel/segment contributions of one
+	// row against a segmented query; contributions sum exactly to OutTotal, and
+	// OutTotal equals the score the same query's scan produced for that row. Per-hit
+	// cost - call it on hits, not banks.
+	UFUNCTION(BlueprintCallable, Category = "Similarity",
+		meta = (DisplayName = "Decompose Hit"))
+	bool DecomposeHit(const USuperFAISSVectorBank* Bank, const TArray<float>& Query,
+		const TArray<FSuperFAISSChannelWeight>& Channels, int32 RowIndex,
+		TArray<float>& OutContributions, float& OutTotal);
 
 	// Mean of the selected bank rows as a query vector ("the category's center"):
 	// int8 rows dequantize through their per-row scales; on Cosine banks the mean is
