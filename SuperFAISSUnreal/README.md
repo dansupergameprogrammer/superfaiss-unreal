@@ -43,6 +43,41 @@ Sim->QueryBatch(Bank, ConcatenatedQueries, QueryCount, Args, Hits, Counts);
 
 Blueprint: `Query Similar (Sync)` / `Query Similar (Async)` on the subsystem.
 
+## Composing queries
+
+Every hit carries `Margin` — the score gap to the next-ranked hit ("won by how
+much"); the top hit's margin is the runner-up gap. Beyond a raw vector, queries can
+be built and combined:
+
+```cpp
+// "The category's center": mean of selected rows (int8 dequantized; Cosine
+// renormalized; a cancelling mean is rejected, not renormalized into noise).
+Sim->MakeCentroidQuery(Bank, {RowA, RowB, RowC}, Centroid);
+
+// "Most X-like relative to Y": unit direction, ranked as a dot query.
+Sim->MakeDirectionQuery(VectorX, VectorY, Direction);
+Args.bScoreAsDot = true;                    // required on L2 banks; no-op otherwise
+Sim->QuerySync(Bank, Direction, Args, Hits);
+
+// "Similar to ALL of these": exact intersection in one bank pass. Each row is
+// ranked by its WORST score against the member queries, so every returned row
+// clears the fused score against every query. Subtraction is the exclusion bitset.
+Sim->QueryIntersect(Bank, ConcatenatedQueries, QueryCount, Args, Hits);
+```
+
+Blueprint: `Make Centroid Query`, `Make Direction Query`, `Query Similar (Intersect)`.
+
+## The query side of the encoder seam
+
+An *encoder* is anything that turns domain state — text, images, gameplay — into a
+vector. This plugin ships no encoders, ever: the bake side of the seam is the sidecar
+format (any pipeline that emits it is an encoder), and the query side is
+`ISuperFAISSQueryProvider` — implement `GetQueryVector(Bank, OutQuery)` on any object
+(C++ or Blueprint) and hand its output to the subsystem. The shipped reference
+implementation, `USuperFAISSBankRowQueryProvider`, produces the query from an
+existing bank row by Id or index — the "find things like this known thing" case.
+Everything domain-specific lives on the implementing side of the interface.
+
 ## Making banks
 
 Export embeddings from any pipeline as the two-file sidecar format —
@@ -62,6 +97,13 @@ the asset (the demo bank: 0.9916).
 Validate every bank in CI: `-run=SuperFAISSUnrealValidate` (non-zero exit on any
 invalid bank).
 
+Add `-Lint` for on-demand health analyses: near-duplicate rows (sampled above a
+configurable cap, never silently exhaustive), low-variance dims, and prototype
+overlap. In-editor, **Tools > SuperFAISS Bank Inspector** gives live queries with
+margins and a PCA projection point cloud of any bank; selected rows become named
+prototype assets (`USuperFAISSPrototypeAsset` — also a query provider) via the
+authoring library.
+
 ## Guarantees
 
 - **Exact**, not approximate: true top-k under Dot, Cosine, or L2.
@@ -77,7 +119,7 @@ invalid bank).
 
 ## Stripping the demo
 
-The demo module is the plugin's only contact with Mass and UMG; nothing outside it
+The demo module is the plugin's only contact with Mass; nothing outside it
 references it. To ship without the demo (or without Mass), three steps:
 
 1. Delete `Source/SuperFAISSUnrealDemo/`.
@@ -88,10 +130,11 @@ The stripped plugin compiles and the non-demo test groups pass unchanged.
 
 ## Tests
 
-`SuperFAISS.*` automation tests (18) cover kernel correctness, SIMD/scalar mirror
+`SuperFAISS.*` automation tests (26) cover kernel correctness, SIMD/scalar mirror
 equality, determinism, tie-break stability, concurrency, asset round-trips, import
-rejection, quantizer recall, performance guards, and a golden semantic query on the
-demo bank. Run headless:
+rejection, quantizer recall, performance guards, query composition (centroid,
+direction, intersection, margins), bank lint analyses, prototype authoring, a golden
+semantic query on the demo bank, and the Mass swarm's stability (F2). Run headless:
 
 ```
 UnrealEditor-Cmd <project> -ExecCmds="Automation RunTests SuperFAISS; Quit" -unattended -nullrhi

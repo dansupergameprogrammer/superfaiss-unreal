@@ -37,16 +37,19 @@ Or headless, from the repo root:
 UnrealEditor-Cmd ExampleProject/ExampleProject.uproject -ExecCmds="Automation RunTests SuperFAISS; Quit" -unattended -nullrhi
 ```
 
-18 automation tests: kernel correctness, SIMD/scalar mirror equality, determinism,
+26 automation tests: kernel correctness, SIMD/scalar mirror equality, determinism,
 tie-break stability, concurrency, asset round-trips, import rejection, quantizer
-recall, performance guards, and a golden semantic query on the demo bank.
+recall, performance guards, query composition (centroid, direction, intersection,
+margins), bank lint analyses, prototype authoring, a golden semantic query on the
+demo bank, and the Mass swarm's stability.
 
 ## Use it in your project
 
 Copy `SuperFAISSUnreal/` into `<YourProject>/Plugins/` and enable it. The plugin is
 self-contained (the core library is vendored inside), has no platform allowlist, and
-depends only on stable engine modules (the demo module adds Slate/InputCore and is
-strippable in three steps) — see the [plugin README](SuperFAISSUnreal/README.md) for
+depends only on stable engine modules (the demo module adds Slate/InputCore and
+Mass — UE 5.8 engine modules, no plugin references — and is strippable in three
+steps) — see the [plugin README](SuperFAISSUnreal/README.md) for
 the API quick start, bank authoring, guarantees, and demo-strip steps.
 
 ## Engine versions

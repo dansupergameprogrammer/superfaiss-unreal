@@ -13,3 +13,5 @@
 #include "../../../ThirdParty/SuperFAISS/src/validate.cpp"
 #include "../../../ThirdParty/SuperFAISS/src/bake.cpp"
 #include "../../../ThirdParty/SuperFAISS/src/query.cpp"
+#include "../../../ThirdParty/SuperFAISS/src/compose.cpp"
+#include "../../../ThirdParty/SuperFAISS/src/pca.cpp"

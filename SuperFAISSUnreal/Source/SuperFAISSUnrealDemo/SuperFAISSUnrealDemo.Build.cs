@@ -16,6 +16,10 @@ public class SuperFAISSUnrealDemo : ModuleRules
 			"SlateCore",
 			"SuperFAISSUnreal",
 			"AssetRegistry",
+			// Station 2 (plan section 11, D13): the Mass swarm - the demo module is the
+			// plugin's only Mass contact (section 6 strippable-by-construction rule).
+			"MassEntity",
+			"MassCore",
 		});
 	}
 }

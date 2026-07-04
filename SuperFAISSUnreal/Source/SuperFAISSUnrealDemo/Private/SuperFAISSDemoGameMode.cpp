@@ -6,6 +6,7 @@
 #include "HAL/PlatformTime.h"
 #include "Styling/CoreStyle.h"
 #include "Widgets/Input/SButton.h"
+#include "SuperFAISSSwarmSubsystem.h"
 #include "Widgets/Input/SComboBox.h"
 #include "Widgets/Input/SEditableTextBox.h"
 #include "Widgets/Layout/SBorder.h"
@@ -26,8 +27,10 @@ public:
 	SLATE_BEGIN_ARGS(SSuperFAISSUnrealDemo) {}
 	SLATE_END_ARGS()
 
-	void Construct(const FArguments& InArgs, TArray<USuperFAISSVectorBank*> InBanks)
+	void Construct(const FArguments& InArgs, TArray<USuperFAISSVectorBank*> InBanks,
+		UWorld* InWorld)
 	{
+		WorldRef = InWorld;
 		for (USuperFAISSVectorBank* InBank : InBanks)
 		{
 			if (InBank != nullptr && InBank->IsValid())
@@ -79,6 +82,20 @@ public:
 							.Text(FText::FromString(TEXT("Benchmark both banks")))
 						]
 					]
+					+ SHorizontalBox::Slot().AutoWidth().Padding(12, 0, 0, 0)
+					[
+						SNew(SButton)
+						.OnClicked(this, &SSuperFAISSUnrealDemo::OnToggleSwarm)
+						[
+							SNew(STextBlock).Font(Body)
+							.Text(this, &SSuperFAISSUnrealDemo::GetSwarmButtonText)
+						]
+					]
+					+ SHorizontalBox::Slot().AutoWidth().Padding(12, 6, 0, 0)
+					[
+						SNew(STextBlock).Font(Body)
+						.Text(this, &SSuperFAISSUnrealDemo::GetSwarmReadout)
+					]
 				]
 
 				+ SVerticalBox::Slot().FillHeight(1.0f).Padding(0, 10, 0, 0)
@@ -97,7 +114,54 @@ public:
 		];
 	}
 
+	// Station 2 (plan section 11): the Mass swarm, toggled from the demo UI; the
+	// readout mirrors what F2 asserts (entities, batch cadence, batch time).
+	FReply OnToggleSwarm()
+	{
+		USuperFAISSSwarmSubsystem* Swarm = GetSwarm();
+		if (Swarm != nullptr)
+		{
+			if (Swarm->IsRunning())
+			{
+				Swarm->StopSwarm();
+			}
+			else
+			{
+				Swarm->StartSwarm(2000, 64, 16, /*Seed*/ 7);
+			}
+		}
+		return FReply::Handled();
+	}
+
+	FText GetSwarmButtonText() const
+	{
+		const USuperFAISSSwarmSubsystem* Swarm = GetSwarm();
+		return FText::FromString(Swarm != nullptr && Swarm->IsRunning()
+			? TEXT("Stop swarm") : TEXT("Start swarm (Mass)"));
+	}
+
+	FText GetSwarmReadout() const
+	{
+		const USuperFAISSSwarmSubsystem* Swarm = GetSwarm();
+		if (Swarm == nullptr || !Swarm->IsRunning())
+		{
+			return FText::GetEmpty();
+		}
+		return FText::FromString(FString::Printf(
+			TEXT("%d entities x %d archetypes - batch %.2f ms (%d runs)"),
+			Swarm->GetEntityCount(), Swarm->GetArchetypeCount(),
+			Swarm->GetLastBatchMilliseconds(), Swarm->GetAssignmentBatchesRun()));
+	}
+
+	USuperFAISSSwarmSubsystem* GetSwarm() const
+	{
+		return WorldRef.IsValid() ? WorldRef->GetSubsystem<USuperFAISSSwarmSubsystem>()
+		                          : nullptr;
+	}
+
 private:
+	TWeakObjectPtr<UWorld> WorldRef;
+
 	struct FPanel
 	{
 		int32 ActiveIndex = 0;
@@ -424,7 +488,7 @@ void ASuperFAISSDemoGameMode::BeginPlay()
 			*Bank->GetName(), Bank->Dims, Bank->Count, Bank->IsValid() ? 1 : 0);
 	}
 
-	DemoWidget = SNew(SSuperFAISSUnrealDemo, TArray<USuperFAISSVectorBank*>(DemoBanks));
+	DemoWidget = SNew(SSuperFAISSUnrealDemo, TArray<USuperFAISSVectorBank*>(DemoBanks), GetWorld());
 	if (GEngine->GameViewport)
 	{
 		GEngine->GameViewport->AddViewportWidgetContent(DemoWidget.ToSharedRef(), 100);

@@ -134,6 +134,15 @@ FName USuperFAISSVectorBank::GetIdForIndex(int32 Index) const
 	return NAME_None;
 }
 
+int32 USuperFAISSVectorBank::GetIndexForId(FName Id) const
+{
+	if (Id.IsNone())
+	{
+		return INDEX_NONE;
+	}
+	return Ids.IndexOfByKey(Id);
+}
+
 superfaiss::BankView USuperFAISSVectorBank::GetBankView() const
 {
 	// Shipping-safe gate (Poirot S3): check() compiles out in Shipping, where a

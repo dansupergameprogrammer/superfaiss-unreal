@@ -24,6 +24,11 @@ public class SuperFAISSUnrealEditor : ModuleRules
 		{
 			"Json",
 			"UnrealEd",
+			// Inspector/visualizer tab (plan section 18.2).
+			"Slate",
+			"SlateCore",
+			"InputCore",
+			"WorkspaceMenuStructure",
 		});
 	}
 }

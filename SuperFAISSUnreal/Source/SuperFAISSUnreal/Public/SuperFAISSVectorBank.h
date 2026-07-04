@@ -90,6 +90,11 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Bank")
 	FName GetIdForIndex(int32 Index) const;
 
+	// Reverse lookup: the row index carrying Id, or INDEX_NONE (also for id-less
+	// banks). Linear scan — editor-tool and setup-time speed, not per-frame.
+	UFUNCTION(BlueprintPure, Category = "Bank")
+	int32 GetIndexForId(FName Id) const;
+
 	// Non-owning view for the query path. Asserts IsValid().
 	superfaiss::BankView GetBankView() const;
 

@@ -20,6 +20,12 @@ struct FSuperFAISSHit
 
 	UPROPERTY(BlueprintReadOnly, Category = "Similarity")
 	float Score = 0.0f;
+
+	// Score gap to the next-ranked hit, in the scored metric's better-direction —
+	// "won by how much". Non-negative; 0 on the last returned hit. The top hit's
+	// Margin is the runner-up gap ("best match by how much").
+	UPROPERTY(BlueprintReadOnly, Category = "Similarity")
+	float Margin = 0.0f;
 };
 
 // C++ query options. Blueprint uses the simplified UFUNCTION surface below.
@@ -28,6 +34,10 @@ struct FSuperFAISSQueryArgs
 	int32 K = 10;
 	// Optional exclusion bitset, ceil(Count/32) words, bit set = skip row.
 	TConstArrayView<uint32> ExcludeBits;
+	// Score with the dot kernel regardless of the bank's metric: identity on
+	// Dot/Cosine banks; on L2 banks this is the axis-projection path (rank along a
+	// MakeDirectionQuery direction). Bank validation rules are unaffected.
+	bool bScoreAsDot = false;
 };
 
 DECLARE_DYNAMIC_DELEGATE_TwoParams(FSuperFAISSResultDelegate,
@@ -91,6 +101,18 @@ public:
 		TArray<FSuperFAISSHit>& OutHits,
 		TArray<int32>& OutCounts);
 
+	// Intersection ("similar to ALL of these"): exact top-k over the fused score —
+	// each row's worst per-query score in the scored metric's better-direction. Every
+	// returned row scores at least the fused score against every member query.
+	// Subtraction stays the exclusion bitset; QueryCount == 1 degenerates to
+	// QuerySync. One bank pass; queries concatenated, stride Bank->Dims, unpadded.
+	bool QueryIntersect(
+		const USuperFAISSVectorBank* Bank,
+		TConstArrayView<float> UnpaddedQueries,
+		int32 QueryCount,
+		const FSuperFAISSQueryArgs& Args,
+		TArray<FSuperFAISSHit>& OutHits);
+
 	// Blueprint surface. Sync is intended for small banks; Async for everything else.
 	UFUNCTION(BlueprintCallable, Category = "Similarity",
 		meta = (DisplayName = "Query Similar (Sync)"))
@@ -101,6 +123,31 @@ public:
 		meta = (DisplayName = "Query Similar (Async)"))
 	void QuerySimilarAsync(const USuperFAISSVectorBank* Bank, const TArray<float>& Query,
 		int32 K, FSuperFAISSResultDelegate OnComplete);
+
+	// Two-query intersection for Blueprint: rows similar to BOTH queries, ranked by
+	// their worse score of the two.
+	UFUNCTION(BlueprintCallable, Category = "Similarity",
+		meta = (DisplayName = "Query Similar (Intersect)"))
+	bool QuerySimilarIntersect(const USuperFAISSVectorBank* Bank,
+		const TArray<float>& QueryA, const TArray<float>& QueryB, int32 K,
+		TArray<FSuperFAISSHit>& Hits);
+
+	// Mean of the selected bank rows as a query vector ("the category's center"):
+	// int8 rows dequantize through their per-row scales; on Cosine banks the mean is
+	// renormalized, and a zero-norm mean (antipodal members cancelling) fails rather
+	// than being renormalized into noise. OutQuery has Bank->Dims elements.
+	UFUNCTION(BlueprintCallable, Category = "Similarity",
+		meta = (DisplayName = "Make Centroid Query"))
+	bool MakeCentroidQuery(const USuperFAISSVectorBank* Bank,
+		const TArray<int32>& RowIndices, TArray<float>& OutQuery);
+
+	// Unit direction from B toward A — normalize(A - B) — for "most A-like relative
+	// to B" projection queries. A == B fails (no direction). On L2 banks pass the
+	// result with bScoreAsDot.
+	UFUNCTION(BlueprintCallable, Category = "Similarity",
+		meta = (DisplayName = "Make Direction Query"))
+	bool MakeDirectionQuery(const TArray<float>& A, const TArray<float>& B,
+		TArray<float>& OutQuery);
 
 	// Diagnostics: workspace pool growth count (flat once warm — the B5 counter).
 	uint64 GetPoolGrowthCount() const;

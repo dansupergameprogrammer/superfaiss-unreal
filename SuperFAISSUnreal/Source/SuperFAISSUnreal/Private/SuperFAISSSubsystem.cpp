@@ -24,6 +24,7 @@ DECLARE_STATS_GROUP(TEXT("SuperFAISSUnreal"), STATGROUP_SuperFAISS, STATCAT_Adva
 DECLARE_CYCLE_STAT(TEXT("QuerySync"), STAT_SuperFAISSQuerySync, STATGROUP_SuperFAISS);
 DECLARE_CYCLE_STAT(TEXT("QueryBatch"), STAT_SuperFAISSQueryBatch, STATGROUP_SuperFAISS);
 DECLARE_CYCLE_STAT(TEXT("QueryAsyncTask"), STAT_SuperFAISSQueryAsync, STATGROUP_SuperFAISS);
+DECLARE_CYCLE_STAT(TEXT("QueryIntersect"), STAT_SuperFAISSQueryIntersect, STATGROUP_SuperFAISS);
 
 // Per-task scratch: a core Workspace (single-owner, per the core contract) plus an
 // aligned staging buffer for padded queries. Pooled; a warm pool never allocates.
@@ -86,6 +87,13 @@ namespace
 		QueryParams Params;
 		Params.k = Args.K;
 		Params.excludeBits = Args.ExcludeBits.Num() ? Args.ExcludeBits.GetData() : nullptr;
+		Params.scoreAs = Args.bScoreAsDot ? ScoreAs::Dot : ScoreAs::BankMetric;
+
+		// Effective view for scoring/ordering under the override. Validation always
+		// runs against the bank's own view (the core applies the same split), so the
+		// serial and parallel paths reject identically.
+		BankView Scoring = View;
+		Scoring.metric = ScoringMetric(View, Params);
 
 		// Path selection: parallel scan when configured and the bank is big enough for
 		// the fan-out to pay. ParallelFor joins before this function returns, so the
@@ -136,17 +144,17 @@ namespace
 			int32_t* ListCounts = Scratch.ChunkListCounts.GetData();
 			const uint32_t* Exclude = Params.excludeBits;
 
-			ParallelFor(Chunks, [&View, &Scratch, HeapBase, SortedBase, ListPtrs,
+			ParallelFor(Chunks, [&Scoring, &Scratch, HeapBase, SortedBase, ListPtrs,
 				ListCounts, Exclude, K](int32 Chunk)
 			{
 				TopK ChunkTopK;
-				ChunkTopK.Init(HeapBase + static_cast<int64>(Chunk) * K, K, View.metric);
-				ScoreChunk(View, Scratch.QueryStaging.GetData(), Chunk, Exclude, ChunkTopK);
+				ChunkTopK.Init(HeapBase + static_cast<int64>(Chunk) * K, K, Scoring.metric);
+				ScoreChunk(Scoring, Scratch.QueryStaging.GetData(), Chunk, Exclude, ChunkTopK);
 				ListPtrs[Chunk] = SortedBase + static_cast<int64>(Chunk) * K;
 				ListCounts[Chunk] = ChunkTopK.Finalize(SortedBase + static_cast<int64>(Chunk) * K);
 			});
 
-			HitCount = MergeTopK(ListPtrs, ListCounts, Chunks, View.metric, K,
+			HitCount = MergeTopK(ListPtrs, ListCounts, Chunks, Scoring.metric, K,
 				Scratch.MergeHeap.GetData(), Scratch.HitStaging.GetData());
 		}
 		else
@@ -165,6 +173,9 @@ namespace
 			OutHits[i].Index = Scratch.HitStaging[i].index;
 			OutHits[i].Id = Bank->GetIdForIndex(Scratch.HitStaging[i].index);
 			OutHits[i].Score = Scratch.HitStaging[i].score;
+			OutHits[i].Margin = (i + 1 < HitCount)
+				? Margin(Scratch.HitStaging[i], Scratch.HitStaging[i + 1], Scoring.metric)
+				: 0.0f;
 		}
 		return true;
 	}
@@ -251,6 +262,7 @@ FSuperFAISSTicket USuperFAISSSubsystem::QueryAsync(
 	TArray<float> QueryCopy(UnpaddedQuery.GetData(), UnpaddedQuery.Num());
 	TArray<uint32> ExcludeCopy(Args.ExcludeBits.GetData(), Args.ExcludeBits.Num());
 	const int32 K = Args.K;
+	const bool bScoreAsDot = Args.bScoreAsDot;
 	TSharedPtr<std::atomic<bool>, ESPMode::ThreadSafe> CancelFlag = Ticket.CancelFlag;
 
 	// Counted from dispatch until the game-thread delivery finishes, so the
@@ -259,7 +271,7 @@ FSuperFAISSTicket USuperFAISSSubsystem::QueryAsync(
 
 	FFunctionGraphTask::CreateAndDispatchWhenReady(
 		[this, PinnedBank = MoveTemp(PinnedBank), QueryCopy = MoveTemp(QueryCopy),
-			ExcludeCopy = MoveTemp(ExcludeCopy), K, CancelFlag,
+			ExcludeCopy = MoveTemp(ExcludeCopy), K, bScoreAsDot, CancelFlag,
 			Completion = MoveTemp(Completion)]() mutable
 		{
 			SCOPE_CYCLE_COUNTER(STAT_SuperFAISSQueryAsync);
@@ -271,6 +283,7 @@ FSuperFAISSTicket USuperFAISSSubsystem::QueryAsync(
 				FSuperFAISSQueryArgs TaskArgs;
 				TaskArgs.K = K;
 				TaskArgs.ExcludeBits = ExcludeCopy;
+				TaskArgs.bScoreAsDot = bScoreAsDot;
 				TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
 				bOk = RunQuery(PinnedBank.Get(), QueryCopy, TaskArgs, *Scratch, Hits);
 				ReleaseWorkspace(MoveTemp(Scratch));
@@ -358,6 +371,12 @@ bool USuperFAISSSubsystem::QueryBatch(
 	QueryParams Params;
 	Params.k = Args.K;
 	Params.excludeBits = Args.ExcludeBits.Num() ? Args.ExcludeBits.GetData() : nullptr;
+	Params.scoreAs = Args.bScoreAsDot ? ScoreAs::Dot : ScoreAs::BankMetric;
+
+	// Effective view for scoring/ordering; validation stays on the bank's view (same
+	// split as RunQuery and the core).
+	BankView Scoring = View;
+	Scoring.metric = ScoringMetric(View, Params);
 
 	// Path selection mirrors RunQuery: chunk-outer ParallelFor when configured and the
 	// bank is big enough; each chunk scores every query (pair kernels) while its rows
@@ -413,7 +432,7 @@ bool USuperFAISSSubsystem::QueryBatch(
 		const uint32_t* Exclude = Params.excludeBits;
 		const int32 Pd = View.paddedDims;
 
-		ParallelFor(Chunks, [&View, HeapBase, SortedBase, CellCounts, QueryBase, Exclude,
+		ParallelFor(Chunks, [&Scoring, HeapBase, SortedBase, CellCounts, QueryBase, Exclude,
 			K, QueryCount, Pd](int32 Chunk)
 		{
 			TopK PairA;
@@ -422,9 +441,9 @@ bool USuperFAISSSubsystem::QueryBatch(
 			for (; M + 2 <= QueryCount; M += 2)
 			{
 				const int64 CellA = static_cast<int64>(Chunk) * QueryCount + M;
-				PairA.Init(HeapBase + CellA * K, K, View.metric);
-				PairB.Init(HeapBase + (CellA + 1) * K, K, View.metric);
-				ScoreChunkPair(View,
+				PairA.Init(HeapBase + CellA * K, K, Scoring.metric);
+				PairB.Init(HeapBase + (CellA + 1) * K, K, Scoring.metric);
+				ScoreChunkPair(Scoring,
 					QueryBase + static_cast<int64>(M) * Pd,
 					QueryBase + static_cast<int64>(M + 1) * Pd,
 					Chunk, Exclude, PairA, PairB);
@@ -434,8 +453,8 @@ bool USuperFAISSSubsystem::QueryBatch(
 			if (M < QueryCount)
 			{
 				const int64 Cell = static_cast<int64>(Chunk) * QueryCount + M;
-				PairA.Init(HeapBase + Cell * K, K, View.metric);
-				ScoreChunk(View, QueryBase + static_cast<int64>(M) * Pd, Chunk, Exclude, PairA);
+				PairA.Init(HeapBase + Cell * K, K, Scoring.metric);
+				ScoreChunk(Scoring, QueryBase + static_cast<int64>(M) * Pd, Chunk, Exclude, PairA);
 				CellCounts[Cell] = PairA.Finalize(SortedBase + Cell * K);
 			}
 		});
@@ -456,7 +475,7 @@ bool USuperFAISSSubsystem::QueryBatch(
 				ListPtrs[Chunk] = SortedBase + Cell * K;
 				PerChunkCounts[Chunk] = CellCounts[Cell];
 			}
-			Counts[M] = MergeTopK(ListPtrs, PerChunkCounts, Chunks, View.metric,
+			Counts[M] = MergeTopK(ListPtrs, PerChunkCounts, Chunks, Scoring.metric,
 				K, Scratch->MergeHeap.GetData(),
 				Scratch->HitStaging.GetData() + static_cast<int64>(M) * K);
 		}
@@ -484,10 +503,176 @@ bool USuperFAISSSubsystem::QueryBatch(
 			Out.Index = H.index;
 			Out.Id = Bank->GetIdForIndex(H.index);
 			Out.Score = H.score;
+			Out.Margin = (i + 1 < Counts[M])
+				? Margin(H, Scratch->HitStaging[static_cast<int64>(M) * Args.K + i + 1],
+					Scoring.metric)
+				: 0.0f;
 		}
 	}
 	ReleaseWorkspace(MoveTemp(Scratch));
 	return true;
+}
+
+bool USuperFAISSSubsystem::QueryIntersect(
+	const USuperFAISSVectorBank* Bank,
+	TConstArrayView<float> UnpaddedQueries,
+	int32 QueryCount,
+	const FSuperFAISSQueryArgs& Args,
+	TArray<FSuperFAISSHit>& OutHits)
+{
+	SCOPE_CYCLE_COUNTER(STAT_SuperFAISSQueryIntersect);
+	using namespace superfaiss;
+
+	OutHits.Reset();
+	if (Bank == nullptr || !Bank->IsValid() || Args.K <= 0 || QueryCount <= 0 ||
+		UnpaddedQueries.Num() != static_cast<int64>(QueryCount) * Bank->Dims)
+	{
+		return false;
+	}
+	const BankView View = Bank->GetBankView();
+	if (Args.ExcludeBits.Num() != 0 && Args.ExcludeBits.Num() < (View.count + 31) / 32)
+	{
+		return false;
+	}
+
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+
+	// Stage all member queries padded + aligned, batch-style.
+	const int64 StagingCount = static_cast<int64>(QueryCount) * View.paddedDims;
+	if (StagingCount > MAX_int32)
+	{
+		ReleaseWorkspace(MoveTemp(Scratch));
+		return false;
+	}
+	if (Scratch->QueryStaging.Num() < StagingCount)
+	{
+		Scratch->QueryStaging.SetNumZeroed(StagingCount);
+	}
+	FMemory::Memzero(Scratch->QueryStaging.GetData(), StagingCount * sizeof(float));
+	for (int32 M = 0; M < QueryCount; ++M)
+	{
+		FMemory::Memcpy(
+			Scratch->QueryStaging.GetData() + static_cast<int64>(M) * View.paddedDims,
+			UnpaddedQueries.GetData() + static_cast<int64>(M) * Bank->Dims,
+			Bank->Dims * sizeof(float));
+	}
+
+	if (Scratch->HitStaging.Num() < Args.K)
+	{
+		Scratch->HitStaging.SetNumUninitialized(Args.K);
+	}
+
+	QueryParams Params;
+	Params.k = Args.K;
+	Params.excludeBits = Args.ExcludeBits.Num() ? Args.ExcludeBits.GetData() : nullptr;
+	Params.scoreAs = Args.bScoreAsDot ? ScoreAs::Dot : ScoreAs::BankMetric;
+
+	BankView Scoring = View;
+	Scoring.metric = ScoringMetric(View, Params);
+
+	const int32 Chunks = ChunkCount(View);
+	const int32 Mode = CVarSuperFAISSParallelScan.GetValueOnAnyThread();
+	const bool bParallel = Mode == 2 ||
+		(Mode == 1 && Chunks >= CVarSuperFAISSParallelMinChunks.GetValueOnAnyThread());
+
+	int32_t HitCount = 0;
+	if (bParallel && Chunks > 1)
+	{
+		for (int32 M = 0; M < QueryCount; ++M)
+		{
+			const Status QueryStatus = ValidateQuery(View,
+				Scratch->QueryStaging.GetData() + static_cast<int64>(M) * View.paddedDims);
+			if (QueryStatus != Status::Ok)
+			{
+				ReleaseWorkspace(MoveTemp(Scratch));
+				return false;
+			}
+		}
+
+		const int32 K = Args.K;
+		const int64 SingleCellCount = static_cast<int64>(Chunks) * K;
+		if (SingleCellCount > MAX_int32)
+		{
+			ReleaseWorkspace(MoveTemp(Scratch));
+			return false;
+		}
+		if (Scratch->ChunkHeapStorage.Num() < SingleCellCount)
+		{
+			Scratch->ChunkHeapStorage.SetNumUninitialized(SingleCellCount);
+			Scratch->ChunkSorted.SetNumUninitialized(SingleCellCount);
+		}
+		if (Scratch->ChunkListPtrs.Num() < Chunks)
+		{
+			Scratch->ChunkListPtrs.SetNumUninitialized(Chunks);
+			Scratch->ChunkListCounts.SetNumUninitialized(Chunks);
+		}
+		if (Scratch->MergeHeap.Num() < K)
+		{
+			Scratch->MergeHeap.SetNumUninitialized(K);
+		}
+
+		superfaiss::Hit* HeapBase = Scratch->ChunkHeapStorage.GetData();
+		superfaiss::Hit* SortedBase = Scratch->ChunkSorted.GetData();
+		const superfaiss::Hit** ListPtrs = Scratch->ChunkListPtrs.GetData();
+		int32_t* ListCounts = Scratch->ChunkListCounts.GetData();
+		const float* QueryBase = Scratch->QueryStaging.GetData();
+		const uint32_t* Exclude = Params.excludeBits;
+
+		ParallelFor(Chunks, [&Scoring, HeapBase, SortedBase, ListPtrs, ListCounts,
+			QueryBase, Exclude, K, QueryCount](int32 Chunk)
+		{
+			TopK ChunkTopK;
+			ChunkTopK.Init(HeapBase + static_cast<int64>(Chunk) * K, K, Scoring.metric);
+			ScoreChunkFused(Scoring, QueryBase, QueryCount, Chunk, Exclude, ChunkTopK);
+			ListPtrs[Chunk] = SortedBase + static_cast<int64>(Chunk) * K;
+			ListCounts[Chunk] = ChunkTopK.Finalize(SortedBase + static_cast<int64>(Chunk) * K);
+		});
+
+		HitCount = MergeTopK(ListPtrs, ListCounts, Chunks, Scoring.metric, K,
+			Scratch->MergeHeap.GetData(), Scratch->HitStaging.GetData());
+	}
+	else
+	{
+		const Status Result = superfaiss::QueryIntersect(View,
+			Scratch->QueryStaging.GetData(), QueryCount, Params, Scratch->Core,
+			Scratch->HitStaging.GetData(), &HitCount);
+		if (Result != Status::Ok)
+		{
+			ReleaseWorkspace(MoveTemp(Scratch));
+			return false;
+		}
+	}
+
+	OutHits.SetNum(HitCount);
+	for (int32 i = 0; i < HitCount; ++i)
+	{
+		OutHits[i].Index = Scratch->HitStaging[i].index;
+		OutHits[i].Id = Bank->GetIdForIndex(Scratch->HitStaging[i].index);
+		OutHits[i].Score = Scratch->HitStaging[i].score;
+		OutHits[i].Margin = (i + 1 < HitCount)
+			? Margin(Scratch->HitStaging[i], Scratch->HitStaging[i + 1], Scoring.metric)
+			: 0.0f;
+	}
+	ReleaseWorkspace(MoveTemp(Scratch));
+	return true;
+}
+
+bool USuperFAISSSubsystem::QuerySimilarIntersect(const USuperFAISSVectorBank* Bank,
+	const TArray<float>& QueryA, const TArray<float>& QueryB, int32 K,
+	TArray<FSuperFAISSHit>& Hits)
+{
+	Hits.Reset();
+	if (QueryA.Num() == 0 || QueryA.Num() != QueryB.Num())
+	{
+		return false;
+	}
+	TArray<float> Concatenated;
+	Concatenated.Reserve(QueryA.Num() * 2);
+	Concatenated.Append(QueryA);
+	Concatenated.Append(QueryB);
+	FSuperFAISSQueryArgs Args;
+	Args.K = K;
+	return QueryIntersect(Bank, Concatenated, 2, Args, Hits);
 }
 
 bool USuperFAISSSubsystem::QuerySimilarSync(const USuperFAISSVectorBank* Bank,
@@ -509,4 +694,60 @@ void USuperFAISSSubsystem::QuerySimilarAsync(const USuperFAISSVectorBank* Bank,
 		OnComplete.ExecuteIfBound(Hits, bSuccess);
 	});
 	QueryAsync(Bank, Query, Args, MoveTemp(Native));
+}
+
+bool USuperFAISSSubsystem::MakeCentroidQuery(const USuperFAISSVectorBank* Bank,
+	const TArray<int32>& RowIndices, TArray<float>& OutQuery)
+{
+	using namespace superfaiss;
+
+	OutQuery.Reset();
+	if (Bank == nullptr || !Bank->IsValid() || RowIndices.Num() == 0)
+	{
+		return false;
+	}
+	const BankView View = Bank->GetBankView();
+
+	// The core writes a padded, aligned query; stage through the pooled scratch and
+	// hand back the unpadded Dims prefix, matching the query-surface convention.
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+	if (Scratch->QueryStaging.Num() < View.paddedDims)
+	{
+		Scratch->QueryStaging.SetNumZeroed(View.paddedDims);
+	}
+	const Status Result = MakeCentroid(
+		View, RowIndices.GetData(), RowIndices.Num(), Scratch->QueryStaging.GetData());
+	const bool bOk = Result == Status::Ok;
+	if (bOk)
+	{
+		OutQuery.SetNumUninitialized(View.dims);
+		FMemory::Memcpy(OutQuery.GetData(), Scratch->QueryStaging.GetData(),
+			View.dims * sizeof(float));
+	}
+	ReleaseWorkspace(MoveTemp(Scratch));
+	return bOk;
+}
+
+bool USuperFAISSSubsystem::MakeDirectionQuery(const TArray<float>& A,
+	const TArray<float>& B, TArray<float>& OutQuery)
+{
+	using namespace superfaiss;
+
+	OutQuery.Reset();
+	if (A.Num() == 0 || A.Num() != B.Num())
+	{
+		return false;
+	}
+
+	// Pure math; the core requires an aligned output buffer.
+	TArray<float, TAlignedHeapAllocator<16>> Aligned;
+	Aligned.SetNumUninitialized(A.Num());
+	const Status Result = MakeDirection(
+		A.GetData(), B.GetData(), A.Num(), A.Num(), Aligned.GetData());
+	if (Result != Status::Ok)
+	{
+		return false;
+	}
+	OutQuery.Append(Aligned.GetData(), A.Num());
+	return true;
 }
