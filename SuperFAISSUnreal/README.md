@@ -138,8 +138,7 @@ Blueprint: the full surface is BlueprintCallable, plus `Query Similar (Scratch)`
 ## Per-row bias (v2.1)
 
 An optional per-row score bias applied **in-scan**, so the composed ranking is
-exact — born as the product's first external feature request (motion matching's
-continuing-pose reward):
+exact — built for shapes like motion matching's continuing-pose reward:
 
 ```cpp
 FSuperFAISSQueryArgs Args;
