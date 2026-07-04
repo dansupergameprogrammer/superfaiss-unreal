@@ -23,6 +23,7 @@ bit-deterministic, zero steady-state allocation.
 | Path | What |
 |---|---|
 | `SuperFAISSUnreal/` | The plugin. Copy this folder into your project's `Plugins/`. |
+| `SuperFAISSUnrealMCP/` | Optional agent toolset: MCP tools over your banks. Requires Experimental engine plugins most distributions don't carry — see its README. Disabled by default; everything else works without it. |
 | `ExampleProject/` | Minimal host project; opens straight into the demo map. |
 
 ## Try it
@@ -37,7 +38,7 @@ Or headless, from the repo root:
 UnrealEditor-Cmd ExampleProject/ExampleProject.uproject -ExecCmds="Automation RunTests SuperFAISS; Quit" -unattended -nullrhi
 ```
 
-26 automation tests: kernel correctness, SIMD/scalar mirror equality, determinism,
+26 automation tests (28 with the optional MCP toolset enabled): kernel correctness, SIMD/scalar mirror equality, determinism,
 tie-break stability, concurrency, asset round-trips, import rejection, quantizer
 recall, performance guards, query composition (centroid, direction, intersection,
 margins), bank lint analyses, prototype authoring, a golden semantic query on the

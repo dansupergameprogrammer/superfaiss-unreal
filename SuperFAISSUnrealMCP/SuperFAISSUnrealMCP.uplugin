@@ -1,0 +1,35 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.2.0",
+	"FriendlyName": "SuperFAISS MCP Toolset",
+	"Description": "Agent-callable MCP tools over SuperFAISS vector banks: enumerate, query, import, validate, and lint from a connected MCP client. Requires an engine distribution carrying the Experimental ToolsetRegistry and ModelContextProtocol plugins (in practice, a GitHub-source engine build).",
+	"Category": "AI",
+	"CreatedBy": "RageQuitDan",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": true,
+	"Installed": false,
+	"EnabledByDefault": false,
+	"Modules": [
+		{
+			"Name": "SuperFAISSUnrealMCP",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "ToolsetRegistry",
+			"Enabled": true
+		},
+		{
+			"Name": "SuperFAISSUnreal",
+			"Enabled": true
+		}
+	]
+}

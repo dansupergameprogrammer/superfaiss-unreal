@@ -1,0 +1,461 @@
+#include "SuperFAISSToolset.h"
+
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "Dom/JsonObject.h"
+#include "Misc/PackageName.h"
+#include "Misc/Paths.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
+#include "SuperFAISSBankImport.h"
+#include "SuperFAISSBankLint.h"
+#include "SuperFAISSPrototypeAsset.h"
+#include "SuperFAISSSubsystem.h"
+#include "SuperFAISSVectorBank.h"
+#include "UObject/Package.h"
+#include "UObject/SavePackage.h"
+
+namespace
+{
+	FString ToJson(const TSharedRef<FJsonObject>& Object)
+	{
+		FString Out;
+		const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+			TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Out);
+		FJsonSerializer::Serialize(Object, Writer);
+		return Out;
+	}
+
+	FString JsonError(const FString& Message)
+	{
+		const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+		Object->SetStringField(TEXT("error"), Message);
+		return ToJson(Object);
+	}
+
+	const TCHAR* MetricName(ESuperFAISSBankMetric Metric)
+	{
+		switch (Metric)
+		{
+		case ESuperFAISSBankMetric::Dot: return TEXT("Dot");
+		case ESuperFAISSBankMetric::Cosine: return TEXT("Cosine");
+		default: return TEXT("L2");
+		}
+	}
+
+	USuperFAISSVectorBank* LoadBank(const FString& BankPath, FString& OutError)
+	{
+		USuperFAISSVectorBank* Bank =
+			LoadObject<USuperFAISSVectorBank>(nullptr, *BankPath);
+		if (Bank == nullptr)
+		{
+			OutError = FString::Printf(TEXT("no bank at %s"), *BankPath);
+			return nullptr;
+		}
+		if (!Bank->IsValid())
+		{
+			OutError = FString::Printf(TEXT("bank failed validation: %s"), *BankPath);
+			return nullptr;
+		}
+		return Bank;
+	}
+
+	TSharedRef<FJsonObject> BankSummary(const USuperFAISSVectorBank& Bank)
+	{
+		const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+		Object->SetStringField(TEXT("path"), Bank.GetPathName());
+		Object->SetNumberField(TEXT("count"), Bank.Count);
+		Object->SetNumberField(TEXT("dims"), Bank.Dims);
+		Object->SetStringField(TEXT("metric"), MetricName(Bank.Metric));
+		Object->SetStringField(TEXT("quantization"),
+			Bank.Quantization == ESuperFAISSBankQuantization::Int8 ? TEXT("Int8")
+			                                                       : TEXT("Float32"));
+		Object->SetNumberField(TEXT("payloadBytes"),
+			static_cast<double>(Bank.GetPayloadBytes()));
+		return Object;
+	}
+
+	FString HitsResult(const USuperFAISSVectorBank& Bank,
+		const TArray<FSuperFAISSHit>& Hits)
+	{
+		const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+		Object->SetStringField(TEXT("bank"), Bank.GetPathName());
+		TArray<TSharedPtr<FJsonValue>> HitValues;
+		for (const FSuperFAISSHit& Hit : Hits)
+		{
+			const TSharedRef<FJsonObject> HitObject = MakeShared<FJsonObject>();
+			HitObject->SetNumberField(TEXT("index"), Hit.Index);
+			if (!Hit.Id.IsNone())
+			{
+				HitObject->SetStringField(TEXT("id"), Hit.Id.ToString());
+			}
+			HitObject->SetNumberField(TEXT("score"), Hit.Score);
+			HitObject->SetNumberField(TEXT("margin"), Hit.Margin);
+			HitValues.Add(MakeShared<FJsonValueObject>(HitObject));
+		}
+		Object->SetArrayField(TEXT("hits"), HitValues);
+		return ToJson(Object);
+	}
+
+	FString RunBankQuery(const USuperFAISSVectorBank* Bank, const TArray<float>& Query,
+		int32 K, bool bScoreAsDot)
+	{
+		USuperFAISSSubsystem* Subsystem =
+			GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+		if (Subsystem == nullptr)
+		{
+			return JsonError(TEXT("subsystem unavailable"));
+		}
+		FSuperFAISSQueryArgs Args;
+		Args.K = FMath::Clamp(K, 1, 1000);
+		Args.bScoreAsDot = bScoreAsDot;
+		TArray<FSuperFAISSHit> Hits;
+		if (!Subsystem->QuerySync(Bank, Query, Args, Hits))
+		{
+			return JsonError(TEXT("query rejected (dims mismatch or invalid vector)"));
+		}
+		return HitsResult(*Bank, Hits);
+	}
+}
+
+FString USuperFAISSToolset::Echo(const FString& Message)
+{
+	return FString::Printf(TEXT("echo: %s (thread: %s)"), *Message,
+		IsInGameThread() ? TEXT("game") : TEXT("worker"));
+}
+
+FString USuperFAISSToolset::ListBanks()
+{
+	FAssetRegistryModule& AssetRegistry =
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+	AssetRegistry.Get().SearchAllAssets(/*bSynchronousSearch*/ true);
+	TArray<FAssetData> Assets;
+	AssetRegistry.Get().GetAssetsByClass(
+		USuperFAISSVectorBank::StaticClass()->GetClassPathName(), Assets);
+
+	const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> BankValues;
+	for (const FAssetData& Asset : Assets)
+	{
+		if (const USuperFAISSVectorBank* Bank =
+			Cast<USuperFAISSVectorBank>(Asset.GetAsset()))
+		{
+			BankValues.Add(MakeShared<FJsonValueObject>(BankSummary(*Bank)));
+		}
+	}
+	Object->SetNumberField(TEXT("count"), BankValues.Num());
+	Object->SetArrayField(TEXT("banks"), BankValues);
+	return ToJson(Object);
+}
+
+FString USuperFAISSToolset::DescribeBank(const FString& BankPath)
+{
+	FString Error;
+	const USuperFAISSVectorBank* Bank = LoadBank(BankPath, Error);
+	if (Bank == nullptr)
+	{
+		return JsonError(Error);
+	}
+	const TSharedRef<FJsonObject> Object = BankSummary(*Bank);
+	Object->SetNumberField(TEXT("schemaVersion"), Bank->SchemaVersion);
+	Object->SetNumberField(TEXT("paddedDims"), Bank->PaddedDims);
+	Object->SetBoolField(TEXT("hasIds"), Bank->Ids.Num() > 0);
+	Object->SetNumberField(TEXT("recallAt10"), Bank->RecallAt10);
+	Object->SetStringField(TEXT("sourceHash"), Bank->SourceHash);
+	return ToJson(Object);
+}
+
+FString USuperFAISSToolset::QueryBank(const FString& BankPath, const FString& RowId,
+	int32 RowIndex, const TArray<float>& Vector, int32 K, bool bScoreAsDot)
+{
+	FString Error;
+	USuperFAISSVectorBank* Bank = LoadBank(BankPath, Error);
+	if (Bank == nullptr)
+	{
+		return JsonError(Error);
+	}
+
+	const int32 Sources =
+		(!RowId.IsEmpty() ? 1 : 0) + (RowIndex >= 0 ? 1 : 0) + (Vector.Num() > 0 ? 1 : 0);
+	if (Sources != 1)
+	{
+		return JsonError(TEXT("provide exactly one of RowId, RowIndex, Vector"));
+	}
+
+	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+	if (Subsystem == nullptr)
+	{
+		return JsonError(TEXT("subsystem unavailable"));
+	}
+
+	TArray<float> Query;
+	if (Vector.Num() > 0)
+	{
+		if (Vector.Num() != Bank->Dims)
+		{
+			return JsonError(FString::Printf(
+				TEXT("vector has %d dims; bank has %d"), Vector.Num(), Bank->Dims));
+		}
+		Query = Vector;
+	}
+	else
+	{
+		int32 Row = RowIndex;
+		if (!RowId.IsEmpty())
+		{
+			if (Bank->Ids.Num() == 0)
+			{
+				return JsonError(TEXT("bank carries no ids; query by RowIndex or Vector"));
+			}
+			Row = Bank->GetIndexForId(FName(*RowId));
+			if (Row == INDEX_NONE)
+			{
+				return JsonError(FString::Printf(TEXT("id not in bank: %s"), *RowId));
+			}
+		}
+		if (Row < 0 || Row >= Bank->Count)
+		{
+			return JsonError(FString::Printf(TEXT("row out of range: %d"), Row));
+		}
+		if (!Subsystem->MakeCentroidQuery(Bank, {Row}, Query))
+		{
+			return JsonError(TEXT("row extraction failed"));
+		}
+	}
+	return RunBankQuery(Bank, Query, K, bScoreAsDot);
+}
+
+FString USuperFAISSToolset::QueryPrototype(const FString& BankPath,
+	const TArray<FString>& RowIds, const TArray<int32>& RowIndices,
+	const FString& PrototypeAssetPath, int32 K)
+{
+	FString Error;
+	USuperFAISSVectorBank* Bank = LoadBank(BankPath, Error);
+	if (Bank == nullptr)
+	{
+		return JsonError(Error);
+	}
+	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+	if (Subsystem == nullptr)
+	{
+		return JsonError(TEXT("subsystem unavailable"));
+	}
+
+	TArray<float> Query;
+	if (!PrototypeAssetPath.IsEmpty())
+	{
+		USuperFAISSPrototypeAsset* Prototype =
+			LoadObject<USuperFAISSPrototypeAsset>(nullptr, *PrototypeAssetPath);
+		if (Prototype == nullptr)
+		{
+			return JsonError(FString::Printf(
+				TEXT("no prototype asset at %s"), *PrototypeAssetPath));
+		}
+		if (Prototype->Query.Num() != Bank->Dims)
+		{
+			return JsonError(FString::Printf(TEXT("prototype has %d dims; bank has %d"),
+				Prototype->Query.Num(), Bank->Dims));
+		}
+		Query = Prototype->Query;
+	}
+	else
+	{
+		TArray<int32> Rows;
+		for (const FString& Id : RowIds)
+		{
+			const int32 Row = Bank->GetIndexForId(FName(*Id));
+			if (Row == INDEX_NONE)
+			{
+				return JsonError(FString::Printf(TEXT("id not in bank: %s"), *Id));
+			}
+			Rows.AddUnique(Row);
+		}
+		for (const int32 Row : RowIndices)
+		{
+			if (Row < 0 || Row >= Bank->Count)
+			{
+				return JsonError(FString::Printf(TEXT("row out of range: %d"), Row));
+			}
+			Rows.AddUnique(Row);
+		}
+		if (Rows.Num() == 0)
+		{
+			return JsonError(TEXT("no prototype members given"));
+		}
+		if (!Subsystem->MakeCentroidQuery(Bank, Rows, Query))
+		{
+			return JsonError(
+				TEXT("centroid failed (members cancel to zero norm on a Cosine bank?)"));
+		}
+	}
+	return RunBankQuery(Bank, Query, K, /*bScoreAsDot*/ false);
+}
+
+FString USuperFAISSToolset::ProjectAxis(const FString& BankPath,
+	const TArray<float>& VectorA, const TArray<float>& VectorB, int32 K)
+{
+	FString Error;
+	USuperFAISSVectorBank* Bank = LoadBank(BankPath, Error);
+	if (Bank == nullptr)
+	{
+		return JsonError(Error);
+	}
+	if (VectorA.Num() != Bank->Dims || VectorB.Num() != Bank->Dims)
+	{
+		return JsonError(FString::Printf(TEXT("vectors must have %d dims"), Bank->Dims));
+	}
+	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+	if (Subsystem == nullptr)
+	{
+		return JsonError(TEXT("subsystem unavailable"));
+	}
+	TArray<float> Direction;
+	if (!Subsystem->MakeDirectionQuery(VectorA, VectorB, Direction))
+	{
+		return JsonError(TEXT("no direction (A equals B?)"));
+	}
+	// On L2 banks the direction ranks through the dot path; identity elsewhere.
+	return RunBankQuery(Bank, Direction, K,
+		/*bScoreAsDot*/ Bank->Metric == ESuperFAISSBankMetric::L2);
+}
+
+FString USuperFAISSToolset::ImportBank(const FString& SidecarJsonPath,
+	const FString& DestinationPackagePath, const FString& Quantization,
+	bool bAllowOverwrite)
+{
+	// Destination confined to /Game; collision refused without explicit overwrite —
+	// the read/import-only posture stays true rather than approximately true.
+	if (!DestinationPackagePath.StartsWith(TEXT("/Game/")))
+	{
+		return JsonError(TEXT("destination must be under /Game"));
+	}
+	if (!FPackageName::IsValidLongPackageName(DestinationPackagePath))
+	{
+		return JsonError(FString::Printf(
+			TEXT("invalid package path: %s"), *DestinationPackagePath));
+	}
+	if (!FPaths::FileExists(SidecarJsonPath))
+	{
+		return JsonError(FString::Printf(TEXT("no sidecar at %s"), *SidecarJsonPath));
+	}
+	ESuperFAISSBankQuantization Quant;
+	if (Quantization.Equals(TEXT("Int8"), ESearchCase::IgnoreCase))
+	{
+		Quant = ESuperFAISSBankQuantization::Int8;
+	}
+	else if (Quantization.Equals(TEXT("Float32"), ESearchCase::IgnoreCase))
+	{
+		Quant = ESuperFAISSBankQuantization::Float32;
+	}
+	else
+	{
+		return JsonError(TEXT("quantization must be Int8 or Float32"));
+	}
+
+	const FString AssetName = FPackageName::GetLongPackageAssetName(DestinationPackagePath);
+	UPackage* Package = CreatePackage(*DestinationPackagePath);
+	Package->FullyLoad();
+	if (UObject* Existing = StaticFindObject(
+		USuperFAISSVectorBank::StaticClass(), Package, *AssetName))
+	{
+		if (!bAllowOverwrite)
+		{
+			return JsonError(FString::Printf(
+				TEXT("asset exists at %s; pass bAllowOverwrite to replace"),
+				*DestinationPackagePath));
+		}
+		Existing->Rename(
+			*MakeUniqueObjectName(GetTransientPackage(), Existing->GetClass()).ToString(),
+			GetTransientPackage(), REN_DontCreateRedirectors | REN_NonTransactional);
+		Existing->ClearFlags(RF_Public | RF_Standalone);
+	}
+
+	FString ImportError;
+	USuperFAISSVectorBank* Bank = FSuperFAISSBankImport::Import(
+		SidecarJsonPath, Package, FName(*AssetName), Quant, ImportError);
+	if (Bank == nullptr)
+	{
+		return JsonError(FString::Printf(TEXT("import rejected: %s"), *ImportError));
+	}
+
+	const FString FileName = FPackageName::LongPackageNameToFilename(
+		DestinationPackagePath, FPackageName::GetAssetPackageExtension());
+	FSavePackageArgs SaveArgs;
+	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+	if (!UPackage::SavePackage(Package, Bank, *FileName, SaveArgs))
+	{
+		return JsonError(FString::Printf(TEXT("save failed: %s"), *FileName));
+	}
+	FAssetRegistryModule::AssetCreated(Bank);
+
+	const TSharedRef<FJsonObject> Object = BankSummary(*Bank);
+	Object->SetNumberField(TEXT("recallAt10"), Bank->RecallAt10);
+	return ToJson(Object);
+}
+
+FString USuperFAISSToolset::ValidateBanks()
+{
+	FAssetRegistryModule& AssetRegistry =
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+	AssetRegistry.Get().SearchAllAssets(/*bSynchronousSearch*/ true);
+	TArray<FAssetData> Assets;
+	AssetRegistry.Get().GetAssetsByClass(
+		USuperFAISSVectorBank::StaticClass()->GetClassPathName(), Assets);
+	for (const FAssetData& Asset : Assets)
+	{
+		Asset.GetAsset();
+	}
+	TArray<FString> Invalid;
+	const int32 InvalidCount = FSuperFAISSBankImport::ValidateLoadedBanks(Invalid);
+
+	const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+	Object->SetNumberField(TEXT("banks"), Assets.Num());
+	Object->SetNumberField(TEXT("invalid"), InvalidCount);
+	TArray<TSharedPtr<FJsonValue>> InvalidValues;
+	for (const FString& Path : Invalid)
+	{
+		InvalidValues.Add(MakeShared<FJsonValueString>(Path));
+	}
+	Object->SetArrayField(TEXT("invalidBanks"), InvalidValues);
+	return ToJson(Object);
+}
+
+FString USuperFAISSToolset::LintBank(const FString& BankPath, float DuplicateThreshold,
+	int32 SampleLimit, float VarianceEpsilon)
+{
+	FString Error;
+	const USuperFAISSVectorBank* Bank = LoadBank(BankPath, Error);
+	if (Bank == nullptr)
+	{
+		return JsonError(Error);
+	}
+
+	FSuperFAISSLintReport Report;
+	if (!FSuperFAISSBankLint::FindNearDuplicates(
+			Bank, DuplicateThreshold, FMath::Max(SampleLimit, 1), Report) ||
+		!FSuperFAISSBankLint::FindLowVarianceDims(Bank, VarianceEpsilon, Report))
+	{
+		return JsonError(TEXT("lint failed"));
+	}
+
+	const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+	Object->SetStringField(TEXT("bank"), Bank->GetPathName());
+	Object->SetNumberField(TEXT("rowsExamined"), Report.RowsExamined);
+	Object->SetBoolField(TEXT("sampled"), Report.bSampled);
+	TArray<TSharedPtr<FJsonValue>> DupValues;
+	for (const FSuperFAISSNearDuplicate& Dup : Report.NearDuplicates)
+	{
+		const TSharedRef<FJsonObject> DupObject = MakeShared<FJsonObject>();
+		DupObject->SetNumberField(TEXT("rowA"), Dup.RowA);
+		DupObject->SetNumberField(TEXT("rowB"), Dup.RowB);
+		DupObject->SetNumberField(TEXT("score"), Dup.Score);
+		DupValues.Add(MakeShared<FJsonValueObject>(DupObject));
+	}
+	Object->SetArrayField(TEXT("nearDuplicates"), DupValues);
+	TArray<TSharedPtr<FJsonValue>> DimValues;
+	for (const int32 Dim : Report.LowVarianceDims)
+	{
+		DimValues.Add(MakeShared<FJsonValueNumber>(Dim));
+	}
+	Object->SetArrayField(TEXT("lowVarianceDims"), DimValues);
+	return ToJson(Object);
+}
