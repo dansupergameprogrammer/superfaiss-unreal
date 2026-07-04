@@ -50,12 +50,14 @@ Or headless, from the repo root:
 UnrealEditor-Cmd ExampleProject/ExampleProject.uproject -ExecCmds="Automation RunTests SuperFAISS; Quit" -unattended -nullrhi
 ```
 
-29 automation tests (31 with the optional MCP toolset enabled): kernel correctness,
+31 automation tests (33 with the optional MCP toolset enabled): kernel correctness,
 SIMD/scalar mirror equality, determinism, tie-break stability, concurrency, asset
 round-trips, import rejection, quantizer recall, performance guards, query
 composition (centroid, direction, intersection, margins), named-channel queries and
-decomposition, per-row bias, scratch banks, bank lint analyses, prototype authoring, a golden
-semantic query on the demo bank, and the Mass swarm's stability.
+decomposition, per-row bias, scratch banks, cross-device exactness (v2.2 — including
+a golden-hash battery over committed fixtures that must match the core CI's pin),
+bank lint analyses, prototype authoring, a golden semantic query on the demo bank,
+and the Mass swarm's stability.
 
 ## Use it in your project
 

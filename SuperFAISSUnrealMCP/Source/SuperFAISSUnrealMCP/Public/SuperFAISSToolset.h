@@ -55,13 +55,16 @@ public:
 	 * values finite, added in the scored metric's own direction (a reward is
 	 * negative on L2). The sparse pairs form is the only bias form MCP exposes -
 	 * a count-length float array through JSON is not an agent surface.
+	 * bCrossDeviceExact (v2.2) runs the cross-device exactness mode: bit-identical
+	 * scores and hit order on any machine at any SIMD width; int8 banks only, and
+	 * the bank asset carries the mode's measured recall (crossDeviceRecallAt10).
 	 */
 	UFUNCTION(meta = (AICallable), Category = "SuperFAISS")
 	static FString QueryBank(const FString& BankPath, const FString& RowId,
 		int32 RowIndex, const TArray<float>& Vector,
 		const TArray<FString>& ChannelNames, const TArray<float>& ChannelWeights,
 		const TArray<int32>& BiasIndices, const TArray<float>& BiasValues,
-		int32 K = 10, bool bScoreAsDot = false);
+		int32 K = 10, bool bScoreAsDot = false, bool bCrossDeviceExact = false);
 
 	/**
 	 * Query by prototype ("the category's center"): the centroid of the listed rows

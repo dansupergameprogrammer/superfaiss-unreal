@@ -162,6 +162,7 @@ FString USuperFAISSToolset::DescribeBank(const FString& BankPath)
 	Object->SetNumberField(TEXT("paddedDims"), Bank->PaddedDims);
 	Object->SetBoolField(TEXT("hasIds"), Bank->Ids.Num() > 0);
 	Object->SetNumberField(TEXT("recallAt10"), Bank->RecallAt10);
+	Object->SetNumberField(TEXT("crossDeviceRecallAt10"), Bank->CrossDeviceRecallAt10);
 	Object->SetStringField(TEXT("sourceHash"), Bank->SourceHash);
 	if (Bank->GetChannelCount() > 0)
 	{
@@ -186,7 +187,7 @@ FString USuperFAISSToolset::DescribeBank(const FString& BankPath)
 FString USuperFAISSToolset::QueryBank(const FString& BankPath, const FString& RowId,
 	int32 RowIndex, const TArray<float>& Vector, const TArray<FString>& ChannelNames,
 	const TArray<float>& ChannelWeights, const TArray<int32>& BiasIndices,
-	const TArray<float>& BiasValues, int32 K, bool bScoreAsDot)
+	const TArray<float>& BiasValues, int32 K, bool bScoreAsDot, bool bCrossDeviceExact)
 {
 	FString Error;
 	USuperFAISSVectorBank* Bank = LoadBank(BankPath, Error);
@@ -254,6 +255,7 @@ FString USuperFAISSToolset::QueryBank(const FString& BankPath, const FString& Ro
 	FSuperFAISSQueryArgs Args;
 	Args.K = FMath::Clamp(K, 1, 1000);
 	Args.bScoreAsDot = bScoreAsDot;
+	Args.bCrossDeviceExact = bCrossDeviceExact;
 	for (int32 C = 0; C < ChannelNames.Num(); ++C)
 	{
 		Args.Channels.Add({FName(*ChannelNames[C]), ChannelWeights[C]});
@@ -269,7 +271,8 @@ FString USuperFAISSToolset::QueryBank(const FString& BankPath, const FString& Ro
 	if (!QuerySubsystem->QuerySync(Bank, Query, Args, Hits))
 	{
 		return JsonError(TEXT(
-			"query rejected (dims mismatch, unknown channel, bad bias pair, or invalid vector)"));
+			"query rejected (dims mismatch, unknown channel, bad bias pair, invalid "
+			"vector, or cross-device mode on a non-int8 bank)"));
 	}
 	return HitsResult(*Bank, Hits);
 }
@@ -439,6 +442,7 @@ FString USuperFAISSToolset::ImportBank(const FString& SidecarJsonPath,
 
 	const TSharedRef<FJsonObject> Object = BankSummary(*Bank);
 	Object->SetNumberField(TEXT("recallAt10"), Bank->RecallAt10);
+	Object->SetNumberField(TEXT("crossDeviceRecallAt10"), Bank->CrossDeviceRecallAt10);
 	return ToJson(Object);
 }
 

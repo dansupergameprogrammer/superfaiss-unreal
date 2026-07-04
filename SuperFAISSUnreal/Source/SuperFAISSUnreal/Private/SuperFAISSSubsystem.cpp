@@ -244,6 +244,8 @@ namespace
 		Params.segments = Segments.Num() > 0 ? Segments.GetData() : nullptr;
 		Params.segmentCount = Segments.Num();
 		Params.bias = Bias;
+		Params.exactness = Args.bCrossDeviceExact
+			? Exactness::CrossDevice : Exactness::PerDevice;
 
 		// Effective view for scoring/ordering under the override. Validation always
 		// runs against the bank's own view (the core applies the same split), so the
@@ -251,11 +253,13 @@ namespace
 		BankView Scoring = View;
 		Scoring.metric = ScoringMetric(View, Params);
 
-		// Segmented and biased queries route through the core (fold/dense/bias
-		// composition lives there); the pooled parallel fan-out below stays a
-		// V1-only fast path and is bypassed for both - serial core scans are
-		// already sub-millisecond at game scale.
-		if (Params.segments != nullptr || Params.bias != nullptr)
+		// Segmented, biased, and cross-device queries route through the core
+		// (fold/dense/bias composition and the integer kernels live there); the
+		// pooled parallel fan-out below stays a V1-only fast path and is bypassed
+		// for all three - serial core scans are already sub-millisecond at game
+		// scale.
+		if (Params.segments != nullptr || Params.bias != nullptr ||
+			Params.exactness == Exactness::CrossDevice)
 		{
 			const Status SegResult = Query(View, Scratch.QueryStaging.GetData(), Params,
 				Scratch.Core, Scratch.HitStaging.GetData(), &HitCountForSegments);
@@ -583,6 +587,8 @@ bool USuperFAISSSubsystem::QueryScratch(
 		Params.segments = Segments.Num() > 0 ? Segments.GetData() : nullptr;
 		Params.segmentCount = Segments.Num();
 		Params.bias = Bias;
+		Params.exactness = Args.bCrossDeviceExact
+			? Exactness::CrossDevice : Exactness::PerDevice;
 
 		int32_t HitCount = 0;
 		if (Query(View, Scratch->QueryStaging.GetData(), Params, Scratch->Core,
@@ -681,6 +687,8 @@ bool USuperFAISSSubsystem::QueryBatch(
 	Params.k = Args.K;
 	Params.excludeBits = Args.ExcludeBits.Num() ? Args.ExcludeBits.GetData() : nullptr;
 	Params.scoreAs = Args.bScoreAsDot ? ScoreAs::Dot : ScoreAs::BankMetric;
+	Params.exactness = Args.bCrossDeviceExact
+		? Exactness::CrossDevice : Exactness::PerDevice;
 
 	// Effective view for scoring/ordering; validation stays on the bank's view (same
 	// split as RunQuery and the core).
@@ -693,8 +701,10 @@ bool USuperFAISSSubsystem::QueryBatch(
 	// Results are bit-identical to the serial path (total order + pair ≡ single bits).
 	const int32 Chunks = ChunkCount(View);
 	const int32 Mode = CVarSuperFAISSParallelScan.GetValueOnAnyThread();
-	const bool bParallel = Mode == 2 ||
-		(Mode == 1 && Chunks >= CVarSuperFAISSParallelMinChunks.GetValueOnAnyThread());
+	// Cross-device queries take the serial core path (the integer kernels and
+	// their epilogue live there), like segments and bias in the single-query path.
+	const bool bParallel = !Args.bCrossDeviceExact && (Mode == 2 ||
+		(Mode == 1 && Chunks >= CVarSuperFAISSParallelMinChunks.GetValueOnAnyThread()));
 
 	if (bParallel && Chunks > 1)
 	{
@@ -875,14 +885,18 @@ bool USuperFAISSSubsystem::QueryIntersect(
 	Params.k = Args.K;
 	Params.excludeBits = Args.ExcludeBits.Num() ? Args.ExcludeBits.GetData() : nullptr;
 	Params.scoreAs = Args.bScoreAsDot ? ScoreAs::Dot : ScoreAs::BankMetric;
+	Params.exactness = Args.bCrossDeviceExact
+		? Exactness::CrossDevice : Exactness::PerDevice;
 
 	BankView Scoring = View;
 	Scoring.metric = ScoringMetric(View, Params);
 
 	const int32 Chunks = ChunkCount(View);
 	const int32 Mode = CVarSuperFAISSParallelScan.GetValueOnAnyThread();
-	const bool bParallel = Mode == 2 ||
-		(Mode == 1 && Chunks >= CVarSuperFAISSParallelMinChunks.GetValueOnAnyThread());
+	// Cross-device queries take the serial core path (the integer kernels and
+	// their epilogue live there), like segments and bias in the single-query path.
+	const bool bParallel = !Args.bCrossDeviceExact && (Mode == 2 ||
+		(Mode == 1 && Chunks >= CVarSuperFAISSParallelMinChunks.GetValueOnAnyThread()));
 
 	int32_t HitCount = 0;
 	if (bParallel && Chunks > 1)
@@ -996,7 +1010,8 @@ bool USuperFAISSSubsystem::QuerySimilarChannels(const USuperFAISSVectorBank* Ban
 
 bool USuperFAISSSubsystem::DecomposeHit(const USuperFAISSVectorBank* Bank,
 	const TArray<float>& Query, const TArray<FSuperFAISSChannelWeight>& Channels,
-	int32 RowIndex, TArray<float>& OutContributions, float& OutTotal, float RowBias)
+	int32 RowIndex, TArray<float>& OutContributions, float& OutTotal, float RowBias,
+	bool bCrossDeviceExact)
 {
 	using namespace superfaiss;
 
@@ -1032,6 +1047,35 @@ bool USuperFAISSSubsystem::DecomposeHit(const USuperFAISSVectorBank* Bank,
 	}
 
 	OutContributions.SetNumZeroed(Segments.Num());
+	if (bCrossDeviceExact)
+	{
+		// Cross-device decomposition (v2.2): quantize exactly as the scan does and
+		// run the integer-kernel decomposition, so OutTotal matches a
+		// bCrossDeviceExact scan's score for this row bitwise. Int8 banks only,
+		// same stride ceiling as the query path.
+		if (View.quant != Quantization::Int8 ||
+			View.paddedDims > kMaxCrossDeviceDims)
+		{
+			OutContributions.Reset();
+			return false;
+		}
+		TArray<int8, TAlignedHeapAllocator<16>> Q8;
+		Q8.SetNumUninitialized(View.paddedDims);
+		XdQuery Xd;
+		QuantizeQueryXd(Staged.GetData(), View.paddedDims,
+			reinterpret_cast<int8_t*>(Q8.GetData()), &Xd.scale, &Xd.sqSum);
+		Xd.q8 = reinterpret_cast<const int8_t*>(Q8.GetData());
+		OutTotal = DecomposeRowScoreXd(View, Xd, RowIndex, Segments.GetData(),
+			Segments.Num(), OutContributions.GetData());
+		// Cross-device bias composes on the floored unbiased float - the same
+		// expression the scan executes (guarded like the default path: a zero
+		// RowBias arg means "unbiased", which is the no-add path bitwise).
+		if (RowBias != 0.0f)
+		{
+			OutTotal = detail::XdComposeBiasValue(OutTotal, RowBias);
+		}
+		return true;
+	}
 	OutTotal = DecomposeRowScore(View, Staged.GetData(), RowIndex, Segments.GetData(),
 		Segments.Num(), OutContributions.GetData());
 	// The bias term (v2.1) reports separately and composes with the same single
@@ -1051,6 +1095,15 @@ bool USuperFAISSSubsystem::QuerySimilarSync(const USuperFAISSVectorBank* Bank,
 {
 	FSuperFAISSQueryArgs Args;
 	Args.K = K;
+	return QuerySync(Bank, Query, Args, Hits);
+}
+
+bool USuperFAISSSubsystem::QuerySimilarCrossDevice(const USuperFAISSVectorBank* Bank,
+	const TArray<float>& Query, int32 K, TArray<FSuperFAISSHit>& Hits)
+{
+	FSuperFAISSQueryArgs Args;
+	Args.K = K;
+	Args.bCrossDeviceExact = true;
 	return QuerySync(Bank, Query, Args, Hits);
 }
 

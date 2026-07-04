@@ -364,6 +364,11 @@ FString SSuperFAISSBankInspector::BankInfoLine() const
 			Line += FString::Printf(TEXT(" r@10 %.3f"), Bank->ChannelRecallAt10[C]);
 		}
 	}
+	if (Bank->CrossDeviceRecallAt10 >= 0.0f)
+	{
+		Line += FString::Printf(TEXT(" — cross-device r@10 %.3f"),
+			Bank->CrossDeviceRecallAt10);
+	}
 	return Line;
 }
 

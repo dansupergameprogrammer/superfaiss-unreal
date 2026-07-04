@@ -71,6 +71,13 @@ public:
 	UPROPERTY(VisibleAnywhere, Category = "Bank")
 	uint64 RecallSeed = 0;
 
+	// Cross-device mode recall (v2.2): recall@10 of Exactness::CrossDevice queries
+	// vs the float32 source, same seed as RecallAt10 - the honesty number for the
+	// query-quantization error the mode adds beyond row quantization. -1 = not
+	// measured (Float32 banks cannot run the mode).
+	UPROPERTY(VisibleAnywhere, Category = "Bank")
+	float CrossDeviceRecallAt10 = -1.0f;
+
 	// Named channels (schemaVersion 2 banks): contiguous element ranges of the row,
 	// as declared by the sidecar (dims space). Empty = a v1 channel-less bank. On
 	// Cosine channel banks, per-row inverse sub-norms are baked from the QUANTIZED

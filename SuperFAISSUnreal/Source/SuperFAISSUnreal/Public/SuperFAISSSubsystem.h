@@ -97,6 +97,18 @@ struct FSuperFAISSQueryArgs
 	// batch (per-query bias arrays are the core API's RowBias-per-entry surface).
 	TArray<float> RowBias;
 	TArray<FSuperFAISSBiasPair> BiasPairs;
+	// Cross-device exactness (v2.2): opt this query into bit-identical scores AND
+	// hit order across DIFFERENT machines and SIMD widths (x86/ARM, any OS) - the
+	// lockstep / rollback / networked-motion-matching contract. Int8 banks only
+	// (an f32 bank fails the query); composes with everything above. The query is
+	// quantized to int8 and scored through integer accumulation with a fixed-order
+	// double epilogue; any final score with magnitude below FLT_MIN is exactly
+	// 0.0f, by contract (the FTZ/DAZ hole, closed by specification). Query
+	// quantization adds error beyond row quantization - the importer measures and
+	// stores cross-device recall beside standard recall; check it before adopting.
+	// Cross-device scores are not equal to default-mode scores (different math).
+	// Full contract: vendored DETERMINISM.md section 2c.
+	bool bCrossDeviceExact = false;
 };
 
 DECLARE_DYNAMIC_DELEGATE_TwoParams(FSuperFAISSResultDelegate,
@@ -218,6 +230,13 @@ public:
 		const TArray<float>& Query, const TArray<FSuperFAISSChannelWeight>& Channels,
 		int32 K, TArray<FSuperFAISSHit>& Hits);
 
+	// Cross-device exact query for Blueprint (v2.2): bit-identical scores and hit
+	// order on any machine at any SIMD width. Int8 banks only; fails on f32 banks.
+	UFUNCTION(BlueprintCallable, Category = "Similarity",
+		meta = (DisplayName = "Query Similar (Cross-Device Exact)"))
+	bool QuerySimilarCrossDevice(const USuperFAISSVectorBank* Bank,
+		const TArray<float>& Query, int32 K, TArray<FSuperFAISSHit>& Hits);
+
 	// Decomposition ("why did this match"): per-channel/segment contributions of one
 	// row against a segmented query; contributions sum exactly to OutTotal, and
 	// OutTotal equals the score the same query's scan produced for that row. Per-hit
@@ -225,11 +244,17 @@ public:
 	// query applied to THIS row (0 when unbiased): it reports as the visible
 	// separate term - contributions + RowBias = OutTotal, the same single add the
 	// scan executed, so the equality stays bitwise.
+	// bCrossDeviceExact (v2.2) decomposes through the cross-device kernel instead,
+	// matching a bCrossDeviceExact query's scan score bitwise; in that mode each
+	// contribution carries the subnormal floor and OutTotal is the scan's double
+	// chain converted once - NOT the float re-sum of the contributions (a
+	// default-mode property only).
 	UFUNCTION(BlueprintCallable, Category = "Similarity",
 		meta = (DisplayName = "Decompose Hit"))
 	bool DecomposeHit(const USuperFAISSVectorBank* Bank, const TArray<float>& Query,
 		const TArray<FSuperFAISSChannelWeight>& Channels, int32 RowIndex,
-		TArray<float>& OutContributions, float& OutTotal, float RowBias = 0.0f);
+		TArray<float>& OutContributions, float& OutTotal, float RowBias = 0.0f,
+		bool bCrossDeviceExact = false);
 
 	// Mean of the selected bank rows as a query vector ("the category's center"):
 	// int8 rows dequantize through their per-row scales; on Cosine banks the mean is

@@ -162,6 +162,42 @@ score. Cost: sparse is effectively free (+0.4% single, ~0% batch); dense measure
 +3.5% f32 / +1.9% int8 single — and a per-query dense view in a batch streams
 M x Count x 4 bias bytes beside the bank, which is why the sparse form exists.
 
+## Cross-device exactness (v2.2)
+
+An opt-in query mode promising **bit-identical scores and hit order across
+different machines** — x86 and ARM, Windows/Linux/macOS, any SIMD width — the
+property lockstep and rollback multiplayer, networked motion matching, and
+server-side validation actually require. Epic's PoseSearch offers no determinism
+contract of any kind; this one runs as a CI test.
+
+```cpp
+FSuperFAISSQueryArgs Args;
+Args.K = 10;
+Args.bCrossDeviceExact = true;      // int8 banks only; composes with everything
+Sim->QuerySync(Bank, QueryVector, Args, Hits);
+// Blueprint: Query Similar (Cross-Device Exact)
+```
+
+How it holds: the query is quantized to int8 (round-half-even in integer math)
+and scoring accumulates in integers — integer addition is associative, so
+reduction width cannot matter; the per-row epilogue is one fixed-order
+double-precision expression ending in an explicit subnormal floor (any final
+score with magnitude below `FLT_MIN` is exactly `0.0f` on every machine — the
+FTZ/DAZ hole closed by contract). The core's CI asserts a pinned hash over
+committed fixture banks — including adversarial tiny-scale banks aimed at the
+subnormal window — on Windows, Linux, and macOS-ARM across every kernel path
+each runner can force, and the `SuperFAISS.B.CrossDeviceGoldenHash` automation
+test asserts the UE-compiled core reproduces the same pin.
+
+Stated plainly: f32 banks are refused in this mode (per-device only); query
+quantization adds recall cost beyond row quantization — the importer measures
+**cross-device recall@10 beside standard recall@10** and stores both on the
+bank asset; cross-device scores are not equal to default-mode scores (different
+math). Cost: the integer path measures FASTER than the default int8 scan
+(−18.5% single / −14.6% batch at 100k×256, desktop AVX2). `DecomposeHit` takes
+`bCrossDeviceExact` and matches the cross-device scan score bitwise. Full
+contract: vendored `DETERMINISM.md` §2c.
+
 ## The query side of the encoder seam
 
 An *encoder* is anything that turns domain state — text, images, gameplay — into a
@@ -208,7 +244,8 @@ authoring library.
 - **Exact**, not approximate: true top-k under Dot, Cosine, or L2.
 - **Deterministic per device**: identical bank + query ⇒ bit-identical results,
   regardless of thread count or scheduling (the ranking order is a strict total order;
-  serial and parallel paths are test-enforced bit-equal).
+  serial and parallel paths are test-enforced bit-equal). **Cross-device** exactness
+  (bit-identical across different machines) is the opt-in v2.2 mode above.
 - **Allocation-free once warm**: pooled workspaces, counted allocations, test-enforced.
 - **Thread-safe**: immutable banks, lock-free concurrent reads, 16-thread storm test.
 - **Every platform**: no platform code, no platform allowlist. SIMD (AVX2/SSE4.1/NEON)
@@ -229,7 +266,7 @@ The stripped plugin compiles and the non-demo test groups pass unchanged.
 
 ## Tests
 
-`SuperFAISS.*` automation tests (29 in this plugin; 31 with the MCP plugin enabled)
+`SuperFAISS.*` automation tests (31 in this plugin; 33 with the MCP plugin enabled)
 cover kernel correctness, SIMD/scalar mirror equality, determinism, tie-break
 stability, concurrency, asset round-trips, import rejection, quantizer recall,
 performance guards, query composition (centroid, direction, intersection, margins),

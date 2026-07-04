@@ -186,7 +186,8 @@ namespace
 		int32 Dims,
 		ESuperFAISSBankMetric Metric,
 		USuperFAISSVectorBank* BakedBank,
-		uint64 Seed)
+		uint64 Seed,
+		bool bCrossDevice = false)
 	{
 		using namespace superfaiss;
 
@@ -253,11 +254,16 @@ namespace
 			QueryParams Params;
 			Params.k = K;
 			Params.excludeBits = Exclude.GetData();
+			// Cross-device recall (v2.2): the baked query runs in CrossDevice mode;
+			// the float32 reference stays default (the mode rejects f32 banks).
+			QueryParams BakedParams = Params;
+			BakedParams.exactness =
+				bCrossDevice ? Exactness::CrossDevice : Exactness::PerDevice;
 
 			int32_t RefN = 0;
 			int32_t BakedN = 0;
 			if (Query(RefView, RefQuery.GetData(), Params, RefWs, RefHits.GetData(), &RefN) != Status::Ok ||
-				Query(BakedView, BakedQuery.GetData(), Params, BakedWs, BakedHits.GetData(), &BakedN) != Status::Ok)
+				Query(BakedView, BakedQuery.GetData(), BakedParams, BakedWs, BakedHits.GetData(), &BakedN) != Status::Ok)
 			{
 				continue;
 			}
@@ -451,6 +457,9 @@ USuperFAISSVectorBank* FSuperFAISSBankImport::Import(
 		constexpr uint64 kRecallSeed = 0x5EEDF00DCAFEBEEFull;
 		Bank->RecallAt10 = ComputeRecallAt10(Rows, Count, Dims, Metric, Bank, kRecallSeed);
 		Bank->RecallSeed = kRecallSeed;
+		// Cross-device mode recall beside standard recall (v2.2 honesty pattern).
+		Bank->CrossDeviceRecallAt10 = ComputeRecallAt10(Rows, Count, Dims, Metric,
+			Bank, kRecallSeed, /*bCrossDevice=*/true);
 
 		// Per-channel recall on int8 Cosine channel banks (T-044 W2b): the
 		// honest-budget number per channel, same seed discipline.
@@ -464,8 +473,9 @@ USuperFAISSVectorBank* FSuperFAISSBankImport::Import(
 			}
 		}
 		UE_LOG(LogTemp, Display,
-			TEXT("SuperFAISSBankImport %s: %d x %d %s int8, recall@10 %.4f (seed %llx)"),
-			*AssetName.ToString(), Count, Dims, *MetricText, Bank->RecallAt10, Bank->RecallSeed);
+			TEXT("SuperFAISSBankImport %s: %d x %d %s int8, recall@10 %.4f, cross-device recall@10 %.4f (seed %llx)"),
+			*AssetName.ToString(), Count, Dims, *MetricText, Bank->RecallAt10,
+			Bank->CrossDeviceRecallAt10, Bank->RecallSeed);
 	}
 
 	return Bank;
