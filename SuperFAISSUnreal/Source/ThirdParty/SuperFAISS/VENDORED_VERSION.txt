@@ -1,1 +1,1 @@
-SuperFAISS v1.0.1 (docs synced at 398269f)
+SuperFAISS v1.0.1 (docs synced at e586bd2)
