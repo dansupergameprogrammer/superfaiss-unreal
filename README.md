@@ -16,6 +16,8 @@ Measured on the shipped demo bank (40,000 words x 100 dims, int8, ~4 MB), deskto
 editor: single query **0.13 ms**, batched **0.06 ms per query** — exact search,
 bit-deterministic, zero steady-state allocation.
 
+![The shipped demo: one query against two GloVe banks, sub-millisecond async results](docs/demo.png)
+
 ## Repo layout
 
 | Path | What |
