@@ -52,6 +52,21 @@ struct FSuperFAISSSegment
 	float Weight = 1.0f;
 };
 
+// One sparse per-row bias entry (v2.1): Index is a bank row, Bias adds to that
+// row's score in the scored metric's own direction (reward positive on
+// Dot/Cosine, NEGATIVE on L2 - lower is better).
+USTRUCT(BlueprintType)
+struct FSuperFAISSBiasPair
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Similarity")
+	int32 Index = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Similarity")
+	float Bias = 0.0f;
+};
+
 // C++ query options. Blueprint uses the simplified UFUNCTION surface below.
 struct FSuperFAISSQueryArgs
 {
@@ -68,6 +83,20 @@ struct FSuperFAISSQueryArgs
 	// ranges. Provide at most one form; empty = the whole row (the V1 path).
 	TArray<FSuperFAISSChannelWeight> Channels;
 	TArray<FSuperFAISSSegment> Segments;
+	// Per-row bias (v2.1): the composed score (similarity + bias) ranks in-scan -
+	// exact, unlike post-weighting the returned top-k. At most one form:
+	//   RowBias   - dense, exactly Count floats (index-aligned to the bank or, on
+	//               scratch queries, to the snapshot the query runs against - a
+	//               count mismatch is rejection, never silent misalignment);
+	//   BiasPairs - sparse (index, bias) entries, unique in-range indices - the
+	//               one-biased-row-per-query shape (motion matching), effectively
+	//               free at any scale.
+	// Values must be finite (-inf is not a mask; use ExcludeBits). Empty = none,
+	// the bit-identical unbiased path. On QueryIntersect the bias applies once, to
+	// the fused score. QueryBatch applies the SAME bias to every query in the
+	// batch (per-query bias arrays are the core API's RowBias-per-entry surface).
+	TArray<float> RowBias;
+	TArray<FSuperFAISSBiasPair> BiasPairs;
 };
 
 DECLARE_DYNAMIC_DELEGATE_TwoParams(FSuperFAISSResultDelegate,
@@ -192,12 +221,15 @@ public:
 	// Decomposition ("why did this match"): per-channel/segment contributions of one
 	// row against a segmented query; contributions sum exactly to OutTotal, and
 	// OutTotal equals the score the same query's scan produced for that row. Per-hit
-	// cost - call it on hits, not banks.
+	// cost - call it on hits, not banks. RowBias (v2.1) is the bias the caller's
+	// query applied to THIS row (0 when unbiased): it reports as the visible
+	// separate term - contributions + RowBias = OutTotal, the same single add the
+	// scan executed, so the equality stays bitwise.
 	UFUNCTION(BlueprintCallable, Category = "Similarity",
 		meta = (DisplayName = "Decompose Hit"))
 	bool DecomposeHit(const USuperFAISSVectorBank* Bank, const TArray<float>& Query,
 		const TArray<FSuperFAISSChannelWeight>& Channels, int32 RowIndex,
-		TArray<float>& OutContributions, float& OutTotal);
+		TArray<float>& OutContributions, float& OutTotal, float RowBias = 0.0f);
 
 	// Mean of the selected bank rows as a query vector ("the category's center"):
 	// int8 rows dequantize through their per-row scales; on Cosine banks the mean is

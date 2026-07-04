@@ -135,6 +135,34 @@ same append/remove sequence + same query = bit-identical results per device.
 
 Blueprint: the full surface is BlueprintCallable, plus `Query Similar (Scratch)`.
 
+## Per-row bias (v2.1)
+
+An optional per-row score bias applied **in-scan**, so the composed ranking is
+exact — born as the product's first external feature request (motion matching's
+continuing-pose reward):
+
+```cpp
+FSuperFAISSQueryArgs Args;
+Args.K = 10;
+Args.BiasPairs = {{ContinuingPoseRow, +0.15f}};   // one biased row per query: free
+// or dense, one float per bank row (memory salience — strength x recency):
+// Args.RowBias = SalienceArray;                  // exactly Count floats, else rejected
+Sim->QuerySync(Bank, QueryVector, Args, Hits);
+
+// DecomposeHit reports bias as a visible separate term:
+Sim->DecomposeHit(Bank, QueryVector, Channels, Hits[0].Index, Contributions, Total,
+	/*RowBias*/ 0.15f);   // Contributions sum + RowBias == Total
+```
+
+Rules, stated plainly: values must be finite (`-inf` is not a mask — use
+`ExcludeBits`; exclusion beats bias); rewards are positive on Dot/Cosine and
+**negative on L2** (lower is better); a dense view must be exactly `Count` floats
+(on scratch banks, the snapshot's count — stale saliences are rejected, never
+silently misaligned); on `QueryIntersect` the bias applies once, to the fused
+score. Cost: sparse is effectively free (+0.4% single, ~0% batch); dense measures
++3.5% f32 / +1.9% int8 single — and a per-query dense view in a batch streams
+M x Count x 4 bias bytes beside the bank, which is why the sparse form exists.
+
 ## The query side of the encoder seam
 
 An *encoder* is anything that turns domain state — text, images, gameplay — into a
@@ -202,11 +230,12 @@ The stripped plugin compiles and the non-demo test groups pass unchanged.
 
 ## Tests
 
-`SuperFAISS.*` automation tests (28 in this plugin; 30 with the MCP plugin enabled)
+`SuperFAISS.*` automation tests (29 in this plugin; 31 with the MCP plugin enabled)
 cover kernel correctness, SIMD/scalar mirror equality, determinism, tie-break
 stability, concurrency, asset round-trips, import rejection, quantizer recall,
 performance guards, query composition (centroid, direction, intersection, margins),
-named-channel queries and decomposition, scratch banks (including the drain gate,
+named-channel queries and decomposition, per-row bias (both forms, snapshot
+alignment, the decomposition bias term), scratch banks (including the drain gate,
 freeze bit-identity, and save/load), bank lint analyses, prototype authoring, a
 golden semantic query on the demo bank, and the Mass swarm's stability (F2). Run
 headless:

@@ -97,6 +97,56 @@ namespace
 		return true;
 	}
 
+	// v2.1 per-row bias: resolves Args.RowBias / Args.BiasPairs against a view's
+	// row count into core form. Dense length must equal the view count exactly
+	// (the N2 alignment contract - on scratch banks the view IS the snapshot);
+	// both forms set is rejection. Returns false on malformed input; outBias is
+	// null when no bias is present.
+	bool ResolveBias(
+		int32 ViewCount,
+		const FSuperFAISSQueryArgs& Args,
+		TArray<superfaiss::BiasPair>& PairScratch,
+		superfaiss::RowBias& BiasScratch,
+		const superfaiss::RowBias*& OutBias)
+	{
+		OutBias = nullptr;
+		const bool bDense = Args.RowBias.Num() > 0;
+		const bool bSparse = Args.BiasPairs.Num() > 0;
+		if (!bDense && !bSparse)
+		{
+			return true;
+		}
+		if (bDense && bSparse)
+		{
+			return false;
+		}
+		BiasScratch = superfaiss::RowBias{};
+		if (bDense)
+		{
+			if (Args.RowBias.Num() != ViewCount)
+			{
+				return false; // index-aligned or rejected, never silently misaligned
+			}
+			BiasScratch.dense = Args.RowBias.GetData();
+		}
+		else
+		{
+			PairScratch.Reset();
+			PairScratch.Reserve(Args.BiasPairs.Num());
+			for (const FSuperFAISSBiasPair& Pair : Args.BiasPairs)
+			{
+				superfaiss::BiasPair Core;
+				Core.index = Pair.Index;
+				Core.bias = Pair.Bias;
+				PairScratch.Add(Core);
+			}
+			BiasScratch.pairs = PairScratch.GetData();
+			BiasScratch.pairCount = PairScratch.Num();
+		}
+		OutBias = &BiasScratch;
+		return true;
+	}
+
 	// D-V2-1 query-side rule: on Cosine channel banks, the query's channel
 	// sub-vectors renormalize once at build so segment scores are true cosines.
 	void RenormalizeQueryChannels(
@@ -179,12 +229,21 @@ namespace
 			RenormalizeQueryChannels(Bank, Segments, Scratch.QueryStaging.GetData());
 		}
 
+		TArray<BiasPair> PairScratch;
+		RowBias BiasScratch;
+		const RowBias* Bias = nullptr;
+		if (!ResolveBias(View.count, Args, PairScratch, BiasScratch, Bias))
+		{
+			return false;
+		}
+
 		QueryParams Params;
 		Params.k = Args.K;
 		Params.excludeBits = Args.ExcludeBits.Num() ? Args.ExcludeBits.GetData() : nullptr;
 		Params.scoreAs = Args.bScoreAsDot ? ScoreAs::Dot : ScoreAs::BankMetric;
 		Params.segments = Segments.Num() > 0 ? Segments.GetData() : nullptr;
 		Params.segmentCount = Segments.Num();
+		Params.bias = Bias;
 
 		// Effective view for scoring/ordering under the override. Validation always
 		// runs against the bank's own view (the core applies the same split), so the
@@ -192,11 +251,11 @@ namespace
 		BankView Scoring = View;
 		Scoring.metric = ScoringMetric(View, Params);
 
-		// Segmented queries route through the core (fold/dense split lives there);
-		// the pooled parallel fan-out below stays a V1-only fast path for now and is
-		// bypassed for segments - serial core scans are already sub-millisecond at
-		// game scale, and the fold path IS the V1 kernel.
-		if (Params.segments != nullptr)
+		// Segmented and biased queries route through the core (fold/dense/bias
+		// composition lives there); the pooled parallel fan-out below stays a
+		// V1-only fast path and is bypassed for both - serial core scans are
+		// already sub-millisecond at game scale.
+		if (Params.segments != nullptr || Params.bias != nullptr)
 		{
 			const Status SegResult = Query(View, Scratch.QueryStaging.GetData(), Params,
 				Scratch.Core, Scratch.HitStaging.GetData(), &HitCountForSegments);
@@ -505,12 +564,25 @@ bool USuperFAISSSubsystem::QueryScratch(
 			return A.offset < B.offset;
 		});
 
+		// v2.1 bias on scratch: index-aligned to THIS snapshot (T-055 N2) - a dense
+		// view sized for any other count is rejection, never silent misalignment;
+		// the equal-count remove-then-append hazard is forbidden by the pin/drain
+		// machinery this query already runs under.
+		TArray<BiasPair> PairScratchBias;
+		RowBias BiasScratch;
+		const RowBias* Bias = nullptr;
+		if (!ResolveBias(View.count, Args, PairScratchBias, BiasScratch, Bias))
+		{
+			break;
+		}
+
 		QueryParams Params;
 		Params.k = Args.K;
 		Params.excludeBits = View.count > 0 ? Scratch->TombstoneStaging.GetData() : nullptr;
 		Params.scoreAs = Args.bScoreAsDot ? ScoreAs::Dot : ScoreAs::BankMetric;
 		Params.segments = Segments.Num() > 0 ? Segments.GetData() : nullptr;
 		Params.segmentCount = Segments.Num();
+		Params.bias = Bias;
 
 		int32_t HitCount = 0;
 		if (Query(View, Scratch->QueryStaging.GetData(), Params, Scratch->Core,
@@ -924,7 +996,7 @@ bool USuperFAISSSubsystem::QuerySimilarChannels(const USuperFAISSVectorBank* Ban
 
 bool USuperFAISSSubsystem::DecomposeHit(const USuperFAISSVectorBank* Bank,
 	const TArray<float>& Query, const TArray<FSuperFAISSChannelWeight>& Channels,
-	int32 RowIndex, TArray<float>& OutContributions, float& OutTotal)
+	int32 RowIndex, TArray<float>& OutContributions, float& OutTotal, float RowBias)
 {
 	using namespace superfaiss;
 
@@ -962,6 +1034,15 @@ bool USuperFAISSSubsystem::DecomposeHit(const USuperFAISSVectorBank* Bank,
 	OutContributions.SetNumZeroed(Segments.Num());
 	OutTotal = DecomposeRowScore(View, Staged.GetData(), RowIndex, Segments.GetData(),
 		Segments.Num(), OutContributions.GetData());
+	// The bias term (v2.1) reports separately and composes with the same single
+	// add the scan executed. Guarded: an unconditional +0.0 would flip a -0.0
+	// total to +0.0 and break the unbiased bitwise contract (the N1 edge). A
+	// dense zero-bias row is therefore compare-equal here, exactly as N1 already
+	// states for zero bias everywhere.
+	if (RowBias != 0.0f)
+	{
+		OutTotal = OutTotal + RowBias;
+	}
 	return true;
 }
 

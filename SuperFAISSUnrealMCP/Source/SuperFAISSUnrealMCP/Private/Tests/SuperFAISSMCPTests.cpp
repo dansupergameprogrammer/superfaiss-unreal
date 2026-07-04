@@ -135,7 +135,7 @@ bool FSuperFAISSMCPToolGoldensTest::RunTest(const FString& Parameters)
 	// QueryBank by id: the F1 golden neighborhood through the tool path.
 	{
 		const TSharedPtr<FJsonObject> R = ParseTool(USuperFAISSToolset::QueryBank(
-			DemoBankPath, TEXT("wizard"), -1, {}, {}, {}, 5, false));
+			DemoBankPath, TEXT("wizard"), -1, {}, {}, {}, {}, {}, 5, false));
 		if (TestTrue(TEXT("QueryBank parses"), R.IsValid()) &&
 			TestFalse(TEXT("QueryBank not error"), R->HasField(TEXT("error"))))
 		{
@@ -186,7 +186,7 @@ bool FSuperFAISSMCPToolGoldensTest::RunTest(const FString& Parameters)
 
 			// The imported bank answers queries through the tool path.
 			const TSharedPtr<FJsonObject> Q = ParseTool(USuperFAISSToolset::QueryBank(
-				FString(ImportDest) + TEXT(".ToolImport"), TEXT("row3"), -1, {}, {}, {}, 3, false));
+				FString(ImportDest) + TEXT(".ToolImport"), TEXT("row3"), -1, {}, {}, {}, {}, {}, 3, false));
 			TestTrue(TEXT("imported bank queries"),
 				Q.IsValid() && !Q->HasField(TEXT("error")));
 		}
@@ -206,6 +206,24 @@ bool FSuperFAISSMCPToolGoldensTest::RunTest(const FString& Parameters)
 				TestFalse(FString::Printf(TEXT("content bank invalid: %s"), *Path),
 					Path.StartsWith(TEXT("/SuperFAISSUnreal/")) ||
 					Path.StartsWith(TEXT("/Game/")));
+			}
+		}
+	}
+
+	// Bias through the tool path (v2.1): a sparse reward lifts a named row into
+	// the top-k of the golden query.
+	{
+		const TSharedPtr<FJsonObject> R = ParseTool(USuperFAISSToolset::QueryBank(
+			DemoBankPath, TEXT("wizard"), -1, {}, {}, {}, {31337}, {100.0f}, 5, false));
+		if (TestTrue(TEXT("bias query parses"), R.IsValid()) &&
+			TestFalse(TEXT("bias query not error"), R->HasField(TEXT("error"))))
+		{
+			const TArray<TSharedPtr<FJsonValue>>& Hits = R->GetArrayField(TEXT("hits"));
+			TestEqual(TEXT("bias hits"), Hits.Num(), 5);
+			if (Hits.Num() > 0)
+			{
+				TestEqual(TEXT("biased row wins"),
+					(int32)Hits[0]->AsObject()->GetNumberField(TEXT("index")), 31337);
 			}
 		}
 	}
@@ -287,23 +305,32 @@ bool FSuperFAISSMCPToolValidationTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("unknown bank"), IsToolError(
 		USuperFAISSToolset::DescribeBank(TEXT("/Game/DoesNotExist.DoesNotExist"))));
 	TestTrue(TEXT("unknown bank query"), IsToolError(USuperFAISSToolset::QueryBank(
-		TEXT("/Game/DoesNotExist.DoesNotExist"), TEXT("x"), -1, {}, {}, {}, 5, false)));
+		TEXT("/Game/DoesNotExist.DoesNotExist"), TEXT("x"), -1, {}, {}, {}, {}, {}, 5, false)));
 	TestTrue(TEXT("unknown id"), IsToolError(USuperFAISSToolset::QueryBank(
-		DemoBankPath, TEXT("zzz_not_a_word_zzz"), -1, {}, {}, {}, 5, false)));
+		DemoBankPath, TEXT("zzz_not_a_word_zzz"), -1, {}, {}, {}, {}, {}, 5, false)));
 	TestTrue(TEXT("two query sources"), IsToolError(USuperFAISSToolset::QueryBank(
-		DemoBankPath, TEXT("wizard"), 5, {}, {}, {}, 5, false)));
+		DemoBankPath, TEXT("wizard"), 5, {}, {}, {}, {}, {}, 5, false)));
 	TestTrue(TEXT("no query source"), IsToolError(USuperFAISSToolset::QueryBank(
-		DemoBankPath, FString(), -1, {}, {}, {}, 5, false)));
+		DemoBankPath, FString(), -1, {}, {}, {}, {}, {}, 5, false)));
 	TestTrue(TEXT("bad vector dims"), IsToolError(USuperFAISSToolset::QueryBank(
-		DemoBankPath, FString(), -1, {1.0f, 2.0f}, {}, {}, 5, false)));
+		DemoBankPath, FString(), -1, {1.0f, 2.0f}, {}, {}, {}, {}, 5, false)));
 	TestTrue(TEXT("row out of range"), IsToolError(USuperFAISSToolset::QueryBank(
-		DemoBankPath, FString(), 999999, {}, {}, {}, 5, false)));
+		DemoBankPath, FString(), 999999, {}, {}, {}, {}, {}, 5, false)));
+
+	// Bias args (v2.1): mismatched parallel arrays, out-of-range and duplicate
+	// indices, and non-finite values are tool errors.
+	TestTrue(TEXT("bias array mismatch"), IsToolError(USuperFAISSToolset::QueryBank(
+		DemoBankPath, TEXT("wizard"), -1, {}, {}, {}, {0}, {}, 5, false)));
+	TestTrue(TEXT("bias index out of range"), IsToolError(USuperFAISSToolset::QueryBank(
+		DemoBankPath, TEXT("wizard"), -1, {}, {}, {}, {999999999}, {1.0f}, 5, false)));
+	TestTrue(TEXT("bias duplicate index"), IsToolError(USuperFAISSToolset::QueryBank(
+		DemoBankPath, TEXT("wizard"), -1, {}, {}, {}, {3, 3}, {1.0f, 2.0f}, 5, false)));
 
 	// Channel args: mismatched parallel arrays and unknown channels are tool errors.
 	TestTrue(TEXT("channel array mismatch"), IsToolError(USuperFAISSToolset::QueryBank(
-		DemoBankPath, TEXT("wizard"), -1, {}, {TEXT("identity")}, {}, 5, false)));
+		DemoBankPath, TEXT("wizard"), -1, {}, {TEXT("identity")}, {}, {}, {}, 5, false)));
 	TestTrue(TEXT("unknown channel"), IsToolError(USuperFAISSToolset::QueryBank(
-		DemoBankPath, TEXT("wizard"), -1, {}, {TEXT("identity")}, {1.0f}, 5, false)));
+		DemoBankPath, TEXT("wizard"), -1, {}, {TEXT("identity")}, {1.0f}, {}, {}, 5, false)));
 
 	// Scratch tools: unknown path and bad vector are tool errors, never crashes.
 	TestTrue(TEXT("unknown scratch bank"), IsToolError(
@@ -332,7 +359,7 @@ bool FSuperFAISSMCPToolValidationTest::RunTest(const FString& Parameters)
 			TestTrue(TEXT("id on id-less bank refused"),
 				IsToolError(USuperFAISSToolset::QueryBank(
 					FString(ImportDestIdless) + TEXT(".ToolImportIdless"), TEXT("row0"),
-					-1, {}, {}, {}, 3, false)));
+					-1, {}, {}, {}, {}, {}, 3, false)));
 		}
 		const FString IdlessFile = FPackageName::LongPackageNameToFilename(
 			ImportDestIdless, FPackageName::GetAssetPackageExtension());

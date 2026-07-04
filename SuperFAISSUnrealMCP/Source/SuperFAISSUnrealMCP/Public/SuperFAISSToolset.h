@@ -50,11 +50,17 @@ public:
 	 * (schemaVersion 2), ChannelNames + ChannelWeights (parallel arrays) rank by a
 	 * weighted combination of named channels; on Cosine channel banks each
 	 * channel's score is a true per-channel cosine. Empty = whole-row query.
+	 * BiasIndices + BiasValues (parallel arrays, v2.1) add a per-row score bias
+	 * IN-SCAN, so the composed ranking is exact: indices are bank rows (unique),
+	 * values finite, added in the scored metric's own direction (a reward is
+	 * negative on L2). The sparse pairs form is the only bias form MCP exposes -
+	 * a count-length float array through JSON is not an agent surface.
 	 */
 	UFUNCTION(meta = (AICallable), Category = "SuperFAISS")
 	static FString QueryBank(const FString& BankPath, const FString& RowId,
 		int32 RowIndex, const TArray<float>& Vector,
 		const TArray<FString>& ChannelNames, const TArray<float>& ChannelWeights,
+		const TArray<int32>& BiasIndices, const TArray<float>& BiasValues,
 		int32 K = 10, bool bScoreAsDot = false);
 
 	/**

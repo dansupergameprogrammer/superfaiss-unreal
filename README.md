@@ -16,6 +16,11 @@ Measured on the shipped demo bank (40,000 words x 100 dims, int8, ~4 MB), deskto
 editor: single query **0.13 ms**, batched **0.06 ms per query** — exact search,
 bit-deterministic, zero steady-state allocation.
 
+**New in 2.1:** per-row score bias, in-scan and exact — sparse (index, bias) pairs
+for motion matching's continuing-pose reward (effectively free) and a dense per-row
+view for memory salience (+3.5% f32 / +1.9% int8, measured). Finite-only; exclusion
+beats bias; rewards are negative on L2.
+
 **New in 2.0:** named channels (rank by a weighted combination of vector sub-spaces,
 with exact per-channel decomposition of every hit and true per-channel cosines) and
 scratch banks (mutable runtime banks — append/remove/query/freeze/save — for NPC
@@ -45,11 +50,11 @@ Or headless, from the repo root:
 UnrealEditor-Cmd ExampleProject/ExampleProject.uproject -ExecCmds="Automation RunTests SuperFAISS; Quit" -unattended -nullrhi
 ```
 
-28 automation tests (30 with the optional MCP toolset enabled): kernel correctness,
+29 automation tests (31 with the optional MCP toolset enabled): kernel correctness,
 SIMD/scalar mirror equality, determinism, tie-break stability, concurrency, asset
 round-trips, import rejection, quantizer recall, performance guards, query
 composition (centroid, direction, intersection, margins), named-channel queries and
-decomposition, scratch banks, bank lint analyses, prototype authoring, a golden
+decomposition, per-row bias, scratch banks, bank lint analyses, prototype authoring, a golden
 semantic query on the demo bank, and the Mass swarm's stability.
 
 ## Use it in your project

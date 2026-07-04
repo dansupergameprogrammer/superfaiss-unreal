@@ -38,7 +38,7 @@ thin wrappers and tracks such churn cheaply.
 | `Echo` | Connectivity probe; names the executing thread |
 | `ListBanks` | Every bank in the project: path, count, dims, metric, quantization, size |
 | `DescribeBank` | Full metadata for one bank, including recall@10 and source hash |
-| `QueryBank` | Exact top-K by row id, row index, or raw vector; hits carry scores and margins. On channel banks (schemaVersion 2), `channelNames` + `channelWeights` rank by a weighted combination of named channels |
+| `QueryBank` | Exact top-K by row id, row index, or raw vector; hits carry scores and margins. On channel banks (schemaVersion 2), `channelNames` + `channelWeights` rank by a weighted combination of named channels. `biasIndices` + `biasValues` (v2.1) add a per-row score bias in-scan — the composed ranking is exact; sparse pairs are the only bias form MCP exposes |
 | `QueryPrototype` | Top-K against a centroid of listed rows, or a saved prototype asset |
 | `ProjectAxis` | Rank the bank along `normalize(A−B)` — "most A-like relative to B" |
 | `ImportBank` | Sidecar pair → validated bank asset with a seeded recall report; destination confined to `/Game`; existing assets refused unless overwrite is explicit; can take seconds on large banks |

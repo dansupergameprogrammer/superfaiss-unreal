@@ -185,7 +185,8 @@ FString USuperFAISSToolset::DescribeBank(const FString& BankPath)
 
 FString USuperFAISSToolset::QueryBank(const FString& BankPath, const FString& RowId,
 	int32 RowIndex, const TArray<float>& Vector, const TArray<FString>& ChannelNames,
-	const TArray<float>& ChannelWeights, int32 K, bool bScoreAsDot)
+	const TArray<float>& ChannelWeights, const TArray<int32>& BiasIndices,
+	const TArray<float>& BiasValues, int32 K, bool bScoreAsDot)
 {
 	FString Error;
 	USuperFAISSVectorBank* Bank = LoadBank(BankPath, Error);
@@ -245,6 +246,10 @@ FString USuperFAISSToolset::QueryBank(const FString& BankPath, const FString& Ro
 	{
 		return JsonError(TEXT("ChannelNames and ChannelWeights must be parallel arrays"));
 	}
+	if (BiasIndices.Num() != BiasValues.Num())
+	{
+		return JsonError(TEXT("BiasIndices and BiasValues must be parallel arrays"));
+	}
 	USuperFAISSSubsystem* QuerySubsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
 	FSuperFAISSQueryArgs Args;
 	Args.K = FMath::Clamp(K, 1, 1000);
@@ -253,11 +258,18 @@ FString USuperFAISSToolset::QueryBank(const FString& BankPath, const FString& Ro
 	{
 		Args.Channels.Add({FName(*ChannelNames[C]), ChannelWeights[C]});
 	}
+	for (int32 B = 0; B < BiasIndices.Num(); ++B)
+	{
+		FSuperFAISSBiasPair Pair;
+		Pair.Index = BiasIndices[B];
+		Pair.Bias = BiasValues[B];
+		Args.BiasPairs.Add(Pair);
+	}
 	TArray<FSuperFAISSHit> Hits;
 	if (!QuerySubsystem->QuerySync(Bank, Query, Args, Hits))
 	{
 		return JsonError(TEXT(
-			"query rejected (dims mismatch, unknown channel, or invalid vector)"));
+			"query rejected (dims mismatch, unknown channel, bad bias pair, or invalid vector)"));
 	}
 	return HitsResult(*Bank, Hits);
 }
