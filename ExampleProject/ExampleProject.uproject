@@ -1,0 +1,22 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.8",
+	"Category": "",
+	"Description": "Minimal host project for the SuperFAISS For Unreal Engine plugin. Opens into the similarity demo map.",
+	"Modules": [
+		{
+			"Name": "ExampleProject",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "SuperFAISSUnreal",
+			"Enabled": true
+		}
+	],
+	"AdditionalPluginDirectories": [
+		".."
+	]
+}
