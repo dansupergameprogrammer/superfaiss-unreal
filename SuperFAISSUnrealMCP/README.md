@@ -52,7 +52,7 @@ Read/import-only by design: no tool deletes or mutates an existing bank, and scr
 banks are never mutated through MCP — game code owns their writes. There is no
 text encoder — an id resolves to a row or it does not resolve; anything that turns
 domain data into vectors lives on your side of the encoder seam (see the
-`SuperFAISSUnreal` README).
+[`SuperFAISSUnreal` README](../SuperFAISSUnreal/README.md)).
 
 ## Licensing
 
