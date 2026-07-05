@@ -443,13 +443,18 @@ FSuperFAISSTicket USuperFAISSSubsystem::QueryAsync(
 		return Ticket;
 	}
 
-	// Pin the bank against GC for the task's lifetime; copy the query and the
-	// exclusion bits — the caller's views need not outlive this call.
+	// Pin the bank against GC for the task's lifetime; copy the query, the
+	// exclusion bits, and the FULL args — the caller's views need not outlive
+	// this call, and an async query must run the same query the sync path would
+	// (Poirot P-3: the original copy carried only K/ExcludeBits/bScoreAsDot, so
+	// async segmented/channel/bias/cross-device queries silently ran plain and
+	// reported success). The TArray members deep-copy; ExcludeBits is a view, so
+	// it is detached here and re-pointed at the task-owned copy inside the task.
 	TStrongObjectPtr<const USuperFAISSVectorBank> PinnedBank(Bank);
 	TArray<float> QueryCopy(UnpaddedQuery.GetData(), UnpaddedQuery.Num());
 	TArray<uint32> ExcludeCopy(Args.ExcludeBits.GetData(), Args.ExcludeBits.Num());
-	const int32 K = Args.K;
-	const bool bScoreAsDot = Args.bScoreAsDot;
+	FSuperFAISSQueryArgs ArgsCopy = Args;
+	ArgsCopy.ExcludeBits = TConstArrayView<uint32>();
 	TSharedPtr<std::atomic<bool>, ESPMode::ThreadSafe> CancelFlag = Ticket.CancelFlag;
 
 	// Counted from dispatch until the game-thread delivery finishes, so the
@@ -458,8 +463,8 @@ FSuperFAISSTicket USuperFAISSSubsystem::QueryAsync(
 
 	FFunctionGraphTask::CreateAndDispatchWhenReady(
 		[this, PinnedBank = MoveTemp(PinnedBank), QueryCopy = MoveTemp(QueryCopy),
-			ExcludeCopy = MoveTemp(ExcludeCopy), K, bScoreAsDot, CancelFlag,
-			Completion = MoveTemp(Completion)]() mutable
+			ExcludeCopy = MoveTemp(ExcludeCopy), ArgsCopy = MoveTemp(ArgsCopy),
+			CancelFlag, Completion = MoveTemp(Completion)]() mutable
 		{
 			SCOPE_CYCLE_COUNTER(STAT_SuperFAISSQueryAsync);
 
@@ -467,12 +472,9 @@ FSuperFAISSTicket USuperFAISSSubsystem::QueryAsync(
 			bool bOk = false;
 			if (!CancelFlag->load())
 			{
-				FSuperFAISSQueryArgs TaskArgs;
-				TaskArgs.K = K;
-				TaskArgs.ExcludeBits = ExcludeCopy;
-				TaskArgs.bScoreAsDot = bScoreAsDot;
+				ArgsCopy.ExcludeBits = ExcludeCopy; // task-owned storage, task-local view
 				TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
-				bOk = RunQuery(PinnedBank.Get(), QueryCopy, TaskArgs, *Scratch, Hits);
+				bOk = RunQuery(PinnedBank.Get(), QueryCopy, ArgsCopy, *Scratch, Hits);
 				ReleaseWorkspace(MoveTemp(Scratch));
 			}
 			const bool bSuccess = bOk && !CancelFlag->load();
@@ -521,7 +523,14 @@ bool USuperFAISSSubsystem::QueryScratch(
 	do
 	{
 		BankView View;
-		const int32 Words = ScratchBank::TombstoneWords(Bank->GetCount());
+		// Size the staging from CAPACITY, not the current count (Poirot P-1): the
+		// pin excludes Grow/Freeze/Load but NOT Append - that concurrency is the
+		// scratch bank's designed model - so Snapshot's own count read can exceed
+		// a count read here, and a word-boundary crossing in that window would
+		// overrun a count-sized buffer. Capacity is pin-stable and bounds every
+		// count Snapshot can observe; it is also never zero, which makes the
+		// empty-bank query well-defined regardless of pool history (P-2).
+		const int32 Words = ScratchBank::TombstoneWords(Bank->Core().Capacity());
 		if (Scratch->TombstoneStaging.Num() < Words)
 		{
 			Scratch->TombstoneStaging.SetNumZeroed(Words);

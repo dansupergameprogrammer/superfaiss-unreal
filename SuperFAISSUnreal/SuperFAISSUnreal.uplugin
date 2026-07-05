@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
 	"Version": 5,
-	"VersionName": "2.2.1",
+	"VersionName": "2.2.2",
 	"FriendlyName": "SuperFAISS For Unreal Engine",
 	"Description": "Fast, deterministic, allocation-free k-nearest-neighbor search over baked embedding banks. Built on the MIT-licensed SuperFAISS core library.",
 	"Category": "AI",

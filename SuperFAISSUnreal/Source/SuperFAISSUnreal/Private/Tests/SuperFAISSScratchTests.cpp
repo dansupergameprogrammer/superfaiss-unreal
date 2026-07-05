@@ -206,6 +206,81 @@ bool FSuperFAISSScratchBankTest::RunTest(const FString& Parameters)
 			Sub->QueryScratch(Bank, Row, Args, Hits));
 	}
 
+	// P-2 (Poirot sweep): querying an EMPTY scratch bank is well-defined - true
+	// with zero hits - regardless of the pooled workspace's history (pre-fix it
+	// returned false on a cold buffer and true on a warm one).
+	{
+		USuperFAISSScratchBank* Empty = NewObject<USuperFAISSScratchBank>();
+		TestTrue(TEXT("empty init"), Empty->Init(16, Dims,
+			ESuperFAISSBankMetric::Dot, ESuperFAISSBankQuantization::Float32));
+		TArray<float> Query = ScratchRows(1, Dims, 0xE117ull);
+		FSuperFAISSQueryArgs Args;
+		Args.K = 4;
+		TArray<FSuperFAISSHit> Hits;
+		TestTrue(TEXT("empty-bank query succeeds"),
+			GEngine->GetEngineSubsystem<USuperFAISSSubsystem>()->QueryScratch(
+				Empty, Query, Args, Hits));
+		TestEqual(TEXT("empty-bank zero hits"), Hits.Num(), 0);
+	}
+
+	// P-1 (Poirot sweep): appends racing pinned queries - the scratch bank's
+	// designed model - must never corrupt staging. The fix sizes tombstone
+	// staging from capacity (pin-stable); this storm drives appends across many
+	// 32-row word boundaries while queries run, and every returned hit must be a
+	// valid, live row index. (The pre-fix overrun needs an exact interleaving a
+	// test cannot force deterministically; the capacity invariant it violates is
+	// what this pins, alongside the sweep's written argument.)
+	{
+		USuperFAISSSubsystem* Sub = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+		USuperFAISSScratchBank* Storm = NewObject<USuperFAISSScratchBank>();
+		const int32 StormCap = 512;
+		TestTrue(TEXT("storm init"), Storm->Init(StormCap, Dims,
+			ESuperFAISSBankMetric::Dot, ESuperFAISSBankQuantization::Float32));
+		const TArray<float> StormRows = ScratchRows(StormCap, Dims, 0x570A11ull);
+		TArray<float> Seed;
+		Seed.SetNumUninitialized(Dims);
+		int32 Index = INDEX_NONE;
+		FMemory::Memcpy(Seed.GetData(), StormRows.GetData(), Dims * sizeof(float));
+		TestTrue(TEXT("storm seed"), Storm->Append(Seed, Index));
+
+		std::atomic<bool> Done{false};
+		std::atomic<int32> Violations{0};
+		auto Future = Async(EAsyncExecution::Thread, [&]()
+		{
+			// Reader thread: pinned queries while the writer below appends.
+			TArray<float> Query = ScratchRows(1, Dims, 0x9E11ull);
+			FSuperFAISSQueryArgs Args;
+			Args.K = 8;
+			TArray<FSuperFAISSHit> Hits;
+			while (!Done.load())
+			{
+				if (!Sub->QueryScratch(Storm, Query, Args, Hits))
+				{
+					continue; // draining windows are legal refusals
+				}
+				const int32 Count = Storm->GetCount();
+				for (const FSuperFAISSHit& Hit : Hits)
+				{
+					if (Hit.Index < 0 || Hit.Index >= Count)
+					{
+						Violations.fetch_add(1);
+					}
+				}
+			}
+		});
+		TArray<float> Row;
+		Row.SetNumUninitialized(Dims);
+		for (int32 R = 1; R < StormCap; ++R)
+		{
+			FMemory::Memcpy(Row.GetData(), StormRows.GetData() + R * Dims,
+				Dims * sizeof(float));
+			TestTrue(TEXT("storm append"), Storm->Append(Row, Index));
+		}
+		Done.store(true);
+		Future.Wait();
+		TestEqual(TEXT("storm violations"), Violations.load(), 0);
+	}
+
 	// Rejections: dims mismatch, zero-norm Cosine append, channels on scratch.
 	{
 		USuperFAISSScratchBank* Bank = NewObject<USuperFAISSScratchBank>();

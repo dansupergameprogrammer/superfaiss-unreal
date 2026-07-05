@@ -394,4 +394,94 @@ bool FSuperFAISSSubsystemAsyncTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+namespace
+{
+	// P-3 (Poirot sweep): QueryAsync must run the SAME query the sync path would.
+	// Pre-fix it copied only K/ExcludeBits/bScoreAsDot, so composed args
+	// (channels, segments, bias, cross-device) silently ran plain and reported
+	// success with wrong hits.
+	struct FComposedAsyncProbe
+	{
+		std::atomic<int32> Delivered{0};
+		std::atomic<bool> bSucceeded{false};
+		TArray<FSuperFAISSHit> AsyncHits;
+		TArray<FSuperFAISSHit> SyncHits;
+	};
+
+	DEFINE_LATENT_AUTOMATION_COMMAND_THREE_PARAMETER(FWaitComposedDelivery,
+		TSharedPtr<FComposedAsyncProbe>, Probe, int32, Expected, double, Deadline);
+
+	bool FWaitComposedDelivery::Update()
+	{
+		return Probe->Delivered.load() >= Expected || FPlatformTime::Seconds() > Deadline;
+	}
+
+	DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FCheckComposedAsync,
+		TSharedPtr<FComposedAsyncProbe>, Probe, FAutomationTestBase*, Test);
+
+	bool FCheckComposedAsync::Update()
+	{
+		Test->TestEqual(TEXT("composed async delivered"), Probe->Delivered.load(), 1);
+		Test->TestTrue(TEXT("composed async succeeded"), Probe->bSucceeded.load());
+		Test->TestEqual(TEXT("async hit count == sync"),
+			Probe->AsyncHits.Num(), Probe->SyncHits.Num());
+		for (int32 i = 0; i < Probe->SyncHits.Num() && i < Probe->AsyncHits.Num(); ++i)
+		{
+			Test->TestTrue(TEXT("async hit == sync hit"),
+				Probe->AsyncHits[i].Index == Probe->SyncHits[i].Index &&
+					Probe->AsyncHits[i].Score == Probe->SyncHits[i].Score);
+		}
+		return true;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FSuperFAISSComposedAsyncTest,
+	"SuperFAISS.B.ComposedAsyncParity",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext |
+		EAutomationTestFlags::ProductFilter)
+
+bool FSuperFAISSComposedAsyncTest::RunTest(const FString& Parameters)
+{
+	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+	USuperFAISSVectorBank* Bank = MakeBank(*this, 500, 32);
+	if (!Subsystem || !Bank)
+	{
+		return true;
+	}
+
+	// A composed query: raw segments + a sparse bias pair (channels need a
+	// schema-2 bank; segments exercise the same dropped-args path).
+	FSuperFAISSQueryArgs Args;
+	Args.K = 6;
+	FSuperFAISSSegment SegA;
+	SegA.Offset = 0;
+	SegA.Length = Bank->PaddedDims / 2;
+	SegA.Weight = 1.0f;
+	FSuperFAISSSegment SegB;
+	SegB.Offset = Bank->PaddedDims / 2;
+	SegB.Length = Bank->PaddedDims - Bank->PaddedDims / 2;
+	SegB.Weight = 0.25f;
+	Args.Segments = {SegA, SegB};
+	Args.BiasPairs = {{123, 5.0f}};
+
+	const TArray<float> Query = MakeQuery(32, 777);
+	TSharedPtr<FComposedAsyncProbe> Probe = MakeShared<FComposedAsyncProbe>();
+	TestTrue(TEXT("sync composed"),
+		Subsystem->QuerySync(Bank, Query, Args, Probe->SyncHits));
+
+	FSuperFAISSNativeResultDelegate Done;
+	Done.BindLambda([Probe](const TArray<FSuperFAISSHit>& Hits, bool bSuccess)
+	{
+		Probe->AsyncHits = Hits;
+		Probe->bSucceeded.store(bSuccess);
+		Probe->Delivered.fetch_add(1);
+	});
+	Subsystem->QueryAsync(Bank, Query, Args, MoveTemp(Done));
+
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitComposedDelivery(Probe, 1, FPlatformTime::Seconds() + 10.0));
+	ADD_LATENT_AUTOMATION_COMMAND(FCheckComposedAsync(Probe, this));
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS
