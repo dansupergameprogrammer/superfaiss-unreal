@@ -1,1 +1,1 @@
-SuperFAISS v2.2 working copy at d541a01 (tag lands at V2.2 publish)
+SuperFAISS v2.2.1 working copy at 3087846

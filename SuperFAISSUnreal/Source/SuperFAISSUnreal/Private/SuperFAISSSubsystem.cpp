@@ -627,7 +627,8 @@ bool USuperFAISSSubsystem::QueryBatch(
 	int32 QueryCount,
 	const FSuperFAISSQueryArgs& Args,
 	TArray<FSuperFAISSHit>& OutHits,
-	TArray<int32>& OutCounts)
+	TArray<int32>& OutCounts,
+	TConstArrayView<FSuperFAISSBiasPair> PerQueryBiasPairs)
 {
 	SCOPE_CYCLE_COUNTER(STAT_SuperFAISSQueryBatch);
 	using namespace superfaiss;
@@ -683,10 +684,70 @@ bool USuperFAISSSubsystem::QueryBatch(
 	int32_t* Counts = Scratch->CountStaging.GetData();
 	FMemory::Memzero(Counts, QueryCount * sizeof(int32_t));
 
+	// Composition: segments apply to every query; bias is either the shared
+	// Args form (one resolved view, replicated per entry - the core's stated
+	// degenerate case) or the per-query sparse pairs.
+	TArray<QuerySegment> Segments;
+	if (!ResolveSegments(Bank, Args, Segments))
+	{
+		ReleaseWorkspace(MoveTemp(Scratch));
+		return false;
+	}
+	for (int32 M = 0; Segments.Num() > 0 && M < QueryCount; ++M)
+	{
+		RenormalizeQueryChannels(Bank, Segments,
+			Scratch->QueryStaging.GetData() + static_cast<int64>(M) * View.paddedDims);
+	}
+
+	TArray<BiasPair> SharedPairScratch;
+	RowBias SharedBiasScratch;
+	const RowBias* SharedBias = nullptr;
+	if (!ResolveBias(View.count, Args, SharedPairScratch, SharedBiasScratch, SharedBias))
+	{
+		ReleaseWorkspace(MoveTemp(Scratch));
+		return false;
+	}
+	if (PerQueryBiasPairs.Num() != 0 &&
+		(PerQueryBiasPairs.Num() != QueryCount || SharedBias != nullptr))
+	{
+		ReleaseWorkspace(MoveTemp(Scratch));
+		return false;
+	}
+	TArray<RowBias> BiasEntries;      // per-query core entries
+	TArray<BiasPair> PerQueryStorage; // stable pair storage the entries point at
+	if (SharedBias != nullptr)
+	{
+		BiasEntries.Init(*SharedBias, QueryCount);
+	}
+	else if (PerQueryBiasPairs.Num() == QueryCount)
+	{
+		BiasEntries.Init(RowBias(), QueryCount);
+		PerQueryStorage.SetNumUninitialized(QueryCount);
+		bool bAnyPair = false;
+		for (int32 M = 0; M < QueryCount; ++M)
+		{
+			if (PerQueryBiasPairs[M].Index != INDEX_NONE)
+			{
+				PerQueryStorage[M] = {PerQueryBiasPairs[M].Index,
+					PerQueryBiasPairs[M].Bias};
+				BiasEntries[M].pairs = &PerQueryStorage[M];
+				BiasEntries[M].pairCount = 1;
+				bAnyPair = true;
+			}
+		}
+		if (!bAnyPair)
+		{
+			BiasEntries.Reset(); // all-unbiased: the bit-identical null path
+		}
+	}
+
 	QueryParams Params;
 	Params.k = Args.K;
 	Params.excludeBits = Args.ExcludeBits.Num() ? Args.ExcludeBits.GetData() : nullptr;
 	Params.scoreAs = Args.bScoreAsDot ? ScoreAs::Dot : ScoreAs::BankMetric;
+	Params.segments = Segments.Num() > 0 ? Segments.GetData() : nullptr;
+	Params.segmentCount = Segments.Num();
+	Params.bias = BiasEntries.Num() > 0 ? BiasEntries.GetData() : nullptr;
 	Params.exactness = Args.bCrossDeviceExact
 		? Exactness::CrossDevice : Exactness::PerDevice;
 
@@ -701,9 +762,11 @@ bool USuperFAISSSubsystem::QueryBatch(
 	// Results are bit-identical to the serial path (total order + pair ≡ single bits).
 	const int32 Chunks = ChunkCount(View);
 	const int32 Mode = CVarSuperFAISSParallelScan.GetValueOnAnyThread();
-	// Cross-device queries take the serial core path (the integer kernels and
-	// their epilogue live there), like segments and bias in the single-query path.
-	const bool bParallel = !Args.bCrossDeviceExact && (Mode == 2 ||
+	// Composed batches (segments, bias, cross-device) take the serial core batch,
+	// like segments and bias in the single-query path.
+	const bool bComposed = Params.segments != nullptr || Params.bias != nullptr ||
+		Args.bCrossDeviceExact;
+	const bool bParallel = !bComposed && (Mode == 2 ||
 		(Mode == 1 && Chunks >= CVarSuperFAISSParallelMinChunks.GetValueOnAnyThread()));
 
 	if (bParallel && Chunks > 1)

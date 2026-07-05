@@ -164,13 +164,22 @@ public:
 
 	// M queries in one bank pass (queries concatenated, stride Bank->Dims, unpadded).
 	// OutHits is query-major, K hits per query (OutCounts holds per-query counts).
+	// Args.Channels/Segments apply to every query in the batch; Args.RowBias/
+	// BiasPairs apply the SAME bias to every query. PerQueryBiasPairs (empty,
+	// or exactly QueryCount entries) instead gives each query its OWN sparse
+	// pair - the crowd shape (one continuing-pose reward per entity, the
+	// core v2.1 sparse form's named consumer); entries with Index == INDEX_NONE
+	// are unbiased. PerQueryBiasPairs is exclusive with the Args bias forms.
+	// Composed batches (segments, any bias, or cross-device) run the serial
+	// core batch; the parallel chunk fan-out stays the plain-query fast path.
 	bool QueryBatch(
 		const USuperFAISSVectorBank* Bank,
 		TConstArrayView<float> UnpaddedQueries,
 		int32 QueryCount,
 		const FSuperFAISSQueryArgs& Args,
 		TArray<FSuperFAISSHit>& OutHits,
-		TArray<int32>& OutCounts);
+		TArray<int32>& OutCounts,
+		TConstArrayView<FSuperFAISSBiasPair> PerQueryBiasPairs = {});
 
 	// Intersection ("similar to ALL of these"): exact top-k over the fused score —
 	// each row's worst per-query score in the scored metric's better-direction. Every

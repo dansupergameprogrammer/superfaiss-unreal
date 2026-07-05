@@ -389,10 +389,10 @@ USuperFAISSVectorBank* FSuperFAISSBankImport::Import(
 			if (!V.IsValid() || !V->TryGetObject(ChannelObject) ||
 				!(*ChannelObject)->TryGetStringField(TEXT("name"), Name) ||
 				!(*ChannelObject)->TryGetNumberField(TEXT("offset"), Offset) ||
-				!(*ChannelObject)->TryGetNumberField(TEXT("length"), Length) ||
+				!(*ChannelObject)->TryGetNumberField(TEXT("dims"), Length) ||
 				Name.IsEmpty())
 			{
-				OutError = TEXT("malformed channel entry (name/offset/length required)");
+				OutError = TEXT("malformed channel entry (name/offset/dims required)");
 				return nullptr;
 			}
 			ChannelNames.Add(FName(*Name));
