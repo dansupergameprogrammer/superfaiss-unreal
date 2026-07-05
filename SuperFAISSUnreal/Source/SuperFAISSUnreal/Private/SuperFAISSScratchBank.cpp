@@ -102,6 +102,30 @@ USuperFAISSVectorBank* USuperFAISSScratchBank::Freeze(TArray<int32>& OutIndexMap
 		const int32 Pd = Bank.GetPaddedDims();
 		const bool bInt8 = Bank.GetQuantization() == Quantization::Int8;
 
+		// Zero live rows is a legitimate freeze (an empty memory graduating is
+		// still a memory): produce an EMPTY valid bank, not a failure a caller
+		// cannot tell from a real one (Poirot R-5). Core Freeze rightly rejects a
+		// null output buffer, so the empty case short-circuits before it.
+		if (Live == 0)
+		{
+			OutIndexMap.SetNumUninitialized(Count);
+			for (int32 R = 0; R < Count; ++R)
+			{
+				OutIndexMap[R] = -1;
+			}
+			USuperFAISSVectorBank* Empty = NewObject<USuperFAISSVectorBank>(GetOuter());
+			FString EmptyError;
+			if (!Empty->InitFromBaked(nullptr, nullptr, 0, Bank.Dims(), GetMetric(),
+					GetQuantization(), TEXT("frozen-scratch-empty"), EmptyError))
+			{
+				UE_LOG(LogTemp, Error, TEXT("SuperFAISSScratchBank empty freeze: %s"),
+					*EmptyError);
+				return false;
+			}
+			Frozen = Empty;
+			return true;
+		}
+
 		TArray<uint8, TAlignedHeapAllocator<16>> Rows;
 		Rows.SetNumZeroed(static_cast<int64>(Live) * Pd * ElementSize(Bank.GetQuantization()));
 		TArray<float> Scales;

@@ -188,6 +188,30 @@ bool FSuperFAISSChannelQueryTest::RunTest(const FString& Parameters)
 		}
 	}
 
+	// R-1 (Poirot deep review): a corrupted channel block is rejected at load,
+	// never crashed on or silently degraded. Mutate a valid bank's properties the
+	// way a corrupt asset would arrive, revalidate via PostLoad.
+	{
+		auto CorruptAndCheck = [&](const TCHAR* Label,
+			TFunctionRef<void(USuperFAISSVectorBank*)> Corrupt)
+		{
+			USuperFAISSVectorBank* Victim =
+				MakeChannelBank(*this, 64, Dims, ESuperFAISSBankQuantization::Int8);
+			if (!Victim)
+			{
+				return;
+			}
+			AddExpectedError(TEXT("bank rejected"), EAutomationExpectedErrorFlags::Contains, 0);
+			Corrupt(Victim);
+			Victim->PostLoad();
+			TestFalse(Label, Victim->IsValid());
+		};
+		CorruptAndCheck(TEXT("mismatched channel arrays rejected"),
+			[](USuperFAISSVectorBank* B) { B->ChannelOffsets.Pop(); });
+		CorruptAndCheck(TEXT("extra channel name rejected"),
+			[](USuperFAISSVectorBank* B) { B->ChannelNames.Add(TEXT("ghost")); });
+	}
+
 	// Rejection matrix: overlap, off-grid, duplicate names, too many channels.
 	{
 		const TArray<float> Rows = ChannelRows(16, Dims, 0x11ull);

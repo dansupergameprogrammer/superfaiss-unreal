@@ -32,13 +32,17 @@ namespace
 	}
 
 	// Per-channel seeded recall@10 (T-044 W2b): the same self-query sampling,
-	// restricted to one channel on both views - the float reference carries its own
-	// channel inverse sub-norms so both sides rank by true per-channel cosine. The
-	// honest-budget number for weak channels on int8 banks.
+	// restricted to one channel on both views. Any metric: on Cosine banks the
+	// float reference carries its own channel inverse sub-norms so both sides
+	// rank by true per-channel cosine; on L2/Dot banks the segment scores the
+	// channel range directly. The honest-budget number for weak channels on
+	// int8 channel banks (the motion bank - L2 pose/trajectory - is the first
+	// non-Cosine channel consumer).
 	float ComputeChannelRecallAt10(
 		const TArray<float>& NormalizedRows,
 		int32 Count,
 		int32 Dims,
+		ESuperFAISSBankMetric Metric,
 		USuperFAISSVectorBank* BakedBank,
 		uint64 Seed,
 		int32 ChannelIndex)
@@ -49,6 +53,7 @@ namespace
 		{
 			return 1.0f;
 		}
+		const bool bCosine = Metric == ESuperFAISSBankMetric::Cosine;
 
 		const int32 RefPd = PaddedDims(Dims, Quantization::Float32);
 		TArray<float, TAlignedHeapAllocator<16>> RefPayload;
@@ -75,16 +80,20 @@ namespace
 		RefView.dims = Dims;
 		RefView.paddedDims = RefPd;
 		RefView.quant = Quantization::Float32;
-		RefView.metric = Metric::Cosine;
+		RefView.metric = Metric == ESuperFAISSBankMetric::L2 ? Metric::L2
+			: Metric == ESuperFAISSBankMetric::Dot ? Metric::Dot : Metric::Cosine;
 		RefView.channels = RefChannels.GetData();
 		RefView.channelCount = RefChannels.Num();
 		TArray<float> RefInvNorms;
-		RefInvNorms.SetNumZeroed(static_cast<int64>(Count) * RefChannels.Num());
-		if (ComputeChannelInverseNorms(RefView, RefInvNorms.GetData()) != Status::Ok)
+		if (bCosine)
 		{
-			return -1.0f;
+			RefInvNorms.SetNumZeroed(static_cast<int64>(Count) * RefChannels.Num());
+			if (ComputeChannelInverseNorms(RefView, RefInvNorms.GetData()) != Status::Ok)
+			{
+				return -1.0f;
+			}
+			RefView.channelInvNorms = RefInvNorms.GetData();
 		}
-		RefView.channelInvNorms = RefInvNorms.GetData();
 
 		const BankView BakedView = BakedBank->GetBankView();
 
@@ -121,19 +130,23 @@ namespace
 			State ^= State >> 27;
 			const int32 Row = static_cast<int32>((State * 0x2545F4914F6CDD1Dull) % Count);
 
-			// Skip rows whose channel is zero-norm on either side (the W3 query law
-			// would reject them; the linter floor reports them separately).
-			double SubNorm = 0.0;
-			for (int32 J = BakedBank->ChannelOffsets[ChannelIndex];
-				J < BakedBank->ChannelOffsets[ChannelIndex] +
-					BakedBank->ChannelLengths[ChannelIndex]; ++J)
+			// Cosine only: skip rows whose channel is zero-norm on either side
+			// (the W3 query law would reject them; the linter floor reports them
+			// separately). L2/Dot score zero sub-vectors lawfully.
+			if (bCosine)
 			{
-				const float V = NormalizedRows[Row * Dims + J];
-				SubNorm += static_cast<double>(V) * V;
-			}
-			if (SubNorm <= 0.0)
-			{
-				continue;
+				double SubNorm = 0.0;
+				for (int32 J = BakedBank->ChannelOffsets[ChannelIndex];
+					J < BakedBank->ChannelOffsets[ChannelIndex] +
+						BakedBank->ChannelLengths[ChannelIndex]; ++J)
+				{
+					const float V = NormalizedRows[Row * Dims + J];
+					SubNorm += static_cast<double>(V) * V;
+				}
+				if (SubNorm <= 0.0)
+				{
+					continue;
+				}
 			}
 
 			FMemory::Memzero(RefQuery.GetData(), RefPd * sizeof(float));
@@ -172,9 +185,12 @@ namespace
 			}
 			TotalPossible += RefN;
 		}
+		// Zero successful probes is "not measured", never "perfect" (Poirot R-3:
+		// a bank wider than the CrossDevice ceiling failed every probe and
+		// recorded 1.0 - the honesty metric lying at the boundary it polices).
 		return TotalPossible > 0
 			? static_cast<float>(TotalHits) / static_cast<float>(TotalPossible)
-			: 1.0f;
+			: -1.0f;
 	}
 
 	// Seeded recall@10: sample rows as self-queries, compare the baked (possibly
@@ -280,7 +296,8 @@ namespace
 			TotalPossible += RefN;
 		}
 
-		return TotalPossible > 0 ? static_cast<float>(TotalHits) / TotalPossible : 1.0f;
+		// Zero successful probes is "not measured", never "perfect" (Poirot R-3).
+		return TotalPossible > 0 ? static_cast<float>(TotalHits) / TotalPossible : -1.0f;
 	}
 }
 
@@ -461,15 +478,15 @@ USuperFAISSVectorBank* FSuperFAISSBankImport::Import(
 		Bank->CrossDeviceRecallAt10 = ComputeRecallAt10(Rows, Count, Dims, Metric,
 			Bank, kRecallSeed, /*bCrossDevice=*/true);
 
-		// Per-channel recall on int8 Cosine channel banks (T-044 W2b): the
+		// Per-channel recall on int8 channel banks (T-044 W2b), any metric: the
 		// honest-budget number per channel, same seed discipline.
-		if (Bank->GetChannelCount() > 0 && Metric == ESuperFAISSBankMetric::Cosine)
+		if (Bank->GetChannelCount() > 0)
 		{
 			Bank->ChannelRecallAt10.Reset();
 			for (int32 C = 0; C < Bank->GetChannelCount(); ++C)
 			{
 				Bank->ChannelRecallAt10.Add(ComputeChannelRecallAt10(
-					Rows, Count, Dims, Bank, kRecallSeed + 1 + C, C));
+					Rows, Count, Dims, Metric, Bank, kRecallSeed + 1 + C, C));
 			}
 		}
 		UE_LOG(LogTemp, Display,

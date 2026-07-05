@@ -206,6 +206,40 @@ bool FSuperFAISSScratchBankTest::RunTest(const FString& Parameters)
 			Sub->QueryScratch(Bank, Row, Args, Hits));
 	}
 
+	// R-5 (Poirot deep review): freezing zero live rows yields an EMPTY VALID
+	// bank, not a null indistinguishable from failure.
+	{
+		USuperFAISSScratchBank* Fresh = NewObject<USuperFAISSScratchBank>();
+		TestTrue(TEXT("r5 init"), Fresh->Init(8, Dims,
+			ESuperFAISSBankMetric::Cosine, ESuperFAISSBankQuantization::Float32));
+		TArray<int32> EmptyMap;
+		USuperFAISSVectorBank* FrozenEmpty = Fresh->Freeze(EmptyMap);
+		if (TestNotNull(TEXT("empty freeze returns a bank"), FrozenEmpty))
+		{
+			TestTrue(TEXT("empty frozen valid"), FrozenEmpty->IsValid());
+			TestEqual(TEXT("empty frozen count"), FrozenEmpty->Count, 0);
+		}
+		TestEqual(TEXT("empty map"), EmptyMap.Num(), 0);
+
+		// All-removed: same outcome, map all -1.
+		TArray<float> Row = ScratchRows(1, Dims, 0x0F0Full);
+		int32 Index = INDEX_NONE;
+		TestTrue(TEXT("r5 append"), Fresh->Append(Row, Index));
+		TestTrue(TEXT("r5 remove"), Fresh->Remove(Index));
+		TArray<int32> Map;
+		USuperFAISSVectorBank* FrozenRemoved = Fresh->Freeze(Map);
+		if (TestNotNull(TEXT("all-removed freeze returns a bank"), FrozenRemoved))
+		{
+			TestTrue(TEXT("all-removed frozen valid"), FrozenRemoved->IsValid());
+			TestEqual(TEXT("all-removed frozen count"), FrozenRemoved->Count, 0);
+		}
+		TestEqual(TEXT("all-removed map"), Map.Num(), 1);
+		if (Map.Num() == 1)
+		{
+			TestEqual(TEXT("all-removed map entry"), Map[0], -1);
+		}
+	}
+
 	// P-2 (Poirot sweep): querying an EMPTY scratch bank is well-defined - true
 	// with zero hits - regardless of the pooled workspace's history (pre-fix it
 	// returned false on a cold buffer and true on a warm one).

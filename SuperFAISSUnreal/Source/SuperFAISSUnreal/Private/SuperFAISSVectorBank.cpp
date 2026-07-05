@@ -114,6 +114,12 @@ bool USuperFAISSVectorBank::InitFromSource(
 	ChannelLengths.Reset();
 	ChannelRecallAt10.Reset();
 	ChannelInvNorms.Reset();
+	// Re-init drops every measured number (Poirot R-4): the importer re-measures
+	// on its own paths; anything it does not re-measure must read "not measured",
+	// never a previous object's truth.
+	RecallAt10 = -1.0f;
+	RecallSeed = 0;
+	CrossDeviceRecallAt10 = -1.0f;
 	if (InChannelNames.Num() > 0)
 	{
 		const int32 ChannelCount = InChannelNames.Num();
@@ -256,6 +262,7 @@ bool USuperFAISSVectorBank::InitFromBaked(
 	SourceHash = InSourceHash;
 	RecallAt10 = -1.0f;
 	RecallSeed = 0;
+	CrossDeviceRecallAt10 = -1.0f; // Poirot R-4
 	IndexBlockVersion = 0;
 	IndexBlockData.Reset();
 	RebuildChannelTable();
@@ -266,6 +273,14 @@ bool USuperFAISSVectorBank::InitFromBaked(
 void USuperFAISSVectorBank::RebuildChannelTable()
 {
 	ChannelTable.Reset();
+	// A corrupted or tampered asset can carry mismatched parallel arrays; indexing
+	// Offsets/Lengths by Names.Num() would read out of bounds DURING LOAD (Poirot
+	// R-1a). Leave the table empty here; ValidateContent rejects the bank.
+	if (ChannelOffsets.Num() != ChannelNames.Num() ||
+		ChannelLengths.Num() != ChannelNames.Num())
+	{
+		return;
+	}
 	for (int32 C = 0; C < ChannelNames.Num(); ++C)
 	{
 		superfaiss::ChannelInfo Info;
@@ -400,6 +415,46 @@ bool USuperFAISSVectorBank::ValidateContent(FString& OutError)
 		return false;
 	}
 
+	// The v2 channel block validates like everything else - "a bank that fails
+	// never yields a view" was not true for it before this (Poirot R-1). The
+	// parallel arrays must agree (R-1a; RebuildChannelTable already refused to
+	// build a table from mismatched arrays), the inverse-norm array must be
+	// exactly Count x ChannelCount on Cosine channel banks (R-1b; a truncated
+	// array would send the kernels past the buffer mid-scan), and the view below
+	// carries the channel table so the core's own channel rules run - including
+	// "Cosine channels require invNorms" (R-1c; a missing array silently scored
+	// without per-channel normalization before).
+	const int32 ChannelCount = ChannelNames.Num();
+	if (ChannelOffsets.Num() != ChannelCount || ChannelLengths.Num() != ChannelCount)
+	{
+		OutError = FString::Printf(TEXT("channel arrays disagree (%d names, %d offsets, %d lengths)"),
+			ChannelCount, ChannelOffsets.Num(), ChannelLengths.Num());
+		return false;
+	}
+	if (ChannelCount > 0)
+	{
+		if (ChannelTable.Num() != ChannelCount)
+		{
+			OutError = TEXT("channel table failed to build");
+			return false;
+		}
+		const int64 ExpectedNorms = Metric == ESuperFAISSBankMetric::Cosine
+			? static_cast<int64>(Count) * ChannelCount
+			: 0;
+		if (ChannelInvNorms.Num() != ExpectedNorms)
+		{
+			OutError = FString::Printf(
+				TEXT("channel inverse-norm array is %d entries, bank requires %lld"),
+				ChannelInvNorms.Num(), static_cast<long long>(ExpectedNorms));
+			return false;
+		}
+	}
+	else if (ChannelInvNorms.Num() != 0)
+	{
+		OutError = TEXT("inverse-norm array on a channel-less bank");
+		return false;
+	}
+
 	BankView View;
 	View.rows = Payload.GetData();
 	View.scales = Quantization == ESuperFAISSBankQuantization::Int8 ? Scales.GetData() : nullptr;
@@ -408,6 +463,12 @@ bool USuperFAISSVectorBank::ValidateContent(FString& OutError)
 	View.paddedDims = PaddedDims;
 	View.quant = ToCore(Quantization);
 	View.metric = ToCore(Metric);
+	if (ChannelCount > 0)
+	{
+		View.channels = ChannelTable.GetData();
+		View.channelCount = ChannelTable.Num();
+		View.channelInvNorms = ChannelInvNorms.Num() > 0 ? ChannelInvNorms.GetData() : nullptr;
+	}
 
 	int32_t BadRow = -1;
 	const Status ContentStatus = Count > 0
