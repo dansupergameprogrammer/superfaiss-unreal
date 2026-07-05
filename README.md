@@ -16,6 +16,13 @@ Measured on the shipped demo bank (40,000 words x 100 dims, int8, ~4 MB), deskto
 editor: single query **0.13 ms**, batched **0.06 ms per query** — exact search,
 bit-deterministic, zero steady-state allocation.
 
+**New in 2.2:** cross-device bit-exactness — an opt-in query mode (int8 banks)
+returning bit-identical scores and hit order on any machine at any SIMD width,
+the contract lockstep/rollback multiplayer and networked motion matching
+require. The claim runs as a CI test against committed fixtures, it measures
+faster than the default int8 scan, and the importer reports the mode's recall
+beside standard recall on every bank asset.
+
 **New in 2.1:** per-row score bias, in-scan and exact — sparse (index, bias) pairs
 for motion matching's continuing-pose reward (effectively free) and a dense per-row
 view for memory salience (+3.5% f32 / +1.9% int8, measured). Finite-only; exclusion
