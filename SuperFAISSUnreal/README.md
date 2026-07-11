@@ -5,8 +5,8 @@ Fast, deterministic, allocation-free k-nearest-neighbor search for Unreal Engine
 `USuperFAISSVectorBank`/`USuperFAISSScratchBank` pair answers many questions:
 whole-vector similarity or any weighted mix of named channels, decomposition bars
 for *why* each hit ranked, gameplay state folded into the ranking in-scan,
-prototype categories pooled from selected rows, NPC memory that grows during play
-and survives a save game — with the quantization cost measured and stored on every
+prototype categories pooled from selected rows, mutable banks that grow during play
+and survive save games — with the quantization cost measured and stored on every
 bank asset. Exact, bit-deterministic per device, and (opt-in) bit-identical across
 machines. Built on the MIT-licensed
 [SuperFAISS](https://github.com/dansupergameprogrammer/superfaiss) core library

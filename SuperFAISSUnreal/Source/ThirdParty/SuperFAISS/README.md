@@ -27,8 +27,8 @@ That reliability is what lets you build actual gameplay on top of the answers.
 And you won't outgrow it: the same bank that answers "most similar overall" also
 answers the narrower questions that arrive next — "most similar *in identity*,
 ignoring appearance" (a weighted slice of the vector, with an exact per-channel
-breakdown of why each hit ranked), or "what does this NPC remember that's relevant
-right now?" over a memory that grows during play and survives a save game. One
+breakdown of why each hit ranked), or the same questions over a bank
+that grows during play and survives a save game. One
 bank, one library, more questions over time.
 
 SuperFAISS is an **independent implementation**. It is **not a fork of, derived from, or
