@@ -1,8 +1,15 @@
 # SuperFAISS For Unreal Engine
 
-Fast, deterministic, allocation-free k-nearest-neighbor search over baked embedding
-banks, for Unreal Engine 5.8+. This is the reference engine integration of the
-MIT-licensed [SuperFAISS](https://github.com/dansupergameprogrammer/superfaiss) core
+Fast, deterministic, allocation-free k-nearest-neighbor search for Unreal Engine
+5.8+ — over banks you import as assets or grow at play time. One
+`USuperFAISSVectorBank`/`USuperFAISSScratchBank` pair answers many questions:
+whole-vector similarity or any weighted mix of named channels, decomposition bars
+for *why* each hit ranked, gameplay state folded into the ranking in-scan,
+prototype categories pooled from selected rows, NPC memory that grows during play
+and survives a save game — with the quantization cost measured and stored on every
+bank asset. Exact, bit-deterministic per device, and (opt-in) bit-identical across
+machines. This is the reference engine integration of the MIT-licensed
+[SuperFAISS](https://github.com/dansupergameprogrammer/superfaiss) core
 library (vendored — no external dependency).
 
 SuperFAISS is an **independent implementation** — not a fork of, derived from, or
@@ -108,6 +115,21 @@ so older engines are expected to be a recompile, with two version-sensitive poin
   then rebuild the demo map with `-run=SuperFAISSUnrealDemoMap`.
 - The example project's `BuildSettingsVersion`/`EngineAssociation` may need a
   per-version bump.
+
+## The original pitch
+
+v1.0's opening pitch, word for word:
+
+> Fast, deterministic, allocation-free k-nearest-neighbor search over baked embedding
+> banks, for Unreal Engine 5.8+. This is the reference engine integration of the
+> MIT-licensed [SuperFAISS](https://github.com/dansupergameprogrammer/superfaiss) core
+> library (vendored — no external dependency).
+
+Every word still holds — the plugin just answers more questions now. The banks no
+longer have to be baked (scratch banks grow during play and survive save games),
+and one bank now serves channel-weighted queries, decomposition, in-scan bias,
+prototype categories, and honest per-bank recall numbers alongside the plain top-k
+it started with.
 
 ## Licensing
 

@@ -1,1 +1,1 @@
-SuperFAISS v2.4.0 at tag v2.4 (046f073)
+SuperFAISS code at tag v2.4 (046f073); docs at 272b43a
