@@ -29,4 +29,23 @@ public:
 		const FString& PackagePath,
 		const FString& AssetName,
 		FString& OutError);
+
+	// Cross-device-tier prototype authoring (v2.4, the bake-side twin entry point):
+	// bakes the recognizer anchor with the SAME integer-domain operator the runtime
+	// uses (USuperFAISSSubsystem::MakeCentroidQueryCrossDevice) — one operator, two
+	// entry points, no second math — so the stored quantized centroid byte-equals a
+	// runtime pool over identical rows. The asset takes the REQUIRED cross-device
+	// version bump; the float presentation Query is baked beside it (the provider
+	// path keeps working). int8 banks only. Weights: empty = unweighted, else one
+	// positive integer per resolved row (ids resolve first, indices after — the
+	// weight order matches the RESOLVED row order).
+	UFUNCTION(BlueprintCallable, Category = "Similarity|Editor")
+	static USuperFAISSPrototypeAsset* CreatePrototypeAssetCrossDevice(
+		const USuperFAISSVectorBank* Bank,
+		const TArray<int32>& RowIndices,
+		const TArray<FName>& RowIds,
+		const TArray<int32>& Weights,
+		const FString& PackagePath,
+		const FString& AssetName,
+		FString& OutError);
 };

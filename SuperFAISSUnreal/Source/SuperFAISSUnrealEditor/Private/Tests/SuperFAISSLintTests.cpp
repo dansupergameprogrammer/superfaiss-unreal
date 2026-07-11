@@ -210,4 +210,116 @@ bool FSuperFAISSPrototypeAuthoringTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+// T-V2.4-U1/U2 — cross-device prototype tier (V2 plan section 21, FAI-1): the
+// authoring twin entry point bakes the SAME core operator's product — the baked
+// quantized centroid byte-equals a runtime MakeCentroidQueryCrossDevice over
+// identical rows (one operator, two entry points, no second math). The asset
+// format takes a REQUIRED minor-version bump for the cross-device tier: an
+// XD-tier payload without the bumped version is a defined rejection.
+// Float-storing prototype assets remain the presentation tier, unchanged.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FSuperFAISSPrototypeCrossDeviceTest,
+	"SuperFAISS.D.PrototypeCrossDevice",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext |
+		EAutomationTestFlags::ProductFilter)
+
+bool FSuperFAISSPrototypeCrossDeviceTest::RunTest(const FString& Parameters)
+{
+	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+	if (!TestNotNull(TEXT("subsystem"), Subsystem))
+	{
+		return true;
+	}
+
+	constexpr int32 Count = 60;
+	constexpr int32 Dims = 24;
+	const TArray<float> Rows = LintRows(Count, Dims, 0xD07Aull);
+	USuperFAISSVectorBank* Bank = NewObject<USuperFAISSVectorBank>();
+	FString Error;
+	if (!TestTrue(TEXT("int8 bank built"), Bank->InitFromSource(Rows, Count, Dims,
+			ESuperFAISSBankMetric::Dot, ESuperFAISSBankQuantization::Int8, {},
+			TEXT("xd-proto-test"), Error)))
+	{
+		return true;
+	}
+
+	const TArray<int32> Members = {3, 11, 29, 47};
+
+	// U1: bake the anchor through the authoring twin entry point.
+	FString AuthorError;
+	USuperFAISSPrototypeAsset* Asset =
+		USuperFAISSAuthoringLibrary::CreatePrototypeAssetCrossDevice(Bank, Members, {},
+			{}, TEXT("/Temp/SuperFAISSAuthoringTest"), TEXT("ProtoXd"), AuthorError);
+	if (!TestNotNull(FString::Printf(TEXT("xd asset created: %s"), *AuthorError), Asset))
+	{
+		return true;
+	}
+	TestEqual(TEXT("required version bump"), Asset->AssetVersion,
+		USuperFAISSPrototypeAsset::kAssetVersionCrossDevice);
+	TestTrue(TEXT("cross-device tier"), Asset->IsCrossDeviceTier());
+
+	// The baked payload byte-equals a runtime pool over identical rows.
+	FSuperFAISSCrossDeviceQuery Runtime;
+	TestTrue(TEXT("runtime pool"),
+		Subsystem->MakeCentroidQueryCrossDevice(Bank, Members, {}, Runtime));
+	FSuperFAISSCrossDeviceQuery Baked;
+	TestTrue(TEXT("baked payload readable"), Asset->GetCrossDeviceQuery(Baked));
+	TestTrue(TEXT("baked image byte-equals runtime"), Baked.ImageQ8 == Runtime.ImageQ8);
+	TestTrue(TEXT("baked scale bit-equals runtime"), Baked.Scale == Runtime.Scale);
+	TestEqual(TEXT("baked self-dot equals runtime"), Baked.SqSum, Runtime.SqSum);
+
+	// The baked anchor executes: hits bit-equal the runtime payload's hits.
+	TArray<FSuperFAISSHit> BakedHits;
+	TArray<FSuperFAISSHit> RuntimeHits;
+	TestTrue(TEXT("baked executes"),
+		Subsystem->QueryPooledCrossDevice(Bank, Baked, 6, BakedHits));
+	TestTrue(TEXT("runtime executes"),
+		Subsystem->QueryPooledCrossDevice(Bank, Runtime, 6, RuntimeHits));
+	TestEqual(TEXT("hit counts"), BakedHits.Num(), RuntimeHits.Num());
+	for (int32 i = 0; i < FMath::Min(BakedHits.Num(), RuntimeHits.Num()); ++i)
+	{
+		TestTrue(FString::Printf(TEXT("baked hit %d bit-equal"), i),
+			BakedHits[i].Index == RuntimeHits[i].Index &&
+				BakedHits[i].Score == RuntimeHits[i].Score);
+	}
+
+	// U2: the version gate is REQUIRED — an XD payload under the presentation
+	// version is a defined rejection, never silently readable.
+	{
+		const int32 SavedVersion = Asset->AssetVersion;
+		Asset->AssetVersion = SavedVersion - 1;
+		FSuperFAISSCrossDeviceQuery Gated;
+		TestFalse(TEXT("unbumped version rejected"), Asset->GetCrossDeviceQuery(Gated));
+		Asset->AssetVersion = SavedVersion;
+		TestTrue(TEXT("restored version reads"), Asset->GetCrossDeviceQuery(Gated));
+	}
+
+	// Float-storing assets are the presentation tier, unchanged: no XD payload, no
+	// XD read, the float provider path still works.
+	{
+		FString FloatError;
+		USuperFAISSPrototypeAsset* FloatAsset =
+			USuperFAISSAuthoringLibrary::CreatePrototypeAsset(Bank, Members, {},
+				TEXT("/Temp/SuperFAISSAuthoringTest"), TEXT("ProtoFloat"), FloatError);
+		if (TestNotNull(FString::Printf(TEXT("float asset: %s"), *FloatError), FloatAsset))
+		{
+			TestFalse(TEXT("presentation tier"), FloatAsset->IsCrossDeviceTier());
+			FSuperFAISSCrossDeviceQuery None;
+			TestFalse(TEXT("no xd payload to read"), FloatAsset->GetCrossDeviceQuery(None));
+			TArray<float> Provided;
+			TestTrue(TEXT("float provider unchanged"),
+				ISuperFAISSQueryProvider::Execute_GetQueryVector(FloatAsset, Bank, Provided));
+		}
+	}
+
+	// The XD asset also carries the float presentation form (provider-compatible).
+	{
+		TArray<float> Provided;
+		TestTrue(TEXT("xd asset still provides the float form"),
+			ISuperFAISSQueryProvider::Execute_GetQueryVector(Asset, Bank, Provided));
+	}
+
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

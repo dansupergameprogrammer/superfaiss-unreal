@@ -578,6 +578,26 @@ namespace
 		Object->SetStringField(TEXT("quantization"),
 			Bank.GetQuantization() == ESuperFAISSBankQuantization::Int8 ? TEXT("Int8")
 			                                                            : TEXT("Float32"));
+		// V2.3 recall audit: the retention flag is a bank property, stated always;
+		// the recall report appears once game code measured one, WITH its generation
+		// stamp and stale mark — a stale report reads as stale here, never silently
+		// current. Read-only: the report is taken by game code, never through MCP.
+		Object->SetBoolField(TEXT("retainsFloats"), Bank.RetainsFloats());
+		FSuperFAISSScratchRecallReport Report;
+		bool bStale = false;
+		if (Bank.GetLastRecallReport(Report, bStale))
+		{
+			const TSharedRef<FJsonObject> Recall = MakeShared<FJsonObject>();
+			Recall->SetNumberField(TEXT("recall"), Report.Recall);
+			Recall->SetNumberField(TEXT("k"), Report.K);
+			Recall->SetNumberField(TEXT("sampleCount"), Report.SampleCount);
+			Recall->SetNumberField(TEXT("liveRows"), Report.LiveRows);
+			Recall->SetNumberField(TEXT("generation"),
+				static_cast<double>(Report.Generation));
+			Recall->SetBoolField(TEXT("informative"), Report.bInformative);
+			Recall->SetBoolField(TEXT("stale"), bStale);
+			Object->SetObjectField(TEXT("recallReport"), Recall);
+		}
 		return Object;
 	}
 }

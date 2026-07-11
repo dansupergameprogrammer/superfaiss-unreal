@@ -151,6 +151,15 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Bank")
 	int32 GetIndexForId(FName Id) const;
 
+	// Dequantize row `Row` to its float feature vector (`Dims` values, pad lanes
+	// dropped). Int8 rows return `q * per-row scale` - the exact inverse of the
+	// bake's symmetric per-row quantizer (`QuantizeRowsInt8`: scale = maxAbs/127,
+	// q = round(v/scale)); Float32 rows copy directly. For audit/tooling that
+	// needs the stored vector in a common space (e.g. an encoder-parity diff);
+	// linear, editor/setup-time speed, not per-frame. Returns false if the bank
+	// is invalid or `Row` is out of range.
+	bool GetRowDequantized(int32 Row, TArray<float>& OutValues) const;
+
 	// Non-owning view for the query path. Asserts IsValid().
 	superfaiss::BankView GetBankView() const;
 

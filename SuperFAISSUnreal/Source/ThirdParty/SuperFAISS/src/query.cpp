@@ -1,5 +1,7 @@
 #include "superfaiss/query.h"
 
+#include <cmath>
+
 #include "superfaiss/kernels.h"
 #include "superfaiss/topk.h"
 #include "superfaiss/validate.h"
@@ -9,6 +11,30 @@ namespace superfaiss
 
 namespace
 {
+	// Pre-quantized payload integrity (v2.4 review S2/M1 — the T-062 trust-boundary
+	// class): no field of a caller-provided XdQuery may make scores or rankings
+	// ill-defined or silently wrong. The scale must be FINITE and non-negative —
+	// the bare `>= 0.0` test admits +inf, which poisons Dot/L2 scores with NaN and
+	// defeats the mode's entire product promise. The self-dot must be the image's
+	// own: it feeds the L2 epilogue's Sum(q_i^2) term, and a lying value silently
+	// corrupts rankings. Recomputing it is O(paddedDims) — noise beside the scan it
+	// precedes; a mismatch is a desynced payload and a hard rejection (the payload
+	// IS the operator's product; anything else is corrupt), never a repair.
+	bool XdPayloadValid(const XdQuery& query, int32_t paddedDims)
+	{
+		if (query.q8 == nullptr || !(query.scale >= 0.0) || !std::isfinite(query.scale) ||
+			query.sqSum < 0)
+		{
+			return false;
+		}
+		int64_t sq = 0;
+		for (int32_t i = 0; i < paddedDims; ++i)
+		{
+			sq += static_cast<int64_t>(query.q8[i]) * query.q8[i];
+		}
+		return sq == query.sqSum;
+	}
+
 	// Weight folding (T-050 W1 bench clause, taken and recorded in plan section 10):
 	// for dot-family scoring, sum_s w_s * sum_{j in s} r_j q_j == sum_j r_j (w(j) q_j)
 	// exactly, so segmented dot/cosine scans fold the segment weights into a query
@@ -340,6 +366,108 @@ Status Query(
 			candidateCount, bias, workspace.BiasBits(), effectiveQuery, paddedQuery,
 			params, bFoldable, bXd ? &xdQuery : nullptr, workspace.HeapStorage(2),
 			outHits);
+		return Status::Ok;
+	}
+
+	*outCount = topk.Finalize(outHits);
+	return Status::Ok;
+}
+
+Status QueryXd(
+	const BankView& bank,
+	const XdQuery& query,
+	const QueryParams& params,
+	Workspace& workspace,
+	Hit* outHits,
+	int32_t* outCount)
+{
+	if (outHits == nullptr || outCount == nullptr || params.k < 0)
+	{
+		return Status::InvalidArgument;
+	}
+	*outCount = 0;
+	if (params.k == 0 || bank.count == 0)
+	{
+		return Status::Ok;
+	}
+
+	// A pre-quantized query is CrossDevice by construction: the mode is required, the
+	// bank laws are the CrossDevice laws, and segments are not accepted (segment
+	// validation is defined against the float query the caller does not have).
+	if (params.exactness != Exactness::CrossDevice || params.segments != nullptr ||
+		params.segmentCount != 0)
+	{
+		return Status::InvalidArgument;
+	}
+	if (bank.quant != Quantization::Int8 || bank.paddedDims > kMaxCrossDeviceDims)
+	{
+		return Status::InvalidArgument;
+	}
+	// The query payload itself: an image, a finite non-negative scale, a self-dot
+	// verified against the image (XdPayloadValid — integrity first, so a zero
+	// sqSum below genuinely means an all-zero image). A Cosine bank then rejects a
+	// zero-norm query under any override — the bank's own validation law.
+	if (!XdPayloadValid(query, bank.paddedDims))
+	{
+		return Status::InvalidArgument;
+	}
+	if (bank.metric == Metric::Cosine && query.sqSum == 0)
+	{
+		return Status::ZeroNormQuery;
+	}
+
+	FBiasForm bias;
+	const Status biasStatus = ResolveBiasForm(params.bias, bias);
+	if (biasStatus != Status::Ok)
+	{
+		return biasStatus;
+	}
+	if (bias.pairCount > 0)
+	{
+		if (static_cast<int64_t>(params.k) + bias.pairCount > INT32_MAX ||
+			!workspace.ReserveBiasBits(bank.count))
+		{
+			return Status::OutOfMemory;
+		}
+		const Status pairStatus =
+			ValidateBiasPairs(bank, bias.pairs, bias.pairCount, workspace.BiasBits());
+		if (pairStatus != Status::Ok)
+		{
+			return pairStatus;
+		}
+	}
+
+	BankView scoring = bank;
+	scoring.metric = ScoringMetric(bank, params);
+
+	const int32_t scanK = params.k + bias.pairCount;
+	if (!workspace.Reserve(scanK, bias.pairCount > 0 ? 3 : 1))
+	{
+		return Status::OutOfMemory;
+	}
+
+	// The scan: the same CrossDevice chunk kernel, the same fixed-order double
+	// epilogue and subnormal floor Query runs in this mode — on the caller's bytes.
+	TopK topk;
+	topk.Init(workspace.HeapStorage(0), scanK, scoring.metric);
+	bool nonFiniteBias = false;
+	const int32_t chunks = ChunkCount(scoring);
+	for (int32_t c = 0; c < chunks; ++c)
+	{
+		ScoreChunkXd(scoring, query, c, params.excludeBits, topk,
+			bias.dense, &nonFiniteBias);
+	}
+	if (nonFiniteBias)
+	{
+		return Status::NonFiniteQuery; // the finite-only bias law (fused check)
+	}
+
+	if (bias.pairCount > 0)
+	{
+		const int32_t candidateCount = topk.Finalize(workspace.HeapStorage(1));
+		*outCount = SelectWithSparseBias(scoring, workspace.HeapStorage(1),
+			candidateCount, bias, workspace.BiasBits(), nullptr, nullptr, params,
+			false, &query, workspace.HeapStorage(2), outHits);
 		return Status::Ok;
 	}
 
@@ -716,6 +844,190 @@ Status QueryBatch(
 					workspace.HeapStorage(width + m), candidateCounts[m], biasForms[m],
 					bits, effective, original, params, bFoldable,
 					bXd ? &xdSlots[m] : nullptr,
+					workspace.HeapStorage(2 * maxWidth), // shared selection slot
+					outHits + static_cast<int64_t>(base + m) * params.k);
+			}
+		}
+	}
+	return Status::Ok;
+}
+
+Status QueryXdBatch(
+	const BankView& bank,
+	const XdQuery* queries,
+	int32_t queryCount,
+	const QueryParams& params,
+	Workspace& workspace,
+	Hit* outHits,
+	int32_t* outCounts)
+{
+	if (outHits == nullptr || outCounts == nullptr || params.k < 0 || queryCount < 0)
+	{
+		return Status::InvalidArgument;
+	}
+	for (int32_t m = 0; m < queryCount; ++m)
+	{
+		outCounts[m] = 0;
+	}
+	if (params.k == 0 || bank.count == 0 || queryCount == 0)
+	{
+		return Status::Ok;
+	}
+	if (queries == nullptr)
+	{
+		return Status::InvalidArgument;
+	}
+
+	// QueryXd's law set, applied per member: CrossDevice by construction, segments
+	// rejected, int8 bank under the dims ceiling, every payload validated (a Cosine
+	// bank rejects a zero self-dot member).
+	if (params.exactness != Exactness::CrossDevice || params.segments != nullptr ||
+		params.segmentCount != 0)
+	{
+		return Status::InvalidArgument;
+	}
+	if (bank.quant != Quantization::Int8 || bank.paddedDims > kMaxCrossDeviceDims)
+	{
+		return Status::InvalidArgument;
+	}
+	for (int32_t m = 0; m < queryCount; ++m)
+	{
+		// Integrity first, per member (XdPayloadValid) — one bad member rejects
+		// the batch before any scan work.
+		if (!XdPayloadValid(queries[m], bank.paddedDims))
+		{
+			return Status::InvalidArgument;
+		}
+		if (bank.metric == Metric::Cosine && queries[m].sqSum == 0)
+		{
+			return Status::ZeroNormQuery;
+		}
+	}
+
+	// Bias forms per query (the QueryBatch convention): params.bias carries
+	// queryCount entries; sparse entries pre-validate before any scan work.
+	FBiasForm biasStack[kSubBatchWidth];
+	FBiasForm* biasForms = nullptr;
+	int32_t maxPairs = 0;
+	if (params.bias != nullptr)
+	{
+		for (int32_t m = 0; m < queryCount; ++m)
+		{
+			FBiasForm form;
+			const Status biasStatus = ResolveBiasForm(&params.bias[m], form);
+			if (biasStatus != Status::Ok)
+			{
+				return biasStatus;
+			}
+			if (form.pairCount > 0)
+			{
+				if (!workspace.ReserveBiasBits(bank.count))
+				{
+					return Status::OutOfMemory;
+				}
+				const Status pairStatus = ValidateBiasPairs(bank, form.pairs,
+					form.pairCount, workspace.BiasBits());
+				if (pairStatus != Status::Ok)
+				{
+					return pairStatus;
+				}
+				maxPairs = form.pairCount > maxPairs ? form.pairCount : maxPairs;
+			}
+		}
+		if (static_cast<int64_t>(params.k) + maxPairs > INT32_MAX)
+		{
+			return Status::OutOfMemory;
+		}
+	}
+
+	BankView scoring = bank;
+	scoring.metric = ScoringMetric(bank, params);
+
+	const int32_t maxWidth = queryCount < kSubBatchWidth ? queryCount : kSubBatchWidth;
+	if (!workspace.Reserve(params.k + maxPairs, maxPairs > 0 ? 2 * maxWidth + 1 : maxWidth))
+	{
+		return Status::OutOfMemory;
+	}
+
+	bool nonFiniteBias = false;
+	int32_t candidateCounts[kSubBatchWidth];
+
+	for (int32_t base = 0; base < queryCount; base += kSubBatchWidth)
+	{
+		const int32_t width =
+			(queryCount - base) < kSubBatchWidth ? (queryCount - base) : kSubBatchWidth;
+		if (params.bias != nullptr)
+		{
+			for (int32_t m = 0; m < width; ++m)
+			{
+				FBiasForm form;
+				(void)ResolveBiasForm(&params.bias[base + m], form); // validated above
+				biasStack[m] = form;
+			}
+			biasForms = biasStack;
+		}
+
+		// Chunk loop outermost — the bank streams once per batch — with the
+		// single-query CrossDevice kernel scoring each member inside the chunk, so
+		// batch results are bit-identical to queryCount QueryXd calls by construction
+		// (the QueryBatch CrossDevice structure, on caller-quantized payloads).
+		TopK topks[kSubBatchWidth];
+		for (int32_t m = 0; m < width; ++m)
+		{
+			const int32_t pairs = biasForms != nullptr ? biasForms[m].pairCount : 0;
+			topks[m].Init(workspace.HeapStorage(m), params.k + pairs, scoring.metric);
+		}
+		const int32_t chunks = ChunkCount(scoring);
+		for (int32_t c = 0; c < chunks; ++c)
+		{
+			for (int32_t m = 0; m < width; ++m)
+			{
+				ScoreChunkXd(scoring, queries[base + m], c, params.excludeBits,
+					topks[m], biasForms != nullptr ? biasForms[m].dense : nullptr,
+					&nonFiniteBias);
+			}
+		}
+		for (int32_t m = 0; m < width; ++m)
+		{
+			const bool bSparse = biasForms != nullptr && biasForms[m].pairCount > 0;
+			if (bSparse)
+			{
+				candidateCounts[m] = topks[m].Finalize(workspace.HeapStorage(width + m));
+			}
+			else
+			{
+				outCounts[base + m] = topks[m].Finalize(
+					outHits + static_cast<int64_t>(base + m) * params.k);
+			}
+		}
+		if (nonFiniteBias)
+		{
+			return Status::NonFiniteQuery;
+		}
+
+		// Sparse composition per member (bits rebuilt per query, the QueryBatch
+		// pattern; the CrossDevice rescore path runs on the member's own payload).
+		if (biasForms != nullptr)
+		{
+			for (int32_t m = 0; m < width; ++m)
+			{
+				if (biasForms[m].pairCount == 0)
+				{
+					continue;
+				}
+				if (!workspace.ReserveBiasBits(bank.count))
+				{
+					return Status::OutOfMemory;
+				}
+				uint32_t* bits = workspace.BiasBits();
+				for (int32_t p = 0; p < biasForms[m].pairCount; ++p)
+				{
+					const int32_t row = biasForms[m].pairs[p].index;
+					bits[row >> 5] |= 1u << (row & 31);
+				}
+				outCounts[base + m] = SelectWithSparseBias(scoring,
+					workspace.HeapStorage(width + m), candidateCounts[m], biasForms[m],
+					bits, nullptr, nullptr, params, false, &queries[base + m],
 					workspace.HeapStorage(2 * maxWidth), // shared selection slot
 					outHits + static_cast<int64_t>(base + m) * params.k);
 			}

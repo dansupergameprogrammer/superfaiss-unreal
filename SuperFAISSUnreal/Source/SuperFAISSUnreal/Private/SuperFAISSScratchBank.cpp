@@ -43,10 +43,67 @@ namespace
 } // namespace
 
 bool USuperFAISSScratchBank::Init(int32 Capacity, int32 Dims,
-	ESuperFAISSBankMetric Metric, ESuperFAISSBankQuantization Quantization)
+	ESuperFAISSBankMetric Metric, ESuperFAISSBankQuantization Quantization,
+	bool bRetainFloats)
 {
-	return Bank.Create(Capacity, Dims, ToCoreMetric(Metric), ToCoreQuant(Quantization)) ==
-		superfaiss::Status::Ok;
+	return Bank.Create(Capacity, Dims, ToCoreMetric(Metric), ToCoreQuant(Quantization),
+			   bRetainFloats) == superfaiss::Status::Ok;
+}
+
+void USuperFAISSScratchBank::FillReport(
+	const superfaiss::ScratchRecallReport& Core, FSuperFAISSScratchRecallReport& Out)
+{
+	Out.Recall = Core.recall;
+	Out.K = Core.k;
+	Out.SampleCount = Core.sampleCount;
+	Out.LiveRows = Core.liveRows;
+	Out.Seed = static_cast<int64>(Core.seed);
+	Out.Generation = static_cast<int64>(Core.generation);
+	Out.bInformative = Core.informative;
+}
+
+bool USuperFAISSScratchBank::MeasureRecall(FSuperFAISSScratchRecallReport& OutReport)
+{
+	OutReport = FSuperFAISSScratchRecallReport{};
+	if (!Bank.IsCreated() || !Bank.RetainsFloats())
+	{
+		// The core's InvalidArgument, mapped: a non-retention bank has no reference
+		// to audit against — a defined rejection, never a guessed number.
+		return false;
+	}
+	// The N4 posture: refuse while a drain-requiring operation is waiting, like any
+	// query dispatch. The pin is released before the core call — the core takes its
+	// own reader pin for the sweep's flight; holding ours across it would deadlock a
+	// drain that starts in between.
+	if (!Bank.TryPinReader())
+	{
+		return false;
+	}
+	Bank.UnpinReader();
+
+	superfaiss::ScratchRecallReport Core;
+	if (Bank.MeasureScratchRecall(RecallWorkspace, &Core) != superfaiss::Status::Ok)
+	{
+		return false;
+	}
+	FillReport(Core, OutReport);
+	LastRecallReport = OutReport;
+	bHasRecallReport = true;
+	return true;
+}
+
+bool USuperFAISSScratchBank::GetLastRecallReport(
+	FSuperFAISSScratchRecallReport& OutReport, bool& bOutStale) const
+{
+	OutReport = FSuperFAISSScratchRecallReport{};
+	bOutStale = false;
+	if (!bHasRecallReport)
+	{
+		return false;
+	}
+	OutReport = LastRecallReport;
+	bOutStale = IsRecallReportStale(LastRecallReport);
+	return true;
 }
 
 bool USuperFAISSScratchBank::Append(const TArray<float>& Vector, int32& OutIndex)
@@ -88,6 +145,29 @@ bool USuperFAISSScratchBank::Grow(int32 NewCapacity)
 
 USuperFAISSVectorBank* USuperFAISSScratchBank::Freeze(TArray<int32>& OutIndexMap)
 {
+	return FreezeInternal(OutIndexMap, nullptr, nullptr);
+}
+
+USuperFAISSVectorBank* USuperFAISSScratchBank::FreezeWithRecall(
+	TArray<int32>& OutIndexMap, FSuperFAISSScratchRecallReport& OutRecallReport,
+	bool& bOutRecallMeasured)
+{
+	OutRecallReport = FSuperFAISSScratchRecallReport{};
+	bOutRecallMeasured = false;
+	superfaiss::ScratchRecallReport Core;
+	bool bMeasured = false;
+	USuperFAISSVectorBank* Frozen = FreezeInternal(OutIndexMap, &Core, &bMeasured);
+	if (Frozen != nullptr && bMeasured)
+	{
+		FillReport(Core, OutRecallReport);
+		bOutRecallMeasured = true;
+	}
+	return Frozen;
+}
+
+USuperFAISSVectorBank* USuperFAISSScratchBank::FreezeInternal(TArray<int32>& OutIndexMap,
+	superfaiss::ScratchRecallReport* OutCoreReport, bool* bOutMeasured)
+{
 	OutIndexMap.Reset();
 	if (!Bank.IsCreated())
 	{
@@ -95,12 +175,20 @@ USuperFAISSVectorBank* USuperFAISSScratchBank::Freeze(TArray<int32>& OutIndexMap
 	}
 
 	USuperFAISSVectorBank* Frozen = nullptr;
-	const bool bOk = DrainAndRun([this, &OutIndexMap, &Frozen]() {
+	const bool bOk = DrainAndRun([this, &OutIndexMap, &Frozen, OutCoreReport,
+							 bOutMeasured]() {
 		using namespace superfaiss;
 		const int32 Count = Bank.Count();
 		const int32 Live = Bank.FreezeLiveCount();
 		const int32 Pd = Bank.GetPaddedDims();
 		const bool bInt8 = Bank.GetQuantization() == Quantization::Int8;
+
+		// The V2.3 re-measurement: on a retention bank the core Freeze measures the
+		// compacted rows at freeze time (inside this exclusive window); a
+		// non-retention freeze produces no number — the caller's flag stays false.
+		ScratchRecallReport* CoreReport =
+			(OutCoreReport != nullptr && Bank.RetainsFloats()) ? OutCoreReport : nullptr;
+		Workspace* CoreWs = CoreReport != nullptr ? &RecallWorkspace : nullptr;
 
 		// Zero live rows is a legitimate freeze (an empty memory graduating is
 		// still a memory): produce an EMPTY valid bank, not a failure a caller
@@ -135,9 +223,13 @@ USuperFAISSVectorBank* USuperFAISSScratchBank::Freeze(TArray<int32>& OutIndexMap
 		}
 		OutIndexMap.SetNumUninitialized(Count);
 		if (Bank.Freeze(Rows.GetData(), bInt8 ? Scales.GetData() : nullptr,
-				OutIndexMap.GetData()) != Status::Ok)
+				OutIndexMap.GetData(), CoreReport, CoreWs) != Status::Ok)
 		{
 			return false;
+		}
+		if (CoreReport != nullptr && bOutMeasured != nullptr)
+		{
+			*bOutMeasured = true;
 		}
 
 		USuperFAISSVectorBank* Candidate = NewObject<USuperFAISSVectorBank>(GetOuter());
@@ -177,7 +269,7 @@ bool USuperFAISSScratchBank::LoadFromBytes(const TArray<uint8>& Bytes)
 {
 	// Load is exclusive: drain queries; the core's reject-over-degrade keeps the
 	// current state on a bad blob.
-	return DrainAndRun([this, &Bytes]() {
+	const bool bLoaded = DrainAndRun([this, &Bytes]() {
 		FByteReader Reader;
 		Reader.Bytes = &Bytes;
 		superfaiss::ScratchArchive Archive;
@@ -185,4 +277,15 @@ bool USuperFAISSScratchBank::LoadFromBytes(const TArray<uint8>& Bytes)
 		Archive.user = &Reader;
 		return Bank.Load(Archive) == superfaiss::Status::Ok;
 	});
+	if (bLoaded)
+	{
+		// A Load replaces the rows wholesale (review S1): the cached report
+		// describes rows that no longer exist, so it is dropped — a stale number
+		// must never wear a current face across a restore. (The core's generation
+		// also advances past every prior stamp, so a caller-held report reads
+		// stale too; a failed load keeps the bank unchanged and the cache with it.)
+		bHasRecallReport = false;
+		LastRecallReport = FSuperFAISSScratchRecallReport{};
+	}
+	return bLoaded;
 }

@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
 	"Version": 1,
-	"VersionName": "2.2.3",
+	"VersionName": "2.4.0",
 	"FriendlyName": "SuperFAISS MCP Toolset",
 	"Description": "Agent-callable MCP tools over SuperFAISS vector banks: enumerate, query, import, validate, and lint from a connected MCP client. Requires an engine distribution carrying the Experimental ToolsetRegistry and ModelContextProtocol plugins (in practice, a GitHub-source engine build).",
 	"Category": "AI",

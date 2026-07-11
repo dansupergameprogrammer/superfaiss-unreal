@@ -319,6 +319,39 @@ int32 USuperFAISSVectorBank::GetIndexForId(FName Id) const
 	return Ids.IndexOfByKey(Id);
 }
 
+bool USuperFAISSVectorBank::GetRowDequantized(int32 Row, TArray<float>& OutValues) const
+{
+	OutValues.Reset();
+	if (!bValidated || Row < 0 || Row >= Count || Dims <= 0)
+	{
+		return false;
+	}
+	OutValues.SetNumUninitialized(Dims);
+	const int64 RowStart = static_cast<int64>(Row) * PaddedDims;
+	if (Quantization == ESuperFAISSBankQuantization::Int8)
+	{
+		// q * per-row scale - the exact inverse of QuantizeRowsInt8. Pad lanes
+		// past Dims are dropped; a zero row has scale 0 and dequantizes to zero.
+		const int8_t* Row8 =
+			reinterpret_cast<const int8_t*>(Payload.GetData()) + RowStart;
+		const float Scale = Scales.IsValidIndex(Row) ? Scales[Row] : 0.0f;
+		for (int32 D = 0; D < Dims; ++D)
+		{
+			OutValues[D] = static_cast<float>(Row8[D]) * Scale;
+		}
+	}
+	else
+	{
+		const float* RowF =
+			reinterpret_cast<const float*>(Payload.GetData()) + RowStart;
+		for (int32 D = 0; D < Dims; ++D)
+		{
+			OutValues[D] = RowF[D];
+		}
+	}
+	return true;
+}
+
 superfaiss::BankView USuperFAISSVectorBank::GetBankView() const
 {
 	// Shipping-safe gate (Poirot S3): check() compiles out in Shipping, where a

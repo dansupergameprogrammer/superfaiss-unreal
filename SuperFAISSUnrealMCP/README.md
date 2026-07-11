@@ -45,7 +45,7 @@ thin wrappers and tracks such churn cheaply.
 | `ValidateBanks` | Project-wide bank validation with per-bank diagnostics |
 | `LintBank` | Near-duplicate rows (sampled above a cap, and the report says so) and low-variance dims; on channel banks also channel-scoped near-duplicates, degenerate channels, and weak channels; cost scales with bank size |
 | `ListScratchBanks` | Live scratch banks (runtime, mutable, in-memory — not assets); read-only |
-| `DescribeScratchBank` | Metadata for one live scratch bank, by the object path `ListScratchBanks` reported |
+| `DescribeScratchBank` | Metadata for one live scratch bank, by the object path `ListScratchBanks` reported; states the v2.3 float-retention flag and, once game code measured one, the recall-audit report with its generation stamp and stale mark |
 | `QueryScratchBank` | Exact top-K against a live scratch bank by raw vector; removed rows excluded automatically |
 
 Read/import-only by design: no tool deletes or mutates an existing bank, and scratch

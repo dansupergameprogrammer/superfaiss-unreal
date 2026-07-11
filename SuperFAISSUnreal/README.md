@@ -13,8 +13,9 @@ encoder model can vectorize — become points where *similar means near*. This p
 answers "what's most similar to this?" exactly, in microseconds, on any thread.
 
 Measured on the shipped demo bank (40,000 words × 100 dims, int8, ~4 MB), desktop editor:
-single query **0.13 ms**, batched **0.06 ms per query** — exact search, bit-deterministic,
-zero steady-state allocation.
+single query **0.13 ms** (auto-parallelized across chunks — the core's serial one-core
+scan of the same bank is ~0.5 ms), batched **0.06 ms per query** — exact search,
+bit-deterministic, zero steady-state allocation.
 
 ## Quick start
 
@@ -167,8 +168,8 @@ M x Count x 4 bias bytes beside the bank, which is why the sparse form exists.
 An opt-in query mode promising **bit-identical scores and hit order across
 different machines** — x86 and ARM, Windows/Linux/macOS, any SIMD width — the
 property lockstep and rollback multiplayer, networked motion matching, and
-server-side validation actually require. Epic's PoseSearch offers no determinism
-contract of any kind; this one runs as a CI test.
+server-side validation actually require. The contract is not aspirational
+prose: it runs as a CI test, a pinned cross-device hash asserted on every push.
 
 ```cpp
 FSuperFAISSQueryArgs Args;
@@ -197,6 +198,38 @@ math). Cost: the integer path measures FASTER than the default int8 scan
 (−18.5% single / −14.6% batch at 100k×256, desktop AVX2). `DecomposeHit` takes
 `bCrossDeviceExact` and matches the cross-device scan score bitwise. Full
 contract: vendored `DETERMINISM.md` §2c.
+
+## Scratch recall audit (v2.3)
+
+`Init(..., bRetainFloats=true)` opts a scratch bank into a dev/audit posture that
+retains the post-normalization float rows beside the quantized rows (an int8
+256-dim row grows ~4.9x — stated, not assumed), and `MeasureRecall` then reports
+the bank's own cross-device recall@10 against that retained reference, with the
+sample count, seed, and a generation stamp; any later append, remove, or load
+marks the report stale, never silently current. `FreezeWithRecall` re-measures
+over the compacted rows at freeze time, and `DescribeScratchBank` (MCP) states
+the flag and the report read-only.
+
+## Integer-domain pooling (v2.4)
+
+`MakeCentroidQueryCrossDevice` pools int8 bank rows into a **quantized**
+cross-device query (order-free integer accumulation — no float mean), so pooled
+queries can honestly participate in cross-device-exact results;
+`QueryPooledCrossDevice` executes exactly those bytes, and all-equal salience
+weights produce the bit-identical unweighted payload. Stated plainly: the
+executor is a K-only surface — it takes the payload and a K; exclusion, bias,
+and channels do not compose through this entry point (the core `QueryXd` path
+supports exclusion and bias; the plugin surface exposes them when a consumer
+needs them, not before). The payload validates on execution: a non-finite scale
+or a self-dot that isn't the image's own is a rejection, never a silently wrong
+ranking. The editor's `CreatePrototypeAssetCrossDevice` bakes the same
+operator's product into a cross-device-tier prototype asset (required asset
+version bump — an XD payload under the old version is refused), so a baked
+anchor byte-equals a runtime pool over identical rows; float prototype assets
+remain the presentation tier, unchanged. Pooled recall is measured beside the
+operator at calibration (0.9930 / 0.9885 / 0.9895 recall@10, Dot / Cosine / L2 —
+200 seeded 8-row pools over the core suite's 512×128 int8 fixtures, fixed
+recorded seed); measure per bank before adopting, as with any quantized mode.
 
 ## The query side of the encoder seam
 
@@ -266,15 +299,18 @@ The stripped plugin compiles and the non-demo test groups pass unchanged.
 
 ## Tests
 
-`SuperFAISS.*` automation tests (31 in this plugin; 33 with the MCP plugin enabled)
+`SuperFAISS.*` automation tests (38 in this plugin; 41 with the MCP plugin enabled)
 cover kernel correctness, SIMD/scalar mirror equality, determinism, tie-break
 stability, concurrency, asset round-trips, import rejection, quantizer recall,
 performance guards, query composition (centroid, direction, intersection, margins),
 named-channel queries and decomposition, per-row bias (both forms, snapshot
 alignment, the decomposition bias term), scratch banks (including the drain gate,
-freeze bit-identity, and save/load), bank lint analyses, prototype authoring, a
-golden semantic query on the demo bank, and the Mass swarm's stability (F2). Run
-headless:
+freeze bit-identity, save/load, the recall audit, and report staleness across a
+save/load round trip), cross-device pooling (payload and hit-list equality
+against the core path, and adversarial payload rejection), the prototype
+asset's cross-device tier and version gate, bank lint analyses, prototype
+authoring, a golden semantic query on the demo bank, and the Mass swarm's
+stability (F2). Run headless:
 
 ```
 UnrealEditor-Cmd <project> -ExecCmds="Automation RunTests SuperFAISS; Quit" -unattended -nullrhi

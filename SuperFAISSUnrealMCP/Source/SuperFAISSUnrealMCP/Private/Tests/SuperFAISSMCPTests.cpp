@@ -387,4 +387,95 @@ bool FSuperFAISSMCPToolValidationTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+// T-V2.3-U2 — the read-only report surface: DescribeScratchBank states the
+// retention flag and, once a report was taken, the recall number WITH its
+// generation stamp and stale mark — a stale report reads as stale through the
+// surface, never silently current. MCP stays read-only (the R-M4 posture): the
+// report is taken by game code; the tool only describes it.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FSuperFAISSMCPScratchRecallTest,
+	"SuperFAISS.M.DescribeScratchRecall",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FSuperFAISSMCPScratchRecallTest::RunTest(const FString& Parameters)
+{
+	constexpr int32 Count = 32;
+	constexpr int32 Dims = 8;
+
+	// A retention bank with a measured report.
+	USuperFAISSScratchBank* Audited = NewObject<USuperFAISSScratchBank>();
+	TestTrue(TEXT("retention init"), Audited->Init(Count, Dims,
+		ESuperFAISSBankMetric::Dot, ESuperFAISSBankQuantization::Int8,
+		/*bRetainFloats*/ true));
+	uint64 State = 0xA3A5ull;
+	for (int32 R = 0; R < Count; ++R)
+	{
+		TArray<float> Row;
+		Row.SetNumUninitialized(Dims);
+		for (float& V : Row)
+		{
+			State ^= State >> 12;
+			State ^= State << 25;
+			State ^= State >> 27;
+			V = static_cast<float>(static_cast<int64>((State * 0x2545F4914F6CDD1Dull) >> 24)) /
+				static_cast<float>(1ll << 39);
+		}
+		int32 Index = INDEX_NONE;
+		TestTrue(TEXT("append"), Audited->Append(Row, Index));
+	}
+	FSuperFAISSScratchRecallReport Report;
+	TestTrue(TEXT("measured"), Audited->MeasureRecall(Report));
+
+	const TSharedPtr<FJsonObject> D =
+		ParseTool(USuperFAISSToolset::DescribeScratchBank(Audited->GetPathName()));
+	if (TestTrue(TEXT("describe parses"), D.IsValid()))
+	{
+		TestTrue(TEXT("retention flag stated"), D->GetBoolField(TEXT("retainsFloats")));
+		const TSharedPtr<FJsonObject>* Recall = nullptr;
+		if (TestTrue(TEXT("recall report present"),
+				D->TryGetObjectField(TEXT("recallReport"), Recall)))
+		{
+			TestEqual(TEXT("recall value"),
+				static_cast<float>((*Recall)->GetNumberField(TEXT("recall"))),
+				Report.Recall);
+			TestEqual(TEXT("live rows"),
+				(int32)(*Recall)->GetNumberField(TEXT("liveRows")), Report.LiveRows);
+			TestEqual(TEXT("generation stamp"),
+				(int64)(*Recall)->GetNumberField(TEXT("generation")), Report.Generation);
+			TestFalse(TEXT("current at measurement"),
+				(*Recall)->GetBoolField(TEXT("stale")));
+			TestEqual(TEXT("informative stated"),
+				(*Recall)->GetBoolField(TEXT("informative")), Report.bInformative);
+		}
+	}
+
+	// A mutation after the report: the surface reads it as STALE.
+	TestTrue(TEXT("mutating remove"), Audited->Remove(0));
+	const TSharedPtr<FJsonObject> D2 =
+		ParseTool(USuperFAISSToolset::DescribeScratchBank(Audited->GetPathName()));
+	if (TestTrue(TEXT("describe re-parses"), D2.IsValid()))
+	{
+		const TSharedPtr<FJsonObject>* Recall = nullptr;
+		if (TestTrue(TEXT("report still described"),
+				D2->TryGetObjectField(TEXT("recallReport"), Recall)))
+		{
+			TestTrue(TEXT("stale reads stale"), (*Recall)->GetBoolField(TEXT("stale")));
+		}
+	}
+
+	// A non-retention bank: flag off, no report object.
+	USuperFAISSScratchBank* Plain = NewObject<USuperFAISSScratchBank>();
+	TestTrue(TEXT("plain init"), Plain->Init(Count, Dims,
+		ESuperFAISSBankMetric::Dot, ESuperFAISSBankQuantization::Int8));
+	const TSharedPtr<FJsonObject> P =
+		ParseTool(USuperFAISSToolset::DescribeScratchBank(Plain->GetPathName()));
+	if (TestTrue(TEXT("plain describe parses"), P.IsValid()))
+	{
+		TestFalse(TEXT("retention off stated"), P->GetBoolField(TEXT("retainsFloats")));
+		TestFalse(TEXT("no report object"), P->HasField(TEXT("recallReport")));
+	}
+
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

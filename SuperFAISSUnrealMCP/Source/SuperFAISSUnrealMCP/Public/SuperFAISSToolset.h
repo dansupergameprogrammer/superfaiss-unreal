@@ -121,7 +121,13 @@ public:
 	UFUNCTION(meta = (AICallable), Category = "SuperFAISS")
 	static FString ListScratchBanks();
 
-	/** Metadata for one live scratch bank, by the object path ListScratchBanks reported. */
+	/**
+	 * Metadata for one live scratch bank, by the object path ListScratchBanks
+	 * reported. States the float-retention flag (a dev/audit posture set at Init)
+	 * and, when game code has measured one, the recall-audit report with its
+	 * generation stamp and stale mark — a report taken before a later append or
+	 * remove reads as stale, never silently current.
+	 */
 	UFUNCTION(meta = (AICallable), Category = "SuperFAISS")
 	static FString DescribeScratchBank(const FString& ScratchBankPath);
 

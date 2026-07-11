@@ -29,6 +29,58 @@ struct FSuperFAISSHit
 	float Margin = 0.0f;
 };
 
+// A pooled cross-device query payload (v2.4, plan section 21): the quantized
+// centroid MakeCentroidQueryCrossDevice produced — the int8 image (stored as its
+// byte pattern), the per-query dequant scale (double, no float round-trip), and
+// the integer self-dot. QueryPooledCrossDevice executes EXACTLY these bytes (the
+// core QueryXd path): no float round-trip, no requantization, so the executed
+// query is bit-for-bit the operator's product on every machine. Dims/PaddedDims
+// bind the payload to its bank shape.
+USTRUCT(BlueprintType)
+struct FSuperFAISSCrossDeviceQuery
+{
+	GENERATED_BODY()
+
+	// int8 image bytes on the bank's padded grid (PaddedDims entries).
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Similarity")
+	TArray<uint8> ImageQ8;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Similarity")
+	double Scale = 0.0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Similarity")
+	int64 SqSum = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Similarity")
+	int32 Dims = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Similarity")
+	int32 PaddedDims = 0;
+
+	// Payload integrity (review S2/M1, the trust-boundary class): a hand-edited or
+	// corrupted payload (a Blueprint-authored struct, a desynced prototype asset)
+	// must be a defined rejection, never a silently wrong ranking. The scale must
+	// be FINITE and non-negative (a bare >= 0 admits +inf, which poisons Dot/L2
+	// scores with NaN), and the self-dot must be the image's own (it feeds the L2
+	// epilogue; a lying value corrupts rankings). O(PaddedDims) — noise beside the
+	// scan it gates; the core boundary re-validates identically.
+	bool IsPayloadValid() const
+	{
+		if (ImageQ8.Num() <= 0 || ImageQ8.Num() != PaddedDims || Dims <= 0 ||
+			Dims > PaddedDims || !(Scale >= 0.0) || !FMath::IsFinite(Scale) || SqSum < 0)
+		{
+			return false;
+		}
+		int64 Sq = 0;
+		for (const uint8 Byte : ImageQ8)
+		{
+			const int64 V = static_cast<int8>(Byte); // stored bit pattern is int8
+			Sq += V * V;
+		}
+		return Sq == SqSum;
+	}
+};
+
 // A named channel with a weight - the Blueprint-sane face of segmented queries
 // (plan section 5): names resolve once at query build, never in the kernel.
 USTRUCT(BlueprintType)
@@ -281,6 +333,34 @@ public:
 		meta = (DisplayName = "Make Direction Query"))
 	bool MakeDirectionQuery(const TArray<float>& A, const TArray<float>& B,
 		TArray<float>& OutQuery);
+
+	// Integer-domain pooling (v2.4, plan section 21): pools the selected int8 bank
+	// rows into a QUANTIZED cross-device query — order-free int64 accumulation with
+	// a direct integer-domain requantization (no float mean, no norm reduction), so
+	// the payload is bit-identical on every machine given the same rows. Weights
+	// (optional salience, empty = unweighted; else one positive integer per row;
+	// all-equal weights produce the bit-identical unweighted payload) fold into the
+	// same integer multiply. int8 banks only (the float MakeCentroidQuery remains
+	// the presentation-tier path); a selection whose integer accumulator cancels to
+	// zero fails, like the float path's zero-norm centroid. The pooled sum of
+	// weights is capped at 2^20 (the core's overflow-proof bound). Recall cost is
+	// measured beside the operator (core suite: ~0.99 recall@10 on random int8 at
+	// the first calibration); this operator is space-version-bound for consumers
+	// (vendored DETERMINISM.md section 2d).
+	UFUNCTION(BlueprintCallable, Category = "Similarity",
+		meta = (DisplayName = "Make Centroid Query (Cross-Device Exact)"))
+	bool MakeCentroidQueryCrossDevice(const USuperFAISSVectorBank* Bank,
+		const TArray<int32>& RowIndices, const TArray<int32>& Weights,
+		FSuperFAISSCrossDeviceQuery& OutQuery);
+
+	// Executes a pooled cross-device payload against its bank — the core QueryXd
+	// path: the same integer kernels, fixed-order double epilogue, and subnormal
+	// floor a bCrossDeviceExact query runs, on the payload's exact bytes. The
+	// payload must match the bank's shape (Dims/PaddedDims); int8 banks only.
+	UFUNCTION(BlueprintCallable, Category = "Similarity",
+		meta = (DisplayName = "Query Similar (Pooled Cross-Device)"))
+	bool QueryPooledCrossDevice(const USuperFAISSVectorBank* Bank,
+		const FSuperFAISSCrossDeviceQuery& Query, int32 K, TArray<FSuperFAISSHit>& Hits);
 
 	// Diagnostics: workspace pool growth count (flat once warm — the B5 counter).
 	uint64 GetPoolGrowthCount() const;

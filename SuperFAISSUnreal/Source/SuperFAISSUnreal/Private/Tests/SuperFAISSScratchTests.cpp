@@ -342,4 +342,210 @@ bool FSuperFAISSScratchBankTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+// T-V2.3-U1 — scratch recall audit at the plugin surface (V2 plan section 20):
+// the plugin MeasureRecall entry point returns the SAME number the core routine
+// returns on the same rows and seed (the plugin wraps the core type — one math);
+// a non-retention bank surfaces the InvalidArgument-mapped failure; a later
+// mutation renders the report stale, never silently current; FreezeWithRecall
+// carries a fresh number measured over the compacted rows.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FSuperFAISSScratchRecallTest,
+	"SuperFAISS.A.ScratchRecall",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext |
+		EAutomationTestFlags::ProductFilter)
+
+bool FSuperFAISSScratchRecallTest::RunTest(const FString& Parameters)
+{
+	constexpr int32 Count = 160;
+	constexpr int32 Dims = 32;
+	const TArray<float> Rows = ScratchRows(Count, Dims, 0x2ECA11ull);
+
+	// Retention is opt-in at Init, never the default, and descriptor-visible.
+	USuperFAISSScratchBank* Plain = NewObject<USuperFAISSScratchBank>();
+	TestTrue(TEXT("default init"), Plain->Init(Count, Dims,
+		ESuperFAISSBankMetric::Cosine, ESuperFAISSBankQuantization::Int8));
+	TestFalse(TEXT("retention never the default"), Plain->RetainsFloats());
+
+	USuperFAISSScratchBank* Audited = NewObject<USuperFAISSScratchBank>();
+	TestTrue(TEXT("retention init"), Audited->Init(Count, Dims,
+		ESuperFAISSBankMetric::Cosine, ESuperFAISSBankQuantization::Int8,
+		/*bRetainFloats*/ true));
+	TestTrue(TEXT("retention flag reads back"), Audited->RetainsFloats());
+
+	// Identical history on the plugin bank and a direct core bank.
+	superfaiss::ScratchBank CoreTwin;
+	TestTrue(TEXT("core twin created"),
+		CoreTwin.Create(Count, Dims, superfaiss::Metric::Cosine,
+			superfaiss::Quantization::Int8, /*retainFloats*/ true) ==
+			superfaiss::Status::Ok);
+	TArray<float> Row;
+	Row.SetNumUninitialized(Dims);
+	for (int32 R = 0; R < Count; ++R)
+	{
+		FMemory::Memcpy(Row.GetData(), Rows.GetData() + R * Dims, Dims * sizeof(float));
+		int32 Index = INDEX_NONE;
+		TestTrue(TEXT("plugin append"), Audited->Append(Row, Index));
+		TestTrue(TEXT("plain append"), Plain->Append(Row, Index));
+		TestTrue(TEXT("core append"),
+			CoreTwin.Append(Row.GetData(), Dims, nullptr) == superfaiss::Status::Ok);
+	}
+	for (int32 R = 0; R < Count; R += 11)
+	{
+		TestTrue(TEXT("plugin remove"), Audited->Remove(R));
+		TestTrue(TEXT("core remove"), CoreTwin.Remove(R) == superfaiss::Status::Ok);
+	}
+
+	// U1 equality: plugin number bit-equals core number on the same rows and seed
+	// (the plugin uses the core default seed; so does the direct call).
+	FSuperFAISSScratchRecallReport Report;
+	TestTrue(TEXT("plugin measure"), Audited->MeasureRecall(Report));
+	superfaiss::Workspace CoreWs;
+	superfaiss::ScratchRecallReport CoreReport;
+	TestTrue(TEXT("core measure"),
+		CoreTwin.MeasureScratchRecall(CoreWs, &CoreReport) == superfaiss::Status::Ok);
+	TestTrue(TEXT("plugin recall bit-equals core"),
+		Report.Recall == CoreReport.recall);
+	TestEqual(TEXT("k"), Report.K, CoreReport.k);
+	TestEqual(TEXT("sample count"), Report.SampleCount, CoreReport.sampleCount);
+	TestEqual(TEXT("live rows"), Report.LiveRows, CoreReport.liveRows);
+	TestEqual(TEXT("seed"), Report.Seed, static_cast<int64>(CoreReport.seed));
+	TestEqual(TEXT("informative"), Report.bInformative, CoreReport.informative);
+
+	// The report is cached for the descriptor surface, current at measurement.
+	FSuperFAISSScratchRecallReport Cached;
+	bool bStale = true;
+	TestTrue(TEXT("cached report"), Audited->GetLastRecallReport(Cached, bStale));
+	TestTrue(TEXT("cached equals measured"), Cached.Recall == Report.Recall);
+	TestFalse(TEXT("current at measurement"), bStale);
+	TestFalse(TEXT("stale check agrees"), Audited->IsRecallReportStale(Report));
+
+	// A later mutation renders it stale — read as stale, never silently current.
+	{
+		FMemory::Memcpy(Row.GetData(), Rows.GetData(), Dims * sizeof(float));
+		int32 Index = INDEX_NONE;
+		TestFalse(TEXT("full bank rejects append"), Audited->Append(Row, Index));
+		TestTrue(TEXT("mutating remove"), Audited->Remove(1));
+		TestTrue(TEXT("report reads stale"), Audited->IsRecallReportStale(Report));
+		TestTrue(TEXT("cache reads stale"), Audited->GetLastRecallReport(Cached, bStale));
+		TestTrue(TEXT("cache stale flag"), bStale);
+	}
+
+	// Reject-over-degrade: a non-retention bank is a defined failure, not a guess.
+	FSuperFAISSScratchRecallReport Rejected;
+	TestFalse(TEXT("non-retention measure rejected"), Plain->MeasureRecall(Rejected));
+
+	// FreezeWithRecall: the graduated bank carries a FRESH number measured over the
+	// compacted rows — INV-equal to a direct measurement taken at freeze time.
+	{
+		FSuperFAISSScratchRecallReport Direct;
+		TestTrue(TEXT("direct pre-freeze measure"), Audited->MeasureRecall(Direct));
+		TArray<int32> IndexMap;
+		FSuperFAISSScratchRecallReport Frozen;
+		bool bMeasured = false;
+		USuperFAISSVectorBank* Graduated =
+			Audited->FreezeWithRecall(IndexMap, Frozen, bMeasured);
+		TestNotNull(TEXT("frozen bank"), Graduated);
+		TestTrue(TEXT("freeze measured"), bMeasured);
+		TestTrue(TEXT("freeze recall == direct measure"), Frozen.Recall == Direct.Recall);
+
+		// A non-retention freeze produces no number.
+		TArray<int32> PlainMap;
+		FSuperFAISSScratchRecallReport None;
+		bool bPlainMeasured = true;
+		USuperFAISSVectorBank* PlainFrozen =
+			Plain->FreezeWithRecall(PlainMap, None, bPlainMeasured);
+		TestNotNull(TEXT("plain frozen bank"), PlainFrozen);
+		TestFalse(TEXT("no number on a non-retention freeze"), bPlainMeasured);
+	}
+
+	// Retention serializes: the loaded bank keeps its audit capability and returns
+	// the same number on the same seed (bit-equal round trip).
+	{
+		USuperFAISSScratchBank* Reloaded = NewObject<USuperFAISSScratchBank>();
+		TArray<uint8> Bytes;
+		TestTrue(TEXT("save"), Audited->SaveToBytes(Bytes));
+		TestTrue(TEXT("load"), Reloaded->LoadFromBytes(Bytes));
+		TestTrue(TEXT("retention survives the round trip"), Reloaded->RetainsFloats());
+		FSuperFAISSScratchRecallReport A;
+		FSuperFAISSScratchRecallReport B;
+		TestTrue(TEXT("original measures"), Audited->MeasureRecall(A));
+		TestTrue(TEXT("reloaded measures"), Reloaded->MeasureRecall(B));
+		TestTrue(TEXT("round-trip recall bit-equal"), A.Recall == B.Recall);
+	}
+
+	return true;
+}
+
+// Review S1 / Japp S-1 — staleness across Save/Load at the plugin surface: a
+// recall report taken before a LoadFromBytes must read STALE after it, never
+// silently current. The trap is the append-only same-count restore (a save-game
+// round trip): the pre-fix core reset the generation to the loaded row count —
+// exactly an append-only bank's stamp — and the plugin kept its cached report,
+// so a number measured on rows that no longer exist read as current.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FSuperFAISSScratchRecallLoadStalenessTest,
+	"SuperFAISS.A.ScratchRecallLoadStaleness",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext |
+		EAutomationTestFlags::ProductFilter)
+
+bool FSuperFAISSScratchRecallLoadStalenessTest::RunTest(const FString& Parameters)
+{
+	constexpr int32 Count = 48;
+	constexpr int32 Dims = 24;
+	const TArray<float> Rows = ScratchRows(Count, Dims, 0x10AD5ull);
+
+	// Append-only retention bank: no removes, so its generation equals its count —
+	// the collision case.
+	USuperFAISSScratchBank* Bank = NewObject<USuperFAISSScratchBank>();
+	TestTrue(TEXT("init"), Bank->Init(Count, Dims, ESuperFAISSBankMetric::Dot,
+		ESuperFAISSBankQuantization::Int8, /*bRetainFloats*/ true));
+	TArray<float> Row;
+	Row.SetNumUninitialized(Dims);
+	for (int32 R = 0; R < Count; ++R)
+	{
+		FMemory::Memcpy(Row.GetData(), Rows.GetData() + R * Dims, Dims * sizeof(float));
+		int32 Index = INDEX_NONE;
+		TestTrue(TEXT("append"), Bank->Append(Row, Index));
+	}
+
+	FSuperFAISSScratchRecallReport Before;
+	TestTrue(TEXT("measured"), Bank->MeasureRecall(Before));
+	TestFalse(TEXT("current at measurement"), Bank->IsRecallReportStale(Before));
+
+	// The same-count restore: save, load the same blob back into the same object.
+	TArray<uint8> Blob;
+	TestTrue(TEXT("save"), Bank->SaveToBytes(Blob));
+	TestTrue(TEXT("load"), Bank->LoadFromBytes(Blob));
+
+	// The caller-held report reads stale, and the bank's cached report never reads
+	// current — cleared or stale, either is lawful; current is the defect.
+	TestTrue(TEXT("pre-load report reads stale after Load"),
+		Bank->IsRecallReportStale(Before));
+	FSuperFAISSScratchRecallReport Cached;
+	bool bStale = false;
+	const bool bHasCached = Bank->GetLastRecallReport(Cached, bStale);
+	TestTrue(TEXT("no cached report reads current after Load"), !bHasCached || bStale);
+
+	// The mutated-restore case: report, save, mutate, restore the pre-mutation
+	// blob — the report must read stale against the restored rows too.
+	FSuperFAISSScratchRecallReport Mid;
+	TestTrue(TEXT("re-measured"), Bank->MeasureRecall(Mid));
+	TestFalse(TEXT("fresh report current"), Bank->IsRecallReportStale(Mid));
+	TArray<uint8> Blob2;
+	TestTrue(TEXT("save 2"), Bank->SaveToBytes(Blob2));
+	TestTrue(TEXT("mutating remove"), Bank->Remove(1));
+	TestTrue(TEXT("stale by the remove"), Bank->IsRecallReportStale(Mid));
+	TestTrue(TEXT("restore"), Bank->LoadFromBytes(Blob2));
+	TestTrue(TEXT("pre-save report stale after the restore"),
+		Bank->IsRecallReportStale(Mid));
+
+	// A report taken after the Load is current — the staleness is the boundary,
+	// not a permanently-poisoned bank.
+	FSuperFAISSScratchRecallReport Fresh;
+	TestTrue(TEXT("post-load measure"), Bank->MeasureRecall(Fresh));
+	TestFalse(TEXT("post-load report current"), Bank->IsRecallReportStale(Fresh));
+
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

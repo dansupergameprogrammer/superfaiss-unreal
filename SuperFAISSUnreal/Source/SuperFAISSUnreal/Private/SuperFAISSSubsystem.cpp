@@ -40,6 +40,10 @@ struct USuperFAISSSubsystem::FPooledWorkspace
 	// Scratch-bank exclusion staging: snapshot tombstones (OR'd with the caller's
 	// excludeBits) live here so the scratch path stays allocation-free once warm.
 	TArray<uint32> TombstoneStaging;
+	// v2.4 pooled cross-device staging: the operator writes (and QueryXd reads) the
+	// int8 image through this aligned buffer — the payload struct's TArray<uint8>
+	// carries no alignment guarantee, the core requires kAlignment.
+	TArray<int8, TAlignedHeapAllocator<16>> XdImageStaging;
 
 	// Parallel-scan scratch, all from this one pooled workspace so the parallel path
 	// stays allocation-free once warm (Poirot T-033 constraint): per-chunk heap and
@@ -1220,6 +1224,113 @@ bool USuperFAISSSubsystem::MakeCentroidQuery(const USuperFAISSVectorBank* Bank,
 		FMemory::Memcpy(OutQuery.GetData(), Scratch->QueryStaging.GetData(),
 			View.dims * sizeof(float));
 	}
+	ReleaseWorkspace(MoveTemp(Scratch));
+	return bOk;
+}
+
+bool USuperFAISSSubsystem::MakeCentroidQueryCrossDevice(const USuperFAISSVectorBank* Bank,
+	const TArray<int32>& RowIndices, const TArray<int32>& Weights,
+	FSuperFAISSCrossDeviceQuery& OutQuery)
+{
+	using namespace superfaiss;
+
+	OutQuery = FSuperFAISSCrossDeviceQuery{};
+	if (Bank == nullptr || !Bank->IsValid() || RowIndices.Num() == 0)
+	{
+		return false;
+	}
+	if (Weights.Num() != 0 && Weights.Num() != RowIndices.Num())
+	{
+		return false; // one weight per row or none, never silently misaligned
+	}
+	const BankView View = Bank->GetBankView();
+
+	// The core writes the quantized image into aligned staging; the payload struct
+	// then carries a copy of the exact bytes (plus the double scale — no float
+	// round-trip — and the integer self-dot).
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+	if (Scratch->XdImageStaging.Num() < View.paddedDims)
+	{
+		Scratch->XdImageStaging.SetNumZeroed(View.paddedDims);
+	}
+	double Scale = 0.0;
+	int64 SqSum = 0;
+	const Status Result = MakeCentroidCrossDevice(View, RowIndices.GetData(),
+		RowIndices.Num(), Weights.Num() > 0 ? Weights.GetData() : nullptr, nullptr,
+		Scratch->XdImageStaging.GetData(), &Scale, &SqSum);
+	const bool bOk = Result == Status::Ok;
+	if (bOk)
+	{
+		OutQuery.ImageQ8.SetNumUninitialized(View.paddedDims);
+		FMemory::Memcpy(OutQuery.ImageQ8.GetData(), Scratch->XdImageStaging.GetData(),
+			View.paddedDims);
+		OutQuery.Scale = Scale;
+		OutQuery.SqSum = SqSum;
+		OutQuery.Dims = View.dims;
+		OutQuery.PaddedDims = View.paddedDims;
+	}
+	ReleaseWorkspace(MoveTemp(Scratch));
+	return bOk;
+}
+
+bool USuperFAISSSubsystem::QueryPooledCrossDevice(const USuperFAISSVectorBank* Bank,
+	const FSuperFAISSCrossDeviceQuery& Query, int32 K, TArray<FSuperFAISSHit>& Hits)
+{
+	using namespace superfaiss;
+
+	Hits.Reset();
+	if (Bank == nullptr || !Bank->IsValid() || K <= 0 || !Query.IsPayloadValid())
+	{
+		return false;
+	}
+	const BankView View = Bank->GetBankView();
+	if (Query.Dims != View.dims || Query.PaddedDims != View.paddedDims)
+	{
+		return false; // the payload is bound to its bank shape
+	}
+
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+	bool bOk = false;
+	do
+	{
+		// The payload's bytes, restaged aligned: the executed image is the caller's
+		// image bit-for-bit (a copy preserves bytes; the core never requantizes).
+		if (Scratch->XdImageStaging.Num() < View.paddedDims)
+		{
+			Scratch->XdImageStaging.SetNumZeroed(View.paddedDims);
+		}
+		FMemory::Memcpy(Scratch->XdImageStaging.GetData(), Query.ImageQ8.GetData(),
+			View.paddedDims);
+		XdQuery Xd;
+		Xd.q8 = Scratch->XdImageStaging.GetData();
+		Xd.scale = Query.Scale;
+		Xd.sqSum = Query.SqSum;
+
+		if (Scratch->HitStaging.Num() < K)
+		{
+			Scratch->HitStaging.SetNumUninitialized(K);
+		}
+		QueryParams Params;
+		Params.k = K;
+		Params.exactness = Exactness::CrossDevice;
+		int32_t HitCount = 0;
+		if (QueryXd(View, Xd, Params, Scratch->Core, Scratch->HitStaging.GetData(),
+				&HitCount) != Status::Ok)
+		{
+			break;
+		}
+		Hits.SetNum(HitCount);
+		for (int32 i = 0; i < HitCount; ++i)
+		{
+			Hits[i].Index = Scratch->HitStaging[i].index;
+			Hits[i].Id = Bank->GetIdForIndex(Scratch->HitStaging[i].index);
+			Hits[i].Score = Scratch->HitStaging[i].score;
+			Hits[i].Margin = (i + 1 < HitCount)
+				? Margin(Scratch->HitStaging[i], Scratch->HitStaging[i + 1], View.metric)
+				: 0.0f;
+		}
+		bOk = true;
+	} while (false);
 	ReleaseWorkspace(MoveTemp(Scratch));
 	return bOk;
 }

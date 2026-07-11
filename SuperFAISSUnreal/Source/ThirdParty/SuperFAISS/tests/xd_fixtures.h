@@ -696,4 +696,19 @@ static const uint32_t kQueryBits[512] = {
 // prints the computed value instead of asserting).
 inline constexpr uint64_t kGoldenXdHash = 0x064eba837829237dull;
 
+// Pinned cross-device hash over the V2.3 scratch x cross-device closure
+// battery (T-V2.3-R10): a non-shared-payload baked twin of a scratch
+// snapshot with a tombstoned row and a Grow in its history, scored
+// across the forced-path sweep. Same capture/re-pin discipline as
+// kGoldenXdHash; 0 means 'not yet pinned' (the test prints the value).
+inline constexpr uint64_t kGoldenScratchXdHash = 0x43b73b20df3239afull;
+
+// Pinned cross-device hash over the V2.4 pooling battery (T-V2.4-P8): pooled
+// quantized queries (image bytes, scale bits, self-dot) built by
+// MakeCentroidCrossDevice over committed fixture rows with fixed index/weight
+// sets, plus their QueryXd hit lists, across the forced-path sweep. Same
+// capture/re-pin discipline as kGoldenXdHash; 0 means 'not yet pinned' (the
+// test prints the value).
+inline constexpr uint64_t kGoldenPoolXdHash = 0x9cf4eeddc1132a03ull;
+
 } // namespace xdfix

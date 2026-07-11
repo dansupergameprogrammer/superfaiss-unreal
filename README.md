@@ -13,8 +13,25 @@ encoder model can vectorize — become points where *similar means near*. This p
 answers "what's most similar to this?" exactly, in microseconds, on any thread.
 
 Measured on the shipped demo bank (40,000 words x 100 dims, int8, ~4 MB), desktop
-editor: single query **0.13 ms**, batched **0.06 ms per query** — exact search,
-bit-deterministic, zero steady-state allocation.
+editor: single query **0.13 ms** (auto-parallelized across chunks — the core's serial
+one-core scan of the same bank is ~0.5 ms), batched **0.06 ms per query** — exact
+search, bit-deterministic, zero steady-state allocation.
+
+**New in 2.4:** integer-domain pooling — `MakeCentroidQueryCrossDevice` pools int8
+rows into a **quantized** cross-device query (order-free integer accumulation, no
+float mean), so pooled queries honestly participate in cross-device-exact results;
+`QueryPooledCrossDevice` executes exactly those bytes, and the editor bakes the
+same operator's product into cross-device-tier prototype assets (baked anchor
+byte-equals a runtime pool over identical rows, behind a required asset version
+bump). Pooled recall is measured beside the operator and stated with its
+conditions in the plugin README.
+
+**New in 2.3:** scratch-bank recall audit — an opt-in float-retention posture on
+scratch banks (never the default; the memory cost is stated plainly) plus
+`MeasureRecall`, reporting the bank's own cross-device recall with a seed, a
+generation stamp, and a stale mark; any later append, remove, or load marks the
+report stale, never silently current. `DescribeScratchBank` (MCP) reports it
+read-only.
 
 **New in 2.2:** cross-device bit-exactness — an opt-in query mode (int8 banks)
 returning bit-identical scores and hit order on any machine at any SIMD width,

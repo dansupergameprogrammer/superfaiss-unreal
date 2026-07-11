@@ -12,6 +12,10 @@
 #include "SuperFAISSSubsystem.h"
 #include "SuperFAISSVectorBank.h"
 
+#include "superfaiss/superfaiss.h"
+
+#include <limits>
+
 namespace
 {
 	TArray<float> CompositionRows(int32 Count, int32 Dims, uint64 Seed)
@@ -459,6 +463,206 @@ bool FSuperFAISSQueryProviderSeamTest::RunTest(const FString& Parameters)
 	USuperFAISSBankRowQueryProvider* Unset = NewObject<USuperFAISSBankRowQueryProvider>();
 	TestFalse(TEXT("unset provider"),
 		ISuperFAISSQueryProvider::Execute_GetQueryVector(Unset, Bank, Query));
+
+	return true;
+}
+
+// T-V2.4 subsystem surface — integer-domain pooling (V2 plan section 21):
+// MakeCentroidQueryCrossDevice wraps the core operator (the payload byte-equals a
+// direct core MakeCentroidCrossDevice over the same view — one operator, one math),
+// QueryPooledCrossDevice executes that exact payload through core QueryXd under the
+// subsystem's dispatch (hit lists bit-equal a direct core QueryXd), all-equal
+// weights bit-equal unweighted, and f32 banks are the defined rejection.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FSuperFAISSPooledCrossDeviceTest,
+	"SuperFAISS.A.PooledCrossDevice",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext |
+		EAutomationTestFlags::ProductFilter)
+
+bool FSuperFAISSPooledCrossDeviceTest::RunTest(const FString& Parameters)
+{
+	using namespace superfaiss;
+
+	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+	if (!TestNotNull(TEXT("subsystem"), Subsystem))
+	{
+		return true;
+	}
+
+	constexpr int32 Count = 300;
+	constexpr int32 Dims = 48;
+	const TArray<float> Rows = CompositionRows(Count, Dims, 0xB00Dull);
+
+	USuperFAISSVectorBank* Bank = NewObject<USuperFAISSVectorBank>();
+	FString Error;
+	if (!TestTrue(TEXT("int8 bank built"), Bank->InitFromSource(Rows, Count, Dims,
+			ESuperFAISSBankMetric::Dot, ESuperFAISSBankQuantization::Int8, {},
+			TEXT("pooled-xd-test"), Error)))
+	{
+		return true;
+	}
+
+	const TArray<int32> Members = {2, 17, 41, 108, 260};
+	const TArray<int32> EqualWeights = {7, 7, 7, 7, 7};
+	const TArray<int32> MixedWeights = {1, 4, 2, 9, 3};
+
+	// The subsystem payload byte-equals the core operator's product on the same view.
+	FSuperFAISSCrossDeviceQuery Pooled;
+	TestTrue(TEXT("pooled query built"),
+		Subsystem->MakeCentroidQueryCrossDevice(Bank, Members, {}, Pooled));
+	TestEqual(TEXT("payload dims"), Pooled.Dims, Dims);
+	TestEqual(TEXT("payload padded size"), Pooled.ImageQ8.Num(), Pooled.PaddedDims);
+	{
+		const BankView View = Bank->GetBankView();
+		TArray<int8, TAlignedHeapAllocator<16>> CoreImage;
+		CoreImage.SetNumZeroed(View.paddedDims);
+		double CoreScale = 0.0;
+		int64 CoreSqSum = 0;
+		TestTrue(TEXT("core operator"),
+			MakeCentroidCrossDevice(View, Members.GetData(), Members.Num(), nullptr,
+				nullptr, CoreImage.GetData(), &CoreScale, &CoreSqSum) == Status::Ok);
+		TestTrue(TEXT("image byte-equals core"),
+			FMemory::Memcmp(Pooled.ImageQ8.GetData(), CoreImage.GetData(),
+				View.paddedDims) == 0);
+		TestTrue(TEXT("scale bit-equals core"), Pooled.Scale == CoreScale);
+		TestEqual(TEXT("self-dot equals core"), Pooled.SqSum, CoreSqSum);
+
+		// The executed query IS the payload: subsystem hits bit-equal core QueryXd.
+		TArray<FSuperFAISSHit> Hits;
+		TestTrue(TEXT("pooled query executes"),
+			Subsystem->QueryPooledCrossDevice(Bank, Pooled, 8, Hits));
+		XdQuery Xd;
+		Xd.q8 = CoreImage.GetData();
+		Xd.scale = CoreScale;
+		Xd.sqSum = CoreSqSum;
+		QueryParams Params;
+		Params.k = 8;
+		Params.exactness = Exactness::CrossDevice;
+		Workspace Ws;
+		Hit CoreHits[8];
+		int32_t CoreN = 0;
+		TestTrue(TEXT("core QueryXd"),
+			QueryXd(View, Xd, Params, Ws, CoreHits, &CoreN) == Status::Ok);
+		TestEqual(TEXT("hit count"), Hits.Num(), (int32)CoreN);
+		for (int32 i = 0; i < FMath::Min(Hits.Num(), (int32)CoreN); ++i)
+		{
+			TestTrue(FString::Printf(TEXT("hit %d bit-equal"), i),
+				Hits[i].Index == CoreHits[i].index && Hits[i].Score == CoreHits[i].score);
+		}
+	}
+
+	// All-equal weights bit-equal unweighted (the common factor cancels under
+	// symmetric quantization); mixed weights produce a well-formed payload.
+	{
+		FSuperFAISSCrossDeviceQuery Weighted;
+		TestTrue(TEXT("equal-weight pool"),
+			Subsystem->MakeCentroidQueryCrossDevice(Bank, Members, EqualWeights, Weighted));
+		TestTrue(TEXT("weighted image bit-equal"),
+			Weighted.ImageQ8 == Pooled.ImageQ8);
+		TestTrue(TEXT("weighted scale bit-equal"), Weighted.Scale == Pooled.Scale);
+		TestEqual(TEXT("weighted self-dot equal"), Weighted.SqSum, Pooled.SqSum);
+
+		FSuperFAISSCrossDeviceQuery Mixed;
+		TestTrue(TEXT("mixed-weight pool"),
+			Subsystem->MakeCentroidQueryCrossDevice(Bank, Members, MixedWeights, Mixed));
+		TestEqual(TEXT("mixed payload sized"), Mixed.ImageQ8.Num(), Mixed.PaddedDims);
+	}
+
+	// Defined rejections: f32 bank (CrossDevice is int8-only), empty selection,
+	// mismatched weights, and a payload executed against the wrong bank shape.
+	{
+		USuperFAISSVectorBank* F32 =
+			CompositionBank(*this, Rows, Count, Dims, ESuperFAISSBankMetric::Dot);
+		FSuperFAISSCrossDeviceQuery Rejected;
+		if (F32 != nullptr)
+		{
+			TestFalse(TEXT("f32 bank rejected"),
+				Subsystem->MakeCentroidQueryCrossDevice(F32, Members, {}, Rejected));
+			TArray<FSuperFAISSHit> Hits;
+			TestFalse(TEXT("f32 execution rejected"),
+				Subsystem->QueryPooledCrossDevice(F32, Pooled, 4, Hits));
+		}
+		TestFalse(TEXT("empty selection rejected"),
+			Subsystem->MakeCentroidQueryCrossDevice(Bank, {}, {}, Rejected));
+		TestFalse(TEXT("weight count mismatch rejected"),
+			Subsystem->MakeCentroidQueryCrossDevice(Bank, Members, {1, 2}, Rejected));
+		TArray<FSuperFAISSHit> Hits;
+		FSuperFAISSCrossDeviceQuery Empty;
+		TestFalse(TEXT("empty payload rejected"),
+			Subsystem->QueryPooledCrossDevice(Bank, Empty, 4, Hits));
+	}
+
+	return true;
+}
+
+// Review S2/M1 / Japp S-2 — the pooled-payload trust boundary at the plugin
+// surface: no field of a caller-authored (or hand-edited, or corrupted-asset)
+// FSuperFAISSCrossDeviceQuery may make scores or rankings ill-defined or silently
+// wrong. A non-finite scale poisons Dot/L2 scores with NaN; a lying self-dot
+// silently corrupts L2 rankings. Each is a defined rejection — the honest
+// pipeline's payload still executes.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FSuperFAISSPooledCrossDeviceAdversarialTest,
+	"SuperFAISS.A.PooledCrossDeviceAdversarial",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext |
+		EAutomationTestFlags::ProductFilter)
+
+bool FSuperFAISSPooledCrossDeviceAdversarialTest::RunTest(const FString& Parameters)
+{
+	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+	if (!TestNotNull(TEXT("subsystem"), Subsystem))
+	{
+		return true;
+	}
+
+	constexpr int32 Count = 120;
+	constexpr int32 Dims = 32;
+	const TArray<float> Rows = CompositionRows(Count, Dims, 0xADEull);
+	USuperFAISSVectorBank* Bank = NewObject<USuperFAISSVectorBank>();
+	FString Error;
+	if (!TestTrue(TEXT("int8 bank built"), Bank->InitFromSource(Rows, Count, Dims,
+			ESuperFAISSBankMetric::Dot, ESuperFAISSBankQuantization::Int8, {},
+			TEXT("pooled-adv-test"), Error)))
+	{
+		return true;
+	}
+
+	const TArray<int32> Members = {1, 7, 40, 99};
+	FSuperFAISSCrossDeviceQuery Honest;
+	TestTrue(TEXT("honest payload built"),
+		Subsystem->MakeCentroidQueryCrossDevice(Bank, Members, {}, Honest));
+	TArray<FSuperFAISSHit> Hits;
+	TestTrue(TEXT("honest payload executes"),
+		Subsystem->QueryPooledCrossDevice(Bank, Honest, 5, Hits));
+
+	// Non-finite and negative scales: each a defined rejection.
+	FSuperFAISSCrossDeviceQuery Adv = Honest;
+	Adv.Scale = std::numeric_limits<double>::infinity();
+	TestFalse(TEXT("+inf scale rejected"),
+		Subsystem->QueryPooledCrossDevice(Bank, Adv, 5, Hits));
+	Adv.Scale = std::numeric_limits<double>::quiet_NaN();
+	TestFalse(TEXT("NaN scale rejected"),
+		Subsystem->QueryPooledCrossDevice(Bank, Adv, 5, Hits));
+	Adv.Scale = -1.0;
+	TestFalse(TEXT("negative scale rejected"),
+		Subsystem->QueryPooledCrossDevice(Bank, Adv, 5, Hits));
+
+	// A lying self-dot: too high, too low, zero-on-nonzero-image. The self-dot
+	// must be the image's own — a desynced payload is rejected, never repaired.
+	Adv = Honest;
+	Adv.SqSum = Honest.SqSum + 1;
+	TestFalse(TEXT("inflated self-dot rejected"),
+		Subsystem->QueryPooledCrossDevice(Bank, Adv, 5, Hits));
+	Adv.SqSum = Honest.SqSum > 0 ? Honest.SqSum - 1 : 1;
+	TestFalse(TEXT("deflated self-dot rejected"),
+		Subsystem->QueryPooledCrossDevice(Bank, Adv, 5, Hits));
+	Adv.SqSum = 0;
+	TestFalse(TEXT("zero self-dot on a nonzero image rejected"),
+		Subsystem->QueryPooledCrossDevice(Bank, Adv, 5, Hits));
+
+	// The honest payload still executes after the adversarial sweep.
+	TestTrue(TEXT("honest payload unaffected"),
+		Subsystem->QueryPooledCrossDevice(Bank, Honest, 5, Hits));
 
 	return true;
 }

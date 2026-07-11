@@ -86,6 +86,76 @@ namespace
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FSuperFAISSDequantizeTest,
+	"SuperFAISS.C.Dequantize",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext |
+		EAutomationTestFlags::ProductFilter)
+
+bool FSuperFAISSDequantizeTest::RunTest(const FString& Parameters)
+{
+	// GetRowDequantized returns q * per-row scale, within the row's quantization
+	// step (maxAbs/127) of the source (a wrong scale/stride would be off ~127x);
+	// float32 is exact; out-of-range returns false. L2 so rows are not
+	// pre-normalized and dequant compares directly to the source.
+	const int32 Count = 8;
+	const int32 Dims = 12;
+	TArray<float> Rows;
+	Rows.SetNumUninitialized(Count * Dims);
+	for (int32 R = 0; R < Count; ++R)
+	{
+		for (int32 D = 0; D < Dims; ++D)
+		{
+			Rows[R * Dims + D] = FMath::Sin(0.7f * R + 0.3f * D) * (1.0f + R);
+		}
+	}
+
+	{
+		USuperFAISSVectorBank* Bank = NewObject<USuperFAISSVectorBank>();
+		FString Error;
+		TestTrue(TEXT("int8 init"), Bank->InitFromSource(Rows, Count, Dims,
+			ESuperFAISSBankMetric::L2, ESuperFAISSBankQuantization::Int8, {},
+			TEXT("dq"), Error));
+		TArray<float> Out;
+		TestFalse(TEXT("out-of-range returns false"),
+			Bank->GetRowDequantized(Count, Out));
+		TestFalse(TEXT("negative row returns false"),
+			Bank->GetRowDequantized(-1, Out));
+		for (int32 R = 0; R < Count; ++R)
+		{
+			TestTrue(FString::Printf(TEXT("dequant row %d"), R),
+				Bank->GetRowDequantized(R, Out));
+			TestEqual(TEXT("dims"), Out.Num(), Dims);
+			float MaxAbs = 0.0f;
+			for (int32 D = 0; D < Dims; ++D)
+			{
+				MaxAbs = FMath::Max(MaxAbs, FMath::Abs(Rows[R * Dims + D]));
+			}
+			const float Step = MaxAbs / 127.0f;
+			for (int32 D = 0; D < Dims; ++D)
+			{
+				TestTrue(FString::Printf(TEXT("row %d dim %d within quant step"), R, D),
+					FMath::Abs(Out[D] - Rows[R * Dims + D]) <= Step + KINDA_SMALL_NUMBER);
+			}
+		}
+	}
+	{
+		USuperFAISSVectorBank* Bank = NewObject<USuperFAISSVectorBank>();
+		FString Error;
+		TestTrue(TEXT("f32 init"), Bank->InitFromSource(Rows, Count, Dims,
+			ESuperFAISSBankMetric::L2, ESuperFAISSBankQuantization::Float32, {},
+			TEXT("dq"), Error));
+		TArray<float> Out;
+		TestTrue(TEXT("f32 dequant"), Bank->GetRowDequantized(3, Out));
+		for (int32 D = 0; D < Dims; ++D)
+		{
+			TestEqual(FString::Printf(TEXT("f32 exact dim %d"), D),
+				Out[D], Rows[3 * Dims + D]);
+		}
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FSuperFAISSAssetRoundTripTest,
 	"SuperFAISS.C.AssetRoundTrip",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext |

@@ -38,8 +38,8 @@ where the vectors came from.
 | Field | Type | Rules |
 |---|---|---|
 | `schemaVersion` | int | 1 (channel-less) or 2 (carries `channels`). Unknown versions are rejected, never guessed at; a v1-only reader hard-rejects 2 by this same rule. Writers emit 1 unless channels are present. |
-| `dims` | int | > 0. Logical dimensions per vector. |
-| `count` | int | >= 0. Number of vectors. |
+| `dims` | int | > 0 and <= 131,072 (`kMaxCrossDeviceDims`, the format's dims ceiling). Logical dimensions per vector. |
+| `count` | int | >= 0 and <= 2^28 (`kMaxBankRows`, the format's row ceiling). Number of vectors. |
 | `metric` | string | `"dot"`, `"cosine"`, or `"l2"` — the metric the bank is intended for. |
 | `dtype` | string | `"float32"` (the interchange payload is always float32; quantization happens at bake). |
 | `ids` | string[] | Optional. Exactly `count` entries, all unique. Absent means IDs are row indices. |
@@ -53,11 +53,15 @@ padding, no compression.
 ### Validation rules (importer obligations)
 
 An importer must reject, with a specific diagnostic and no partial output:
-payload size disagreeing with the header; any non-finite value; duplicate or
-wrongly-counted ids; a zero-norm row when `metric` is `cosine`; unknown
-`schemaVersion`, `metric`, or `dtype`; a malformed `channels` table (overlap,
-off-grid boundary, duplicate or empty name, out-of-bounds range, more than 8
-entries, or schemaVersion 2 without one).
+header geometry over the format ceilings (`dims` > 131,072 or `count` > 2^28) —
+rejected on the header fields alone, **before any payload size is computed from
+them** (`ValidateBank`/`ValidateSourceRows` enforce this as `BadFormat`; within
+the ceilings every byte-size term stays at most 2^47, so the arithmetic cannot
+overflow); payload size disagreeing with the header; any non-finite value;
+duplicate or wrongly-counted ids; a zero-norm row when `metric` is `cosine`;
+unknown `schemaVersion`, `metric`, or `dtype`; a malformed `channels` table
+(overlap, off-grid boundary, duplicate or empty name, out-of-bounds range, more
+than 8 entries, or schemaVersion 2 without one).
 
 ## 2. Baked layout: what the kernels scan
 
@@ -107,19 +111,28 @@ file, save-game blob, network; the bank owns the format):
 | Field | Type | Notes |
 |---|---|---|
 | magic | u32 | `0x42535346` |
-| version | u32 | `1` |
-| capacity | i32 | arena capacity restored on load |
+| version | u32 | `1`, or `2` when the bank retains floats (v2.3) |
+| capacity | i32 | arena capacity restored on load; `<= 2^28` |
 | count | i32 | published rows; `0 <= count <= capacity` |
 | dims | i32 | logical dims |
-| paddedDims | i32 | must equal `PaddedDims(dims, quant)` |
+| paddedDims | i32 | must equal `PaddedDims(dims, quant)`; `<= 131072` |
 | metric, quant | u8, u8 | enum values; 6 reserved bytes follow |
 | rows | payload | `count x paddedDims` elements, baked layout (section 2) |
 | scales | f32[count] | int8 banks only |
 | tombstones | u32[ceil(count/32)] | bit set = removed row |
+| retained floats | f32[count x dims] | **version 2 only** (v2.3 recall audit): the post-normalization source rows, index-aligned with `rows` |
 
-Load is reject-over-degrade: a bad magic/version, inconsistent header,
-truncated payload, tombstone bit at or above `count`, or content that fails
-bank-data validation rejects the archive and leaves the existing bank
+Versioning (v2.3): a bank created with float retention writes version 2 and
+appends the retained rows; a bank without retention still writes version 1,
+byte-identical to pre-v2.3. The reader accepts versions 1 and 2 — a version-1
+blob loads with retention absent (defined) — and hard-rejects anything else
+(`BadFormat`), the standing old-reader/new-data law.
+
+Load is reject-over-degrade: a bad magic/version, inconsistent or out-of-bounds
+header geometry (the capacity/paddedDims ceilings above are checked before any
+allocation arithmetic — an absurd header is a format defect, not an allocator
+outcome), truncated payload, tombstone bit at or above `count`, or content that
+fails bank-data validation rejects the archive and leaves the existing bank
 unchanged. Byte order is the host's; archives are save-game-grade state, not a
 cross-endian interchange format (the `.wvbank` sidecar is the interchange).
 

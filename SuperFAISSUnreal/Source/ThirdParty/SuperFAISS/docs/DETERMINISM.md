@@ -93,7 +93,12 @@ Why it holds:
   included) from committed fixture banks — including adversarial tiny-scale banks
   whose scale products straddle the subnormal window — under every kernel path the
   hardware can force, and asserts it equals a golden pinned in the repo. Windows,
-  Linux, and macOS-ARM runners all assert the same pin on every push.
+  Linux, and macOS-ARM runners all assert the same pin on every push. Two sibling
+  batteries carry their own pins the same way: the scratch × cross-device battery
+  (v2.3 — a copied-bytes baked twin of a scratch snapshot, tombstones and a `Grow`
+  in its history, scoring bit-identically to the snapshot) and the pooled-query
+  battery (v2.4 — `MakeCentroidCrossDevice` payloads and their `QueryXd` hit lists
+  over the committed fixtures).
 
 Scope and cost, stated plainly:
 
@@ -126,6 +131,23 @@ same live rows — and `Freeze()` produces exactly that bank, byte for byte.
 Removal is snapshot-consistent: a tombstone is visible to every snapshot taken
 after the `Remove`, and a snapshot, once taken, is immutable — querying it
 twice is bit-identical regardless of concurrent writer activity.
+
+One quiescence caveat (v2.3): `MeasureScratchRecall` sweeps many self-queries
+under a reader pin, not exclusivity, so its number is well-defined — and
+reproducible given history — only when no writer runs concurrently; a racing
+append/remove yields a safe but non-reproducible number (atomic value reads,
+never undefined behavior).
+
+## 2d. Integer-domain pooling (v2.4): a versioned composition operator
+
+`MakeCentroidCrossDevice` pools int8 rows into a quantized CrossDevice query with
+order-free int64 accumulation and a direct integer-domain requantization (no float
+norm reduction exists on the path). Given identical row bytes, scales, indices, and
+weights, its product — image, scale, self-dot — is bit-identical on any machine, and
+`QueryXd` executes exactly those bytes. **It is a versioned composition operator: any
+change to its accumulation, epilogue, or quantization is a space-version change for
+consumers** — embedding-space version machinery (stamping, mismatch rejection) lives
+consumer-side; treat a change here exactly like re-baking the space.
 
 ## 3. Embedder obligations
 
