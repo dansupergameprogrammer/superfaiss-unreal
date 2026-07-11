@@ -6,7 +6,7 @@ Fast, deterministic, allocation-free k-nearest-neighbor search for game runtimes
 over banks you bake in your pipeline or grow at play time. One bank answers many
 questions: score the whole vector or any weighted slice of it, decompose every hit's
 score channel by channel, fold gameplay state into the ranking, pool rows into new
-queries, carry memory across save games — and measure what quantization actually
+queries, grow and persist banks at runtime — and measure what quantization actually
 costs you: recall audited per bank, with the mutable banks carrying their own
 stored, staleness-tracked number. Exact, bit-reproducible per device, and
 (opt-in) bit-identical across machines. Dependency-free C++17 — the standard library
