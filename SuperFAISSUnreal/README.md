@@ -111,7 +111,31 @@ channels.
 
 Blueprint: `Query Similar (Channels)`, `Decompose Hit`. The Bank Inspector
 gets per-channel weight sliders, decomposition bars on every hit, and
-channel-scoped PCA projection.
+channel-scoped PCA projection (see [Bank Inspector](#bank-inspector) below).
+
+## Bank Inspector
+
+A dockable editor tab for exploring bank assets live: **Window → SuperFAISS
+Bank Inspector**. Pick any bank in the project, type a query, and see the ranked
+matches with score and margin — plus a PCA projection of the whole bank beside
+them. No cooking, no play-in-editor; it queries the imported asset directly.
+
+![Live query in the Bank Inspector](Docs/Images/inspector-query.png)
+
+*Typing `wizard` against a 40,000-row DemoBank ranks the bank by similarity —
+`wizard` 0.9992, then `magician`, `sorcerer`, `magical`, … — each with its
+score and the margin to the next hit, beside a PCA point cloud of the 40k rows.*
+
+On channel (schema-2) banks, the per-channel weight sliders reweight the query
+in place and the PCA dropdown projects the bank through any single named channel,
+so you can see how each channel separates the data on its own:
+
+![Pose-channel PCA](Docs/Images/inspector-pca-pose.png)
+![Trajectory-channel PCA](Docs/Images/inspector-pca-trajectory.png)
+
+*The same 270-row schema-2 bank (`pose[0..32]` + `trajectory[32..48]`) projected
+through the `pose` channel (top) and the `trajectory` channel (bottom) — selected
+from the channel dropdown, with the weight sliders above.*
 
 ## Scratch banks (v2.0)
 
@@ -274,7 +298,7 @@ Add `-Lint` for on-demand health analyses: near-duplicate rows (sampled above a
 configurable cap, never silently exhaustive), low-variance dims, prototype overlap,
 and on channel banks: channel-scoped near-duplicates, degenerate channels, and weak
 channels (rows whose channel carries almost no energy — their per-channel cosines
-are amplified quantization noise; `-ChannelEnergyFloor=` tunes the threshold). In-editor, **Tools > SuperFAISS Bank Inspector** gives live queries with
+are amplified quantization noise; `-ChannelEnergyFloor=` tunes the threshold). In-editor, **Window > SuperFAISS Bank Inspector** gives live queries with
 margins and a PCA projection point cloud of any bank; selected rows become named
 prototype assets (`USuperFAISSPrototypeAsset` — also a query provider) via the
 authoring library.

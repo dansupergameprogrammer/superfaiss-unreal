@@ -23,6 +23,18 @@ editor: single query **0.13 ms** (auto-parallelized across chunks — the core's
 one-core scan of the same bank is ~0.5 ms), batched **0.06 ms per query** — exact
 search, bit-deterministic, zero steady-state allocation.
 
+**New in 2.5:** bank analytics — cross-device-deterministic reductions over int8
+banks: a set-to-set centroid distance (drift over checkpoints is that operator
+between two checkpoints' row sets), directed nearest-neighbour set divergence (mean,
+and the order-free max that is the Hausdorff component), within-bank dispersion, and
+the shared query-vs-query pair score they rest on — all bit-identical across machines
+by the same integer-accumulation proof as the query path, on the Blueprint subsystem
+and (read-only) as MCP tools. Plus an offline per-device probe-direction projection
+report. The editor's **Bank Inspector** (Window > SuperFAISS Bank Inspector) shows a
+live PCA projection beside its ranked-query view. Result-direction convention (a `Dot`
+bank returns a similarity, not a distance) and the cosine limb's determinism condition
+are stated in the docs.
+
 **New in 2.4:** integer-domain pooling — `MakeCentroidQueryCrossDevice` pools int8
 rows into a **quantized** cross-device query (order-free integer accumulation, no
 float mean), so pooled queries honestly participate in cross-device-exact results;
@@ -80,14 +92,15 @@ Or headless, from the repo root:
 UnrealEditor-Cmd ExampleProject/ExampleProject.uproject -ExecCmds="Automation RunTests SuperFAISS; Quit" -unattended -nullrhi
 ```
 
-31 automation tests (33 with the optional MCP toolset enabled): kernel correctness,
-SIMD/scalar mirror equality, determinism, tie-break stability, concurrency, asset
-round-trips, import rejection, quantizer recall, performance guards, query
-composition (centroid, direction, intersection, margins), named-channel queries and
-decomposition, per-row bias, scratch banks, cross-device exactness (v2.2 — including
-a golden-hash battery over committed fixtures that must match the core CI's pin),
-bank lint analyses, prototype authoring, a golden semantic query on the demo bank,
-and the Mass swarm's stability.
+40 automation tests (plus the MCP toolset's own when that optional plugin is
+enabled): kernel correctness, SIMD/scalar mirror equality, determinism, tie-break
+stability, concurrency, asset round-trips, import rejection, quantizer recall,
+performance guards, query composition (centroid, direction, intersection, margins),
+named-channel queries and decomposition, per-row bias, scratch banks, cross-device
+exactness (v2.2 — including a golden-hash battery over committed fixtures that must
+match the core CI's pin), bank analytics (set-to-set distance, drift/divergence/spread,
+projection — v2.5), bank lint analyses, prototype authoring, a golden semantic query
+on the demo bank, and the Mass swarm's stability.
 
 ## Use it in your project
 

@@ -8,6 +8,16 @@
 class USuperFAISSVectorBank;
 class USuperFAISSScratchBank;
 
+// Reduction kind for the V2.5 divergence/spread reductions (plan section 22) — the
+// Blueprint-facing mirror of core superfaiss::Reduce (ordinals shared): Mean is a
+// fixed-order ascending-index double accumulation, Max an order-free running max.
+UENUM()
+enum class ESuperFAISSReduce : uint8
+{
+	Mean = 0,
+	Max = 1,
+};
+
 USTRUCT(BlueprintType)
 struct FSuperFAISSHit
 {
@@ -361,6 +371,120 @@ public:
 		meta = (DisplayName = "Query Similar (Pooled Cross-Device)"))
 	bool QueryPooledCrossDevice(const USuperFAISSVectorBank* Bank,
 		const FSuperFAISSCrossDeviceQuery& Query, int32 K, TArray<FSuperFAISSHit>& Hits);
+
+	// --- V2.5 bank analytics (plan section 22) ---
+	// Cross-device deterministic reductions over int8 banks — set-to-set distance,
+	// directed nearest-neighbour divergence, and within-bank dispersion — plus the
+	// shared query-vs-query pair score and the per-device projection report. Each BP
+	// method wraps the vendored core operator: the UE-compiled core is the same code,
+	// so the returned scalar is bit-identical to a direct core call on the same rows
+	// (the cross-device contract; DETERMINISM.md section 2c/2d). Int8 cross-device
+	// banks only; an f32 or mismatched bank is the mapped rejection (false), never a
+	// silently wrong number. The subsystem owns the scratch/workspace so callers
+	// allocate nothing once the pool is warm.
+
+	// Set-to-set centroid distance (plan 22.4): pools each row selection cross-device
+	// (MakeCentroidQueryCrossDevice) and scores the pair in Metric's distance sense.
+	// DRIFT over checkpoints is this method between two checkpoints' banks and row
+	// sets — no separate method. Weights are optional salience (empty = unweighted;
+	// else one positive weight per row). Empty selection -> false; a zero-norm pooled
+	// accumulator -> false (the cosine-antipodal case). Both banks int8 cross-device
+	// with equal Dims/PaddedDims.
+	UFUNCTION(BlueprintCallable, Category = "Similarity|Analytics",
+		meta = (DisplayName = "Set-To-Set Distance (Cross-Device)"))
+	bool SetToSetDistanceCrossDevice(const USuperFAISSVectorBank* BankA,
+		const TArray<int32>& RowIndicesA, const TArray<int32>& WeightsA,
+		const USuperFAISSVectorBank* BankB, const TArray<int32>& RowIndicesB,
+		const TArray<int32>& WeightsB, ESuperFAISSBankMetric Metric, float& OutDistance);
+
+	// Directed mean nearest-neighbour set divergence (plan 22.4): for each live row of
+	// SourceBank, its nearest-neighbour distance to TargetBank, reduced by a
+	// fixed-order mean (ascending source-row index). Scored in the TARGET bank's own
+	// metric (Cosine -> 1-cos, L2 -> squared distance, Dot -> similarity). Directed
+	// A->B; a symmetric divergence is the caller's reduce of both directions. Both
+	// banks int8 cross-device with equal shape.
+	UFUNCTION(BlueprintCallable, Category = "Similarity|Analytics",
+		meta = (DisplayName = "Mean Nearest Neighbor (Cross-Device)"))
+	bool MeanNearestNeighborCrossDevice(const USuperFAISSVectorBank* SourceBank,
+		const USuperFAISSVectorBank* TargetBank, float& OutValue);
+
+	// Directed max nearest-neighbour set divergence (plan 22.4): the same directed
+	// nearest-neighbour set as the mean, reduced by an order-free max — the directed
+	// Hausdorff component.
+	UFUNCTION(BlueprintCallable, Category = "Similarity|Analytics",
+		meta = (DisplayName = "Max Nearest Neighbor (Cross-Device)"))
+	bool MaxNearestNeighborCrossDevice(const USuperFAISSVectorBank* SourceBank,
+		const USuperFAISSVectorBank* TargetBank, float& OutValue);
+
+	// Within-bank dispersion (plan 22.4, spread = centroid-dispersion, D-V2-11): the
+	// mean (or max) distance of each selected row to the selection's OWN cross-device
+	// centroid, in the bank's metric. RowIndices are the rows to include (ascending
+	// for the pinned mean order); empty selection -> false.
+	UFUNCTION(BlueprintCallable, Category = "Similarity|Analytics",
+		meta = (DisplayName = "Bank Spread (Cross-Device)"))
+	bool BankSpreadCrossDevice(const USuperFAISSVectorBank* Bank,
+		const TArray<int32>& RowIndices, ESuperFAISSReduce Reduce, float& OutValue);
+
+	// Cross-device score between two pooled/lifted payloads (plan 22.4): the shared
+	// primitive the operators above rest on, in Metric's distance sense (Dot: dot
+	// similarity; L2: squared distance; Cosine: 1 - cos, the one runtime sqrt). This
+	// is the PUBLIC boundary and carries the D-V2-13 guard: it validates both payloads
+	// (IsPayloadValid) and rejects any int8 image element equal to -128 (the +-127
+	// premise the int32 cross-dot bound rests on) -> false. Cosine requires a nonzero
+	// self-dot on both members -> false otherwise.
+	UFUNCTION(BlueprintCallable, Category = "Similarity|Analytics",
+		meta = (DisplayName = "Score Cross-Device Query Pair"))
+	bool ScoreCrossDeviceQueryPair(const FSuperFAISSCrossDeviceQuery& A,
+		const FSuperFAISSCrossDeviceQuery& B, ESuperFAISSBankMetric Metric,
+		float& OutScore);
+
+	// Feature A — the probe-direction projection report (plan 22.3). OFFLINE authoring
+	// tooling, per-device float, NO cross-device claim: projects each bank row onto the
+	// unit direction normalize(DirectionA - DirectionB) (built like MakeDirectionQuery
+	// and extended to the full row set), writing OutProjections (Bank->Count floats).
+	// When GroupA is non-empty, OutSeparation is the Cohen's-d separation of GroupA's
+	// projected mean against the remaining rows' — the report FINDS the separation it
+	// exists to find. A zero-norm/degenerate direction, an empty bank, or a GroupA that
+	// covers every row (empty complement) -> false. DirectionA/B have Bank->Dims
+	// elements.
+	UFUNCTION(BlueprintCallable, Category = "Similarity|Analytics",
+		meta = (DisplayName = "Projection Report"))
+	bool ProjectionReport(const USuperFAISSVectorBank* Bank,
+		const TArray<float>& DirectionA, const TArray<float>& DirectionB,
+		const TArray<int32>& GroupA, TArray<float>& OutProjections,
+		float& OutSeparation);
+
+	// --- V2.5 analytics over a live scratch snapshot (plan section 22, T-V2.5-U2) ---
+	// Scratch overloads mirror QueryScratch: pin the bank, snapshot to a BankView, OR
+	// the snapshot's tombstones into the analytics exclusion set (deletion is
+	// exclusion), run the same core operator over the snapshot, unpin. The scalar is
+	// the core snapshot result — a tombstoned row contributes to neither the pool nor
+	// the reduction. The scratch operand is the natural single/source/A side; the
+	// counterpart is a baked bank (the "drift from a reference bank" shape). Refused
+	// while the bank drains for a Grow/Freeze/Load (the N4 gate). Callable from any
+	// thread.
+
+	// Within-scratch-snapshot dispersion over the live rows (the scratch closure of
+	// BankSpreadCrossDevice).
+	UFUNCTION(BlueprintCallable, Category = "Similarity|Analytics",
+		meta = (DisplayName = "Bank Spread (Cross-Device, Scratch)"))
+	bool BankSpreadCrossDeviceScratch(USuperFAISSScratchBank* Bank,
+		ESuperFAISSReduce Reduce, float& OutValue);
+
+	// Directed mean nearest-neighbour divergence from a scratch snapshot's live rows to
+	// a baked TargetBank (the scratch closure of MeanNearestNeighborCrossDevice).
+	UFUNCTION(BlueprintCallable, Category = "Similarity|Analytics",
+		meta = (DisplayName = "Mean Nearest Neighbor (Cross-Device, Scratch Source)"))
+	bool MeanNearestNeighborCrossDeviceScratch(USuperFAISSScratchBank* SourceBank,
+		const USuperFAISSVectorBank* TargetBank, float& OutValue);
+
+	// Set-to-set centroid distance between a scratch snapshot's live rows and a baked
+	// BankB (the scratch closure of SetToSetDistanceCrossDevice).
+	UFUNCTION(BlueprintCallable, Category = "Similarity|Analytics",
+		meta = (DisplayName = "Set-To-Set Distance (Cross-Device, Scratch A)"))
+	bool SetToSetDistanceCrossDeviceScratch(USuperFAISSScratchBank* BankA,
+		const USuperFAISSVectorBank* BankB, const TArray<int32>& RowIndicesB,
+		const TArray<int32>& WeightsB, ESuperFAISSBankMetric Metric, float& OutDistance);
 
 	// Diagnostics: workspace pool growth count (flat once warm — the B5 counter).
 	uint64 GetPoolGrowthCount() const;

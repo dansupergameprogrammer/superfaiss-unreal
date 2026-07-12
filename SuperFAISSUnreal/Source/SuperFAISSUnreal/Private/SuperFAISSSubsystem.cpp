@@ -44,6 +44,16 @@ struct USuperFAISSSubsystem::FPooledWorkspace
 	// int8 image through this aligned buffer — the payload struct's TArray<uint8>
 	// carries no alignment guarantee, the core requires kAlignment.
 	TArray<int8, TAlignedHeapAllocator<16>> XdImageStaging;
+	// v2.5 analytics staging (plan section 22): a SECOND aligned int8 image so a pair
+	// score / set-to-set distance holds both operands' images (or both pooled
+	// centroids) aligned at once; and an XdQuery array for the NN reductions' lifted
+	// source rows (MeanNN/MaxNN scratch of source.count). Both from the pooled
+	// workspace so the analytics path stays allocation-free once warm.
+	TArray<int8, TAlignedHeapAllocator<16>> XdImageStagingB;
+	TArray<superfaiss::XdQuery> XdQueryStaging;
+	// v2.5 scratch-source analytics: the snapshot BankView's live rows against a baked
+	// target need the snapshot's float direction / padded staging reused from the
+	// buffers above; the tombstone words reuse TombstoneStaging (as QueryScratch does).
 
 	// Parallel-scan scratch, all from this one pooled workspace so the parallel path
 	// stays allocation-free once warm (Poirot T-033 constraint): per-chunk heap and
@@ -1357,4 +1367,421 @@ bool USuperFAISSSubsystem::MakeDirectionQuery(const TArray<float>& A,
 	}
 	OutQuery.Append(Aligned.GetData(), A.Num());
 	return true;
+}
+
+// --- V2.5 bank analytics (plan section 22) ---
+
+bool USuperFAISSSubsystem::SetToSetDistanceCrossDevice(const USuperFAISSVectorBank* BankA,
+	const TArray<int32>& RowIndicesA, const TArray<int32>& WeightsA,
+	const USuperFAISSVectorBank* BankB, const TArray<int32>& RowIndicesB,
+	const TArray<int32>& WeightsB, ESuperFAISSBankMetric Metric, float& OutDistance)
+{
+	using namespace superfaiss;
+
+	OutDistance = 0.0f;
+	if (BankA == nullptr || !BankA->IsValid() || BankB == nullptr || !BankB->IsValid() ||
+		RowIndicesA.Num() == 0 || RowIndicesB.Num() == 0)
+	{
+		return false;
+	}
+	if ((WeightsA.Num() != 0 && WeightsA.Num() != RowIndicesA.Num()) ||
+		(WeightsB.Num() != 0 && WeightsB.Num() != RowIndicesB.Num()))
+	{
+		return false; // one weight per row or none, never silently misaligned
+	}
+	const BankView ViewA = BankA->GetBankView();
+	const BankView ViewB = BankB->GetBankView();
+
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+	if (Scratch->XdImageStaging.Num() < ViewA.paddedDims)
+	{
+		Scratch->XdImageStaging.SetNumZeroed(ViewA.paddedDims);
+	}
+	if (Scratch->XdImageStagingB.Num() < ViewB.paddedDims)
+	{
+		Scratch->XdImageStagingB.SetNumZeroed(ViewB.paddedDims);
+	}
+	const Status Result = CentroidDistanceCrossDevice(
+		ViewA, RowIndicesA.GetData(), RowIndicesA.Num(),
+		WeightsA.Num() > 0 ? WeightsA.GetData() : nullptr, nullptr,
+		ViewB, RowIndicesB.GetData(), RowIndicesB.Num(),
+		WeightsB.Num() > 0 ? WeightsB.GetData() : nullptr, nullptr,
+		static_cast<superfaiss::Metric>(Metric), Scratch->XdImageStaging.GetData(),
+		Scratch->XdImageStagingB.GetData(), &OutDistance);
+	ReleaseWorkspace(MoveTemp(Scratch));
+	return Result == Status::Ok;
+}
+
+bool USuperFAISSSubsystem::MeanNearestNeighborCrossDevice(
+	const USuperFAISSVectorBank* SourceBank, const USuperFAISSVectorBank* TargetBank,
+	float& OutValue)
+{
+	using namespace superfaiss;
+	OutValue = 0.0f;
+	if (SourceBank == nullptr || !SourceBank->IsValid() ||
+		TargetBank == nullptr || !TargetBank->IsValid())
+	{
+		return false;
+	}
+	const BankView Source = SourceBank->GetBankView();
+	const BankView Target = TargetBank->GetBankView();
+
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+	if (Scratch->XdQueryStaging.Num() < Source.count)
+	{
+		Scratch->XdQueryStaging.SetNumUninitialized(Source.count);
+	}
+	if (Scratch->HitStaging.Num() < Source.count)
+	{
+		Scratch->HitStaging.SetNumUninitialized(Source.count);
+	}
+	if (Scratch->CountStaging.Num() < Source.count)
+	{
+		Scratch->CountStaging.SetNumUninitialized(Source.count);
+	}
+	const Status Result = MeanNNCrossDevice(Source, nullptr, Target, nullptr,
+		Scratch->XdQueryStaging.GetData(), Scratch->HitStaging.GetData(),
+		Scratch->CountStaging.GetData(), Scratch->Core, &OutValue);
+	ReleaseWorkspace(MoveTemp(Scratch));
+	return Result == Status::Ok;
+}
+
+bool USuperFAISSSubsystem::MaxNearestNeighborCrossDevice(
+	const USuperFAISSVectorBank* SourceBank, const USuperFAISSVectorBank* TargetBank,
+	float& OutValue)
+{
+	using namespace superfaiss;
+	OutValue = 0.0f;
+	if (SourceBank == nullptr || !SourceBank->IsValid() ||
+		TargetBank == nullptr || !TargetBank->IsValid())
+	{
+		return false;
+	}
+	const BankView Source = SourceBank->GetBankView();
+	const BankView Target = TargetBank->GetBankView();
+
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+	if (Scratch->XdQueryStaging.Num() < Source.count)
+	{
+		Scratch->XdQueryStaging.SetNumUninitialized(Source.count);
+	}
+	if (Scratch->HitStaging.Num() < Source.count)
+	{
+		Scratch->HitStaging.SetNumUninitialized(Source.count);
+	}
+	if (Scratch->CountStaging.Num() < Source.count)
+	{
+		Scratch->CountStaging.SetNumUninitialized(Source.count);
+	}
+	const Status Result = MaxNNCrossDevice(Source, nullptr, Target, nullptr,
+		Scratch->XdQueryStaging.GetData(), Scratch->HitStaging.GetData(),
+		Scratch->CountStaging.GetData(), Scratch->Core, &OutValue);
+	ReleaseWorkspace(MoveTemp(Scratch));
+	return Result == Status::Ok;
+}
+
+bool USuperFAISSSubsystem::BankSpreadCrossDevice(const USuperFAISSVectorBank* Bank,
+	const TArray<int32>& RowIndices, ESuperFAISSReduce Reduce, float& OutValue)
+{
+	using namespace superfaiss;
+	OutValue = 0.0f;
+	if (Bank == nullptr || !Bank->IsValid() || RowIndices.Num() == 0)
+	{
+		return false;
+	}
+	const BankView View = Bank->GetBankView();
+
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+	if (Scratch->XdImageStaging.Num() < View.paddedDims)
+	{
+		Scratch->XdImageStaging.SetNumZeroed(View.paddedDims);
+	}
+	const Status Result = SpreadCrossDevice(View, RowIndices.GetData(), RowIndices.Num(),
+		nullptr, static_cast<superfaiss::Reduce>(Reduce), Scratch->XdImageStaging.GetData(),
+		&OutValue);
+	ReleaseWorkspace(MoveTemp(Scratch));
+	return Result == Status::Ok;
+}
+
+bool USuperFAISSSubsystem::ScoreCrossDeviceQueryPair(const FSuperFAISSCrossDeviceQuery& A,
+	const FSuperFAISSCrossDeviceQuery& B, ESuperFAISSBankMetric Metric, float& OutScore)
+{
+	using namespace superfaiss;
+	OutScore = 0.0f;
+	// The plugin trust-boundary mirror of the core payload law (both payloads
+	// self-consistent). The D-V2-13 -128 guard lives in the core ScoreXdPair below —
+	// a -128 image with a correct self-dot passes IsPayloadValid and is rejected there,
+	// which is the behaviour U1 asserts.
+	if (!A.IsPayloadValid() || !B.IsPayloadValid() || A.PaddedDims != B.PaddedDims)
+	{
+		return false;
+	}
+
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+	if (Scratch->XdImageStaging.Num() < A.PaddedDims)
+	{
+		Scratch->XdImageStaging.SetNumZeroed(A.PaddedDims);
+	}
+	if (Scratch->XdImageStagingB.Num() < B.PaddedDims)
+	{
+		Scratch->XdImageStagingB.SetNumZeroed(B.PaddedDims);
+	}
+	// Restage both images aligned (the payload's TArray<uint8> carries no alignment).
+	FMemory::Memcpy(Scratch->XdImageStaging.GetData(), A.ImageQ8.GetData(), A.PaddedDims);
+	FMemory::Memcpy(Scratch->XdImageStagingB.GetData(), B.ImageQ8.GetData(), B.PaddedDims);
+	XdQuery Xa;
+	Xa.q8 = Scratch->XdImageStaging.GetData();
+	Xa.scale = A.Scale;
+	Xa.sqSum = A.SqSum;
+	XdQuery Xb;
+	Xb.q8 = Scratch->XdImageStagingB.GetData();
+	Xb.scale = B.Scale;
+	Xb.sqSum = B.SqSum;
+	const Status Result = ScoreXdPair(Xa, Xb, A.PaddedDims, static_cast<superfaiss::Metric>(Metric),
+		&OutScore);
+	ReleaseWorkspace(MoveTemp(Scratch));
+	return Result == Status::Ok;
+}
+
+bool USuperFAISSSubsystem::ProjectionReport(const USuperFAISSVectorBank* Bank,
+	const TArray<float>& DirectionA, const TArray<float>& DirectionB,
+	const TArray<int32>& GroupA, TArray<float>& OutProjections, float& OutSeparation)
+{
+	using namespace superfaiss;
+	OutProjections.Reset();
+	OutSeparation = 0.0f;
+	if (Bank == nullptr || !Bank->IsValid())
+	{
+		return false;
+	}
+	const BankView View = Bank->GetBankView();
+	if (DirectionA.Num() != View.dims || DirectionB.Num() != View.dims)
+	{
+		return false;
+	}
+
+	// Build the unit probe direction on the padded grid: normalize(A - B), padded with
+	// zeros (row padding dims are zero, so the padded direction dots the real components
+	// only). Offline authoring tooling — local aligned buffers, not the warm pool.
+	using FAlignedFloats = TArray<float, TAlignedHeapAllocator<16>>;
+	FAlignedFloats PaddedA;
+	FAlignedFloats PaddedB;
+	FAlignedFloats PaddedDir;
+	PaddedA.SetNumZeroed(View.paddedDims);
+	PaddedB.SetNumZeroed(View.paddedDims);
+	PaddedDir.SetNumZeroed(View.paddedDims);
+	FMemory::Memcpy(PaddedA.GetData(), DirectionA.GetData(), View.dims * sizeof(float));
+	FMemory::Memcpy(PaddedB.GetData(), DirectionB.GetData(), View.dims * sizeof(float));
+	if (MakeDirection(PaddedA.GetData(), PaddedB.GetData(), View.dims, View.paddedDims,
+			PaddedDir.GetData()) != Status::Ok)
+	{
+		return false;
+	}
+
+	// Group A = the set bits over all rows; the complement is group B (the core rejects
+	// an empty complement when a separation is requested — the F3 no-partial contract).
+	TArray<uint32> GroupBits;
+	const uint32* GroupBitsPtr = nullptr;
+	if (GroupA.Num() > 0)
+	{
+		GroupBits.SetNumZeroed((View.count + 31) / 32);
+		for (const int32 Index : GroupA)
+		{
+			if (Index >= 0 && Index < View.count)
+			{
+				GroupBits[Index >> 5] |= (1u << (Index & 31));
+			}
+		}
+		GroupBitsPtr = GroupBits.GetData();
+	}
+
+	TArray<float> Projections;
+	Projections.SetNumUninitialized(View.count);
+	float Separation = 0.0f;
+	const Status Result = superfaiss::ProjectionReport(View, PaddedDir.GetData(),
+		GroupBitsPtr, Projections.GetData(), GroupBitsPtr != nullptr ? &Separation : nullptr);
+	if (Result != Status::Ok)
+	{
+		return false;
+	}
+	OutProjections = MoveTemp(Projections);
+	OutSeparation = Separation;
+	return true;
+}
+
+// --- V2.5 analytics over a live scratch snapshot (plan section 22, T-V2.5-U2) ---
+
+bool USuperFAISSSubsystem::BankSpreadCrossDeviceScratch(USuperFAISSScratchBank* Bank,
+	ESuperFAISSReduce Reduce, float& OutValue)
+{
+	using namespace superfaiss;
+	OutValue = 0.0f;
+	if (Bank == nullptr || !Bank->IsInitialized() || !Bank->TryPin())
+	{
+		return false;
+	}
+	ON_SCOPE_EXIT { Bank->Unpin(); };
+
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+	bool bOk = false;
+	do
+	{
+		BankView View;
+		// Size the tombstone staging from CAPACITY, not the current count (the P-1
+		// posture QueryScratch documents): a concurrent Append can advance Snapshot's
+		// own count read past a count read here; capacity is pin-stable and bounds it.
+		const int32 Words = ScratchBank::TombstoneWords(Bank->Core().Capacity());
+		if (Scratch->TombstoneStaging.Num() < Words)
+		{
+			Scratch->TombstoneStaging.SetNumZeroed(Words);
+		}
+		if (Bank->Core().Snapshot(&View, Scratch->TombstoneStaging.GetData()) != Status::Ok)
+		{
+			break;
+		}
+		if (View.count <= 0)
+		{
+			break; // an empty selection is a defined rejection (matches the baked path)
+		}
+		if (Scratch->XdImageStaging.Num() < View.paddedDims)
+		{
+			Scratch->XdImageStaging.SetNumZeroed(View.paddedDims);
+		}
+		// Spread over all published rows; the snapshot tombstones are the exclusion set
+		// (deletion is exclusion), so a removed row joins neither the pool nor the mean.
+		TArray<int32> RowIndices;
+		RowIndices.SetNumUninitialized(View.count);
+		for (int32 i = 0; i < View.count; ++i)
+		{
+			RowIndices[i] = i;
+		}
+		const Status Result = SpreadCrossDevice(View, RowIndices.GetData(), View.count,
+			Scratch->TombstoneStaging.GetData(), static_cast<superfaiss::Reduce>(Reduce),
+			Scratch->XdImageStaging.GetData(), &OutValue);
+		bOk = Result == Status::Ok;
+	} while (false);
+	ReleaseWorkspace(MoveTemp(Scratch));
+	return bOk;
+}
+
+bool USuperFAISSSubsystem::MeanNearestNeighborCrossDeviceScratch(
+	USuperFAISSScratchBank* SourceBank, const USuperFAISSVectorBank* TargetBank,
+	float& OutValue)
+{
+	using namespace superfaiss;
+	OutValue = 0.0f;
+	if (SourceBank == nullptr || !SourceBank->IsInitialized() ||
+		TargetBank == nullptr || !TargetBank->IsValid() || !SourceBank->TryPin())
+	{
+		return false;
+	}
+	ON_SCOPE_EXIT { SourceBank->Unpin(); };
+
+	const BankView Target = TargetBank->GetBankView();
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+	bool bOk = false;
+	do
+	{
+		BankView Source;
+		const int32 Words = ScratchBank::TombstoneWords(SourceBank->Core().Capacity());
+		if (Scratch->TombstoneStaging.Num() < Words)
+		{
+			Scratch->TombstoneStaging.SetNumZeroed(Words);
+		}
+		if (SourceBank->Core().Snapshot(&Source, Scratch->TombstoneStaging.GetData()) !=
+			Status::Ok)
+		{
+			break;
+		}
+		if (Source.count <= 0)
+		{
+			break;
+		}
+		if (Scratch->XdQueryStaging.Num() < Source.count)
+		{
+			Scratch->XdQueryStaging.SetNumUninitialized(Source.count);
+		}
+		if (Scratch->HitStaging.Num() < Source.count)
+		{
+			Scratch->HitStaging.SetNumUninitialized(Source.count);
+		}
+		if (Scratch->CountStaging.Num() < Source.count)
+		{
+			Scratch->CountStaging.SetNumUninitialized(Source.count);
+		}
+		const Status Result = MeanNNCrossDevice(Source,
+			Scratch->TombstoneStaging.GetData(), Target, nullptr,
+			Scratch->XdQueryStaging.GetData(), Scratch->HitStaging.GetData(),
+			Scratch->CountStaging.GetData(), Scratch->Core, &OutValue);
+		bOk = Result == Status::Ok;
+	} while (false);
+	ReleaseWorkspace(MoveTemp(Scratch));
+	return bOk;
+}
+
+bool USuperFAISSSubsystem::SetToSetDistanceCrossDeviceScratch(USuperFAISSScratchBank* BankA,
+	const USuperFAISSVectorBank* BankB, const TArray<int32>& RowIndicesB,
+	const TArray<int32>& WeightsB, ESuperFAISSBankMetric Metric, float& OutDistance)
+{
+	using namespace superfaiss;
+	OutDistance = 0.0f;
+	if (BankA == nullptr || !BankA->IsInitialized() || BankB == nullptr ||
+		!BankB->IsValid() || RowIndicesB.Num() == 0)
+	{
+		return false;
+	}
+	if (WeightsB.Num() != 0 && WeightsB.Num() != RowIndicesB.Num())
+	{
+		return false;
+	}
+	if (!BankA->TryPin())
+	{
+		return false;
+	}
+	ON_SCOPE_EXIT { BankA->Unpin(); };
+
+	const BankView ViewB = BankB->GetBankView();
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+	bool bOk = false;
+	do
+	{
+		BankView ViewA;
+		const int32 Words = ScratchBank::TombstoneWords(BankA->Core().Capacity());
+		if (Scratch->TombstoneStaging.Num() < Words)
+		{
+			Scratch->TombstoneStaging.SetNumZeroed(Words);
+		}
+		if (BankA->Core().Snapshot(&ViewA, Scratch->TombstoneStaging.GetData()) != Status::Ok)
+		{
+			break;
+		}
+		if (ViewA.count <= 0)
+		{
+			break;
+		}
+		if (Scratch->XdImageStaging.Num() < ViewA.paddedDims)
+		{
+			Scratch->XdImageStaging.SetNumZeroed(ViewA.paddedDims);
+		}
+		if (Scratch->XdImageStagingB.Num() < ViewB.paddedDims)
+		{
+			Scratch->XdImageStagingB.SetNumZeroed(ViewB.paddedDims);
+		}
+		TArray<int32> RowIndicesA;
+		RowIndicesA.SetNumUninitialized(ViewA.count);
+		for (int32 i = 0; i < ViewA.count; ++i)
+		{
+			RowIndicesA[i] = i;
+		}
+		const Status Result = CentroidDistanceCrossDevice(
+			ViewA, RowIndicesA.GetData(), ViewA.count, nullptr,
+			Scratch->TombstoneStaging.GetData(),
+			ViewB, RowIndicesB.GetData(), RowIndicesB.Num(),
+			WeightsB.Num() > 0 ? WeightsB.GetData() : nullptr, nullptr,
+			static_cast<superfaiss::Metric>(Metric), Scratch->XdImageStaging.GetData(),
+			Scratch->XdImageStagingB.GetData(), &OutDistance);
+		bOk = Result == Status::Ok;
+	} while (false);
+	ReleaseWorkspace(MoveTemp(Scratch));
+	return bOk;
 }

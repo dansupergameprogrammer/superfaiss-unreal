@@ -1,1 +1,1 @@
-SuperFAISS code at tag v2.4 (046f073); docs at ee55197
+SuperFAISS code at tag v2.5 (commit 137b167) — bank analytics (ScoreXdPair, set-to-set distance, NN divergence, spread, projection report) on the shipped v2.4 base. Reference docs (README.md, docs/API.md, docs/INTEGRATION.md) synced from core master 9597269 (post-v2.5, docs-only: the analytics reference section, the Dot/Cosine/L2 result-direction table, and the integration/scratch notes).

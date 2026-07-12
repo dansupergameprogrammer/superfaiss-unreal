@@ -12,8 +12,11 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Serialization/JsonSerializer.h"
+#include "Engine/Engine.h"
 #include "SuperFAISSToolset.h"
 #include "SuperFAISSScratchBank.h"
+#include "SuperFAISSSubsystem.h"
+#include "SuperFAISSVectorBank.h"
 #include "UObject/Package.h"
 
 namespace
@@ -475,6 +478,210 @@ bool FSuperFAISSMCPScratchRecallTest::RunTest(const FString& Parameters)
 		TestFalse(TEXT("no report object"), P->HasField(TEXT("recallReport")));
 	}
 
+	return true;
+}
+
+// T-V2.5-U3 (plan section 22, test design section 7): the V2.5 analytics MCP tools
+// (ProjectionReport / SetToSetDistance / BankSpread) return the core helper's numbers
+// for the same bank and arguments (parsed from the tool JSON), ProjectionReport extends
+// the shipped ProjectAxis (same direction primitive, whole-set superset of its top-k, the
+// N1 correction), and the tools are read-only (no bank mutation surface). Numeric match
+// is to the JSON round-trip's precision — the MCP surface is a text protocol, not a
+// bitwise one; the bitwise plugin<->core parity lives in SuperFAISS.A.AnalyticsSurface.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FSuperFAISSMCPAnalyticsTest,
+	"SuperFAISS.M.Analytics",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+namespace
+{
+	const TCHAR* AnalyticsDest = TEXT("/Game/SuperFAISSMCPTests/AnalyticsInt8");
+	const TCHAR* AnalyticsPath = TEXT("/Game/SuperFAISSMCPTests/AnalyticsInt8.AnalyticsInt8");
+
+	void CleanupAnalyticsAsset()
+	{
+		const FString FileName = FPackageName::LongPackageNameToFilename(
+			AnalyticsDest, FPackageName::GetAssetPackageExtension());
+		IFileManager::Get().Delete(*FileName, false, true, true);
+	}
+
+	// Relative match to the JSON round-trip's precision (a text surface, not bitwise).
+	bool NumMatches(double Json, float Subsystem)
+	{
+		const double S = static_cast<double>(Subsystem);
+		return FMath::Abs(Json - S) <= 1.0e-4 * (1.0 + FMath::Abs(S));
+	}
+}
+
+bool FSuperFAISSMCPAnalyticsTest::RunTest(const FString& Parameters)
+{
+	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+	if (!TestNotNull(TEXT("subsystem"), Subsystem))
+	{
+		return true;
+	}
+
+	// Import a dedicated Int8 bank fixture so the analytics run on a cross-device bank.
+	CleanupAnalyticsAsset();
+	constexpr int32 Count = 32;
+	constexpr int32 Dims = 8;
+	FMCPFixture Fixture(TEXT("analytics_int8"), Count, Dims, /*bWithIds*/ true);
+	const TSharedPtr<FJsonObject> Imported = ParseTool(USuperFAISSToolset::ImportBank(
+		Fixture.JsonPath, AnalyticsDest, TEXT("Int8"), false));
+	if (!TestTrue(TEXT("analytics fixture imported"),
+			Imported.IsValid() && !Imported->HasField(TEXT("error"))))
+	{
+		CleanupAnalyticsAsset();
+		return true;
+	}
+
+	USuperFAISSVectorBank* Bank = LoadObject<USuperFAISSVectorBank>(nullptr, AnalyticsPath);
+	if (!TestNotNull(TEXT("analytics bank loads"), Bank))
+	{
+		CleanupAnalyticsAsset();
+		return true;
+	}
+
+	TArray<int32> AllRows;
+	AllRows.SetNumUninitialized(Bank->Count);
+	for (int32 i = 0; i < Bank->Count; ++i)
+	{
+		AllRows[i] = i;
+	}
+
+	// --- BankSpread MCP == subsystem BankSpreadCrossDevice (mean and max) ---
+	{
+		const TSharedPtr<FJsonObject> R = ParseTool(USuperFAISSToolset::BankSpread(AnalyticsPath, {}));
+		if (TestTrue(TEXT("BankSpread parses"), R.IsValid()) &&
+			TestFalse(TEXT("BankSpread not error"), R->HasField(TEXT("error"))))
+		{
+			float RefMean = 0.0f;
+			float RefMax = 0.0f;
+			TestTrue(TEXT("subsystem spread mean"),
+				Subsystem->BankSpreadCrossDevice(Bank, AllRows, ESuperFAISSReduce::Mean, RefMean));
+			TestTrue(TEXT("subsystem spread max"),
+				Subsystem->BankSpreadCrossDevice(Bank, AllRows, ESuperFAISSReduce::Max, RefMax));
+			TestTrue(TEXT("MCP spreadMean matches core"),
+				NumMatches(R->GetNumberField(TEXT("spreadMean")), RefMean));
+			TestTrue(TEXT("MCP spreadMax matches core"),
+				NumMatches(R->GetNumberField(TEXT("spreadMax")), RefMax));
+		}
+	}
+
+	// --- SetToSetDistance MCP == subsystem (centroid + meanNN + maxNN) ---
+	{
+		const TArray<int32> SelA = {0, 1, 2, 3};
+		const TArray<int32> SelB = {4, 5, 6, 7};
+		const TSharedPtr<FJsonObject> R = ParseTool(USuperFAISSToolset::SetToSetDistance(
+			AnalyticsPath, AnalyticsPath, SelA, SelB, TEXT("Cosine"), TEXT("all")));
+		if (TestTrue(TEXT("SetToSetDistance parses"), R.IsValid()) &&
+			TestFalse(TEXT("SetToSetDistance not error"), R->HasField(TEXT("error"))))
+		{
+			float RefCentroid = 0.0f;
+			TestTrue(TEXT("subsystem centroid distance"),
+				Subsystem->SetToSetDistanceCrossDevice(Bank, SelA, {}, Bank, SelB, {},
+					ESuperFAISSBankMetric::Cosine, RefCentroid));
+			TestTrue(TEXT("MCP centroidDistance matches core"),
+				NumMatches(R->GetNumberField(TEXT("centroidDistance")), RefCentroid));
+
+			float RefMean = 0.0f;
+			float RefMax = 0.0f;
+			TestTrue(TEXT("subsystem meanNN"),
+				Subsystem->MeanNearestNeighborCrossDevice(Bank, Bank, RefMean));
+			TestTrue(TEXT("subsystem maxNN"),
+				Subsystem->MaxNearestNeighborCrossDevice(Bank, Bank, RefMax));
+			TestTrue(TEXT("MCP meanNN matches core"),
+				NumMatches(R->GetNumberField(TEXT("meanNN")), RefMean));
+			TestTrue(TEXT("MCP maxNN matches core"),
+				NumMatches(R->GetNumberField(TEXT("maxNN")), RefMax));
+		}
+	}
+
+	// --- ProjectionReport MCP == subsystem, and the ProjectAxis superset (N1) ---
+	{
+		TArray<float> VecA;
+		TArray<float> VecB;
+		VecA.SetNumUninitialized(Dims);
+		VecB.SetNumUninitialized(Dims);
+		for (int32 J = 0; J < Dims; ++J)
+		{
+			VecA[J] = (J % 2 == 0) ? 1.0f : -0.5f;
+			VecB[J] = (J % 3 == 0) ? -1.0f : 0.25f;
+		}
+		const TArray<int32> GroupA = {0, 1, 2, 3};
+		const TSharedPtr<FJsonObject> R = ParseTool(USuperFAISSToolset::ProjectionReport(
+			AnalyticsPath, VecA, VecB, GroupA));
+		if (TestTrue(TEXT("ProjectionReport parses"), R.IsValid()) &&
+			TestFalse(TEXT("ProjectionReport not error"), R->HasField(TEXT("error"))))
+		{
+			TArray<float> RefProjections;
+			float RefSeparation = 0.0f;
+			TestTrue(TEXT("subsystem projection"),
+				Subsystem->ProjectionReport(Bank, VecA, VecB, GroupA, RefProjections, RefSeparation));
+			TestTrue(TEXT("MCP separation matches core"),
+				NumMatches(R->GetNumberField(TEXT("separation")), RefSeparation));
+
+			const TArray<TSharedPtr<FJsonValue>>& Proj = R->GetArrayField(TEXT("projections"));
+			TestEqual(TEXT("projection count"), Proj.Num(), RefProjections.Num());
+			for (int32 i = 0; i < Proj.Num() && i < RefProjections.Num(); ++i)
+			{
+				TestTrue(TEXT("MCP projection[i] matches core"),
+					NumMatches(Proj[i]->AsNumber(), RefProjections[i]));
+			}
+
+			// N1: ProjectAxis (top-k ranking on the same direction) is the base
+			// ProjectionReport extends into a whole-set audit. Its top hits ARE the
+			// highest-projected rows, so ProjectAxis's #1 must sit among the top few by
+			// projection — the "superset of the top-k" relationship, robust to a last-bit
+			// ranking difference between the two per-device paths.
+			TArray<int32> ByProjection;
+			ByProjection.SetNumUninitialized(RefProjections.Num());
+			for (int32 i = 0; i < RefProjections.Num(); ++i)
+			{
+				ByProjection[i] = i;
+			}
+			ByProjection.Sort([&RefProjections](int32 A, int32 B) {
+				return RefProjections[A] > RefProjections[B];
+			});
+			const int32 TopN = FMath::Min(3, ByProjection.Num());
+			TSet<int32> TopByProjection;
+			for (int32 i = 0; i < TopN; ++i)
+			{
+				TopByProjection.Add(ByProjection[i]);
+			}
+
+			const TSharedPtr<FJsonObject> Axis = ParseTool(USuperFAISSToolset::ProjectAxis(
+				AnalyticsPath, VecA, VecB, 3));
+			if (TestTrue(TEXT("ProjectAxis parses"), Axis.IsValid()) &&
+				TestFalse(TEXT("ProjectAxis not error"), Axis->HasField(TEXT("error"))))
+			{
+				const TArray<TSharedPtr<FJsonValue>>& AxisHits = Axis->GetArrayField(TEXT("hits"));
+				if (TestTrue(TEXT("ProjectAxis returned hits"), AxisHits.Num() > 0))
+				{
+					const int32 TopAxisIndex =
+						static_cast<int32>(AxisHits[0]->AsObject()->GetNumberField(TEXT("index")));
+					TestTrue(TEXT("ProjectAxis top-1 is among ProjectionReport's top-3 rows"),
+						TopByProjection.Contains(TopAxisIndex));
+				}
+			}
+		}
+	}
+
+	// --- Read-only posture (DEF): analytics tools mutate no bank; count is unchanged ---
+	{
+		const TSharedPtr<FJsonObject> D = ParseTool(USuperFAISSToolset::DescribeBank(AnalyticsPath));
+		if (TestTrue(TEXT("post-analytics describe parses"), D.IsValid()))
+		{
+			TestEqual(TEXT("bank count unchanged after analytics reads"),
+				static_cast<int32>(D->GetNumberField(TEXT("count"))), Count);
+		}
+		// An unknown mode is a defined rejection, not a silent all-run.
+		TestTrue(TEXT("unknown set-to-set mode rejected"),
+			IsToolError(USuperFAISSToolset::SetToSetDistance(
+				AnalyticsPath, AnalyticsPath, {0}, {1}, TEXT("Cosine"), TEXT("bogus"))));
+	}
+
+	CleanupAnalyticsAsset();
 	return true;
 }
 

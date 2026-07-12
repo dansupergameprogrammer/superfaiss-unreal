@@ -14,5 +14,6 @@
 #include "../../../ThirdParty/SuperFAISS/src/bake.cpp"
 #include "../../../ThirdParty/SuperFAISS/src/query.cpp"
 #include "../../../ThirdParty/SuperFAISS/src/compose.cpp"
+#include "../../../ThirdParty/SuperFAISS/src/analytics.cpp"
 #include "../../../ThirdParty/SuperFAISS/src/pca.cpp"
 #include "../../../ThirdParty/SuperFAISS/src/scratch.cpp"

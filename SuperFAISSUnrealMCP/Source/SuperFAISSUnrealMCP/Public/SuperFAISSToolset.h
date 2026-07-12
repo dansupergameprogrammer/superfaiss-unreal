@@ -114,6 +114,45 @@ public:
 		int32 SampleLimit = 4096, float VarianceEpsilon = 0.00000001f);
 
 	/**
+	 * Probe-direction projection audit (V2.5, plan section 22.3). Projects every row of
+	 * the bank onto the unit direction from VectorB toward VectorA (normalize(A - B),
+	 * the same direction primitive ProjectAxis uses) and reports the whole-set
+	 * projections — ProjectAxis's top-K ranking widened to a full-bank audit. When
+	 * GroupA (row indices) is non-empty, also reports the Cohen's-d separation of that
+	 * group's projected mean against the remaining rows: the constitution's bake-time
+	 * anchor-audit instrument. Per-device float, offline. VectorA/B must match the
+	 * bank's dimensions; A == B, an empty bank, or a GroupA covering every row is an
+	 * error. Read-only.
+	 */
+	UFUNCTION(meta = (AICallable), Category = "SuperFAISS")
+	static FString ProjectionReport(const FString& BankPath, const TArray<float>& VectorA,
+		const TArray<float>& VectorB, const TArray<int32>& GroupA);
+
+	/**
+	 * Set-to-set divergence between two int8 cross-device banks (V2.5, plan section
+	 * 22.4). Mode selects the read: "centroid" (the cross-device centroid distance of
+	 * the selected rows, RowIndicesA/RowIndicesB — empty selects all rows), "meanNN" or
+	 * "maxNN" (directed nearest-neighbour divergence from A's rows to B's, whole-bank),
+	 * or "all" (default, all three). Metric ("Dot"/"Cosine"/"L2", empty = bank A's
+	 * metric) sets the centroid distance sense; the NN divergences score in bank B's
+	 * own metric. DRIFT over checkpoints is this read applied to two checkpoint bank
+	 * paths. Both banks int8 cross-device with equal dimensions. Read-only.
+	 */
+	UFUNCTION(meta = (AICallable), Category = "SuperFAISS")
+	static FString SetToSetDistance(const FString& BankPathA, const FString& BankPathB,
+		const TArray<int32>& RowIndicesA, const TArray<int32>& RowIndicesB,
+		const FString& Metric, const FString& Mode);
+
+	/**
+	 * Within-bank dispersion (V2.5, plan section 22.4): the mean and max distance of
+	 * each selected row (RowIndices — empty selects all rows) to the selection's own
+	 * cross-device centroid, in the bank's metric. The int8 cross-device spread
+	 * statistic. Int8 banks only. Read-only.
+	 */
+	UFUNCTION(meta = (AICallable), Category = "SuperFAISS")
+	static FString BankSpread(const FString& BankPath, const TArray<int32>& RowIndices);
+
+	/**
 	 * Lists live scratch banks (runtime, mutable, in-memory — NPC memory and other
 	 * session-accumulated embeddings; they are not assets). Read-only: scratch
 	 * banks are mutated by game code, never through MCP.

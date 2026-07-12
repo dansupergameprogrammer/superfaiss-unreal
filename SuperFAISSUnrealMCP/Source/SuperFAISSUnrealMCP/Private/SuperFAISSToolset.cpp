@@ -371,6 +371,200 @@ FString USuperFAISSToolset::ProjectAxis(const FString& BankPath,
 		/*bScoreAsDot*/ Bank->Metric == ESuperFAISSBankMetric::L2);
 }
 
+namespace
+{
+	// Parse a metric name; empty falls back to Fallback. Returns false on an unknown name.
+	bool ParseMetricName(const FString& Name, ESuperFAISSBankMetric Fallback,
+		ESuperFAISSBankMetric& OutMetric)
+	{
+		if (Name.IsEmpty())
+		{
+			OutMetric = Fallback;
+			return true;
+		}
+		if (Name.Equals(TEXT("Dot"), ESearchCase::IgnoreCase))
+		{
+			OutMetric = ESuperFAISSBankMetric::Dot;
+		}
+		else if (Name.Equals(TEXT("Cosine"), ESearchCase::IgnoreCase))
+		{
+			OutMetric = ESuperFAISSBankMetric::Cosine;
+		}
+		else if (Name.Equals(TEXT("L2"), ESearchCase::IgnoreCase))
+		{
+			OutMetric = ESuperFAISSBankMetric::L2;
+		}
+		else
+		{
+			return false;
+		}
+		return true;
+	}
+
+	// The selection, or every row 0..Count-1 when the caller left it empty.
+	TArray<int32> RowsOrAll(const TArray<int32>& RowIndices, int32 Count)
+	{
+		if (RowIndices.Num() > 0)
+		{
+			return RowIndices;
+		}
+		TArray<int32> All;
+		All.SetNumUninitialized(Count);
+		for (int32 i = 0; i < Count; ++i)
+		{
+			All[i] = i;
+		}
+		return All;
+	}
+}
+
+FString USuperFAISSToolset::ProjectionReport(const FString& BankPath,
+	const TArray<float>& VectorA, const TArray<float>& VectorB, const TArray<int32>& GroupA)
+{
+	FString Error;
+	USuperFAISSVectorBank* Bank = LoadBank(BankPath, Error);
+	if (Bank == nullptr)
+	{
+		return JsonError(Error);
+	}
+	if (VectorA.Num() != Bank->Dims || VectorB.Num() != Bank->Dims)
+	{
+		return JsonError(FString::Printf(TEXT("vectors must have %d dims"), Bank->Dims));
+	}
+	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+	if (Subsystem == nullptr)
+	{
+		return JsonError(TEXT("subsystem unavailable"));
+	}
+	TArray<float> Projections;
+	float Separation = 0.0f;
+	if (!Subsystem->ProjectionReport(Bank, VectorA, VectorB, GroupA, Projections, Separation))
+	{
+		return JsonError(
+			TEXT("projection report rejected (A equals B, empty bank, or group covers all rows?)"));
+	}
+	const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+	Object->SetStringField(TEXT("bank"), Bank->GetPathName());
+	Object->SetNumberField(TEXT("count"), Projections.Num());
+	TArray<TSharedPtr<FJsonValue>> ProjValues;
+	ProjValues.Reserve(Projections.Num());
+	for (const float P : Projections)
+	{
+		ProjValues.Add(MakeShared<FJsonValueNumber>(P));
+	}
+	Object->SetArrayField(TEXT("projections"), ProjValues);
+	if (GroupA.Num() > 0)
+	{
+		Object->SetNumberField(TEXT("separation"), Separation);
+	}
+	return ToJson(Object);
+}
+
+FString USuperFAISSToolset::SetToSetDistance(const FString& BankPathA,
+	const FString& BankPathB, const TArray<int32>& RowIndicesA,
+	const TArray<int32>& RowIndicesB, const FString& Metric, const FString& Mode)
+{
+	FString ErrorA;
+	USuperFAISSVectorBank* BankA = LoadBank(BankPathA, ErrorA);
+	if (BankA == nullptr)
+	{
+		return JsonError(ErrorA);
+	}
+	FString ErrorB;
+	USuperFAISSVectorBank* BankB = LoadBank(BankPathB, ErrorB);
+	if (BankB == nullptr)
+	{
+		return JsonError(ErrorB);
+	}
+	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+	if (Subsystem == nullptr)
+	{
+		return JsonError(TEXT("subsystem unavailable"));
+	}
+	ESuperFAISSBankMetric MetricEnum;
+	if (!ParseMetricName(Metric, BankA->Metric, MetricEnum))
+	{
+		return JsonError(TEXT("metric must be Dot, Cosine, or L2"));
+	}
+
+	const FString ModeLower = Mode.IsEmpty() ? TEXT("all") : Mode.ToLower();
+	const bool bCentroid = ModeLower == TEXT("all") || ModeLower == TEXT("centroid");
+	const bool bMeanNN = ModeLower == TEXT("all") || ModeLower == TEXT("meannn");
+	const bool bMaxNN = ModeLower == TEXT("all") || ModeLower == TEXT("maxnn");
+	if (!bCentroid && !bMeanNN && !bMaxNN)
+	{
+		return JsonError(TEXT("mode must be centroid, meanNN, maxNN, or all"));
+	}
+
+	const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+	Object->SetStringField(TEXT("bankA"), BankA->GetPathName());
+	Object->SetStringField(TEXT("bankB"), BankB->GetPathName());
+
+	if (bCentroid)
+	{
+		const TArray<int32> IdxA = RowsOrAll(RowIndicesA, BankA->Count);
+		const TArray<int32> IdxB = RowsOrAll(RowIndicesB, BankB->Count);
+		float Distance = 0.0f;
+		if (!Subsystem->SetToSetDistanceCrossDevice(BankA, IdxA, {}, BankB, IdxB, {},
+				MetricEnum, Distance))
+		{
+			return JsonError(
+				TEXT("centroid distance rejected (non-int8, dims mismatch, or zero-norm centroid?)"));
+		}
+		Object->SetNumberField(TEXT("centroidDistance"), Distance);
+		Object->SetStringField(TEXT("metric"), MetricName(MetricEnum));
+	}
+	if (bMeanNN)
+	{
+		float Value = 0.0f;
+		if (!Subsystem->MeanNearestNeighborCrossDevice(BankA, BankB, Value))
+		{
+			return JsonError(TEXT("meanNN rejected (non-int8 or dims mismatch?)"));
+		}
+		Object->SetNumberField(TEXT("meanNN"), Value);
+	}
+	if (bMaxNN)
+	{
+		float Value = 0.0f;
+		if (!Subsystem->MaxNearestNeighborCrossDevice(BankA, BankB, Value))
+		{
+			return JsonError(TEXT("maxNN rejected (non-int8 or dims mismatch?)"));
+		}
+		Object->SetNumberField(TEXT("maxNN"), Value);
+	}
+	return ToJson(Object);
+}
+
+FString USuperFAISSToolset::BankSpread(const FString& BankPath,
+	const TArray<int32>& RowIndices)
+{
+	FString Error;
+	USuperFAISSVectorBank* Bank = LoadBank(BankPath, Error);
+	if (Bank == nullptr)
+	{
+		return JsonError(Error);
+	}
+	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+	if (Subsystem == nullptr)
+	{
+		return JsonError(TEXT("subsystem unavailable"));
+	}
+	const TArray<int32> Idx = RowsOrAll(RowIndices, Bank->Count);
+	float SpreadMean = 0.0f;
+	float SpreadMax = 0.0f;
+	if (!Subsystem->BankSpreadCrossDevice(Bank, Idx, ESuperFAISSReduce::Mean, SpreadMean) ||
+		!Subsystem->BankSpreadCrossDevice(Bank, Idx, ESuperFAISSReduce::Max, SpreadMax))
+	{
+		return JsonError(TEXT("spread rejected (non-int8 bank or empty selection?)"));
+	}
+	const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+	Object->SetStringField(TEXT("bank"), Bank->GetPathName());
+	Object->SetNumberField(TEXT("count"), Idx.Num());
+	Object->SetNumberField(TEXT("spreadMean"), SpreadMean);
+	Object->SetNumberField(TEXT("spreadMax"), SpreadMax);
+	return ToJson(Object);
+}
+
 FString USuperFAISSToolset::ImportBank(const FString& SidecarJsonPath,
 	const FString& DestinationPackagePath, const FString& Quantization,
 	bool bAllowOverwrite)
