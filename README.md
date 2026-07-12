@@ -72,6 +72,11 @@ so plainly. See the [plugin README](SuperFAISSUnreal/README.md).
 
 ![The shipped demo: one query against two GloVe banks, sub-millisecond async results](docs/demo.png)
 
+The editor **Bank Inspector** (Window > SuperFAISS Bank Inspector) — live queries with
+score and margin, and a PCA projection, over any bank asset:
+
+![Bank Inspector: a live `wizard` query over a 40k-word bank, ranked with scores and margins, beside a PCA point cloud](docs/inspector.png)
+
 ## Repo layout
 
 | Path | What |
