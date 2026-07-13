@@ -92,6 +92,50 @@ Status SpreadCrossDevice(
 	const BankView& bank, const int32_t* rowIndices, int32_t rowCount,
 	const uint32_t* excludeBits, Reduce reduce, int8_t* centroidScratch, float* outValue);
 
+// --- V3.0 Tier 2: channel-scoped analytics (plan section 23.5) ---
+//
+// The four CrossDevice operators above, scored over one channel's sub-range
+// [bank.channels[channel].offset, +length) instead of [0, paddedDims). `channel`
+// indexes the bank's channel table (bank.channels / bank.channelCount); the operator
+// pools and scores over that sub-range only. Dot/L2 are a sub-range of the same integer
+// accumulation (the overflow bound only shrinks); Cosine recomputes the sub-range integer
+// self-dot and applies one IEEE correctly-rounded sqrt (1 - crossDot/sqrt(aSq*bSq)) -- it
+// does NOT read the per-row channelInvNorms (C-4/D-V3-10). Both paths are
+// cross-device-reproducible; the analytics recompute in the int->double domain for a
+// full-precision bit-exact double reference (the REF checks against it), whereas the
+// per-row channelInvNorms are the float32-precision query-path scoring convenience.
+// Channel-scoped Cosine therefore depends only on the channel table, not the sub-norm
+// arena. New surface for ALL banks (baked + scratch); a scratch snapshot
+// inherits it once Tier 1 put the channel table on the snapshot. A bank with no channel
+// table, or `channel` outside [0, channelCount), is InvalidArgument; a zero-sub-norm
+// channel member floors to a defined 0 in a reduction (C-5/D-V3-11), while a single
+// per-channel query on a zero-norm sub-vector still rejects (ZeroNormQuery). The scratch
+// scratch-buffer sizing matches the whole-vector operators.
+Status CentroidDistanceCrossDeviceChannel(
+	const BankView& bankA, const int32_t* rowIndicesA, int32_t rowCountA,
+	const int32_t* weightsA, const uint32_t* excludeBitsA,
+	const BankView& bankB, const int32_t* rowIndicesB, int32_t rowCountB,
+	const int32_t* weightsB, const uint32_t* excludeBitsB,
+	Metric metric, int32_t channel,
+	int8_t* centroidScratchA, int8_t* centroidScratchB, float* outDistance);
+
+Status MeanNNCrossDeviceChannel(
+	const BankView& source, const uint32_t* sourceExcludeBits,
+	const BankView& target, const uint32_t* targetExcludeBits, int32_t channel,
+	XdQuery* queryScratch, Hit* hitScratch, int32_t* countScratch, Workspace& ws,
+	float* outValue);
+
+Status MaxNNCrossDeviceChannel(
+	const BankView& source, const uint32_t* sourceExcludeBits,
+	const BankView& target, const uint32_t* targetExcludeBits, int32_t channel,
+	XdQuery* queryScratch, Hit* hitScratch, int32_t* countScratch, Workspace& ws,
+	float* outValue);
+
+Status SpreadCrossDeviceChannel(
+	const BankView& bank, const int32_t* rowIndices, int32_t rowCount,
+	const uint32_t* excludeBits, Reduce reduce, int32_t channel,
+	int8_t* centroidScratch, float* outValue);
+
 // Feature A — the probe-direction projection report (plan 22.3). OFFLINE, per-device
 // float, no cross-device claim: projects each row of `bank` onto the unit probe direction
 // (`paddedDirection`, paddedDims floats, caller-normalized e.g. via MakeDirection) and

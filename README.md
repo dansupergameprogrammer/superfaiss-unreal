@@ -23,6 +23,18 @@ editor: single query **0.13 ms** (auto-parallelized across chunks — the core's
 one-core scan of the same bank is ~0.5 ms), batched **0.06 ms per query** — exact
 search, bit-deterministic, zero steady-state allocation.
 
+**New in 3.0:** channel-capable scratch banks and channel-scoped analytics —
+channels (the named sub-space partition baked banks have carried since 2.0) extend
+to the mutable half. `InitWithChannels` fixes a channel table on a scratch bank at
+construction; a named-channel scratch query ranks a snapshot by a weighted
+combination of channels and agrees **bit-for-bit** with its baked twin; channel-aware
+`Freeze` graduates the bank to a schema-2 channel bank, and per-channel recall audit
+reports recall@k per channel. Every 2.5 analytics operator gains a channel-scoped
+form (BP and read-only MCP) — "this mind's *identity* is drifting but its *appearance*
+is stable" is a channel-scoped centroid distance. Append-time-only cost (the Cosine
+per-channel sub-norm), never on the query path. Built on the MIT core library at tag
+`v3.0`.
+
 **New in 2.5:** bank analytics — cross-device-deterministic reductions over int8
 banks: a set-to-set centroid distance (drift over checkpoints is that operator
 between two checkpoints' row sets), directed nearest-neighbour set divergence (mean,
@@ -97,15 +109,18 @@ Or headless, from the repo root:
 UnrealEditor-Cmd ExampleProject/ExampleProject.uproject -ExecCmds="Automation RunTests SuperFAISS; Quit" -unattended -nullrhi
 ```
 
-40 automation tests (plus the MCP toolset's own when that optional plugin is
-enabled): kernel correctness, SIMD/scalar mirror equality, determinism, tie-break
-stability, concurrency, asset round-trips, import rejection, quantizer recall,
-performance guards, query composition (centroid, direction, intersection, margins),
-named-channel queries and decomposition, per-row bias, scratch banks, cross-device
-exactness (v2.2 — including a golden-hash battery over committed fixtures that must
-match the core CI's pin), bank analytics (set-to-set distance, drift/divergence/spread,
-projection — v2.5), bank lint analyses, prototype authoring, a golden semantic query
-on the demo bank, and the Mass swarm's stability.
+53 automation tests (61 with the MCP toolset plugin enabled): kernel correctness,
+SIMD/scalar mirror equality, determinism, tie-break stability, concurrency, asset
+round-trips, import rejection, quantizer recall, performance guards, query composition
+(centroid, direction, intersection, margins), named-channel queries and decomposition,
+per-row bias, scratch banks, **channel-capable scratch banks (v3.0) — a named-channel
+scratch query proven bit-equal to its baked twin, channel-aware freeze to a schema-2
+bank, per-channel recall, the composition set (bias / cross-device / tombstone), and
+the rejection catalog; channel-scoped analytics; the channel-scratch linter**,
+cross-device exactness (v2.2 — including a golden-hash battery over committed fixtures
+that must match the core CI's pin), bank analytics (set-to-set distance,
+drift/divergence/spread, projection — v2.5), bank lint analyses, prototype authoring, a
+golden semantic query on the demo bank, and the Mass swarm's stability.
 
 ## Use it in your project
 

@@ -518,9 +518,13 @@ bool USuperFAISSSubsystem::QueryScratch(
 	using namespace superfaiss;
 
 	OutHits.Reset();
-	// Channels are asset-side vocabulary; scratch banks carry no channel table.
+	// V3.0: named channels resolve against the scratch bank's own fixed channel table
+	// (V3-G3 guard dropped). A channels+segments mix, or named channels on a
+	// channel-less bank, is a defined rejection.
 	if (Bank == nullptr || !Bank->IsInitialized() || Args.K <= 0 ||
-		Args.Channels.Num() > 0 || UnpaddedQuery.Num() != Bank->GetDims())
+		UnpaddedQuery.Num() != Bank->GetDims() ||
+		(Args.Channels.Num() > 0 && Args.Segments.Num() > 0) ||
+		(Args.Channels.Num() > 0 && Bank->GetChannelCount() == 0))
 	{
 		return false;
 	}
@@ -578,7 +582,31 @@ bool USuperFAISSSubsystem::QueryScratch(
 			Scratch->HitStaging.SetNumUninitialized(Args.K);
 		}
 
+		// Named channels resolve against the scratch bank's OWN table (V3.0, C-6/N1):
+		// the plugin's baked ResolveSegments is typed on USuperFAISSVectorBank and
+		// cannot be reused, so resolve here via the wrapper's name->index map and the
+		// snapshot view's channel ranges (populated on the snapshot since slot 2).
 		TArray<QuerySegment> Segments;
+		bool bChannelsResolved = true;
+		for (const FSuperFAISSChannelWeight& Entry : Args.Channels)
+		{
+			const int32 ChannelIndex = Bank->GetChannelIndex(Entry.Channel);
+			if (ChannelIndex == INDEX_NONE || View.channels == nullptr ||
+				ChannelIndex >= View.channelCount)
+			{
+				bChannelsResolved = false;
+				break;
+			}
+			QuerySegment Segment;
+			Segment.offset = View.channels[ChannelIndex].offset;
+			Segment.length = View.channels[ChannelIndex].length;
+			Segment.weight = Entry.Weight;
+			Segments.Add(Segment);
+		}
+		if (!bChannelsResolved)
+		{
+			break; // unknown channel name — defined rejection, never a wrong ranking
+		}
 		for (const FSuperFAISSSegment& Raw : Args.Segments)
 		{
 			QuerySegment Segment;
@@ -590,6 +618,35 @@ bool USuperFAISSSubsystem::QueryScratch(
 		Segments.Sort([](const QuerySegment& A, const QuerySegment& B) {
 			return A.offset < B.offset;
 		});
+
+		// Cosine channel queries renormalize the query's per-channel sub-vectors (the
+		// true per-channel cosine, §5) — the scratch mirror of RenormalizeQueryChannels
+		// over the snapshot, so a named-channel scratch query matches its baked twin.
+		if (View.metric == Metric::Cosine && View.channelCount > 0)
+		{
+			for (const QuerySegment& Segment : Segments)
+			{
+				if (Segment.weight == 0.0f)
+				{
+					continue;
+				}
+				double Norm = 0.0;
+				for (int32 J = Segment.offset; J < Segment.offset + Segment.length; ++J)
+				{
+					Norm += static_cast<double>(Scratch->QueryStaging[J]) *
+						Scratch->QueryStaging[J];
+				}
+				if (Norm > 0.0)
+				{
+					const double Inv = 1.0 / FMath::Sqrt(Norm);
+					for (int32 J = Segment.offset; J < Segment.offset + Segment.length; ++J)
+					{
+						Scratch->QueryStaging[J] =
+							static_cast<float>(Scratch->QueryStaging[J] * Inv);
+					}
+				}
+			}
+		}
 
 		// v2.1 bias on scratch: index-aligned to THIS snapshot (T-055 N2) - a dense
 		// view sized for any other count is rejection, never silent misalignment;
@@ -1176,6 +1233,151 @@ bool USuperFAISSSubsystem::DecomposeHit(const USuperFAISSVectorBank* Bank,
 	return true;
 }
 
+bool USuperFAISSSubsystem::QuerySimilarScratchChannels(USuperFAISSScratchBank* Bank,
+	const TArray<float>& Query, const TArray<FSuperFAISSChannelWeight>& Channels,
+	int32 K, TArray<FSuperFAISSHit>& Hits)
+{
+	FSuperFAISSQueryArgs Args;
+	Args.K = K;
+	Args.Channels = Channels;
+	return QueryScratch(Bank, Query, Args, Hits);
+}
+
+bool USuperFAISSSubsystem::DecomposeScratchHit(USuperFAISSScratchBank* Bank,
+	const TArray<float>& Query, const TArray<FSuperFAISSChannelWeight>& Channels,
+	int32 RowIndex, TArray<float>& OutContributions, float& OutTotal, float RowBias,
+	bool bCrossDeviceExact)
+{
+	using namespace superfaiss;
+	OutContributions.Reset();
+	OutTotal = 0.0f;
+	if (Bank == nullptr || !Bank->IsInitialized() || RowIndex < 0 ||
+		Query.Num() != Bank->GetDims() || Channels.Num() == 0 ||
+		Bank->GetChannelCount() == 0)
+	{
+		return false;
+	}
+	if (!Bank->TryPin())
+	{
+		return false;
+	}
+	ON_SCOPE_EXIT { Bank->Unpin(); };
+
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+	bool bOk = false;
+	do
+	{
+		BankView View;
+		const int32 Words = ScratchBank::TombstoneWords(Bank->Core().Capacity());
+		if (Scratch->TombstoneStaging.Num() < Words)
+		{
+			Scratch->TombstoneStaging.SetNumZeroed(Words);
+		}
+		if (Bank->Core().Snapshot(&View, Scratch->TombstoneStaging.GetData()) != Status::Ok ||
+			RowIndex >= View.count)
+		{
+			break;
+		}
+
+		// Resolve channels against the scratch table + snapshot ranges (C-6/N1).
+		TArray<QuerySegment> Segments;
+		bool bResolved = true;
+		for (const FSuperFAISSChannelWeight& Entry : Channels)
+		{
+			const int32 ChannelIndex = Bank->GetChannelIndex(Entry.Channel);
+			if (ChannelIndex == INDEX_NONE || View.channels == nullptr ||
+				ChannelIndex >= View.channelCount)
+			{
+				bResolved = false;
+				break;
+			}
+			QuerySegment Segment;
+			Segment.offset = View.channels[ChannelIndex].offset;
+			Segment.length = View.channels[ChannelIndex].length;
+			Segment.weight = Entry.Weight;
+			Segments.Add(Segment);
+		}
+		if (!bResolved)
+		{
+			break;
+		}
+		Segments.Sort([](const QuerySegment& A, const QuerySegment& B) {
+			return A.offset < B.offset;
+		});
+
+		// Stage padded + renormalized exactly as the scan does, so OutTotal is the
+		// per-channel scan's own score for this row (bitwise) and the contributions
+		// sum to it — the scratch mirror of DecomposeHit over the snapshot.
+		TArray<float, TAlignedHeapAllocator<16>> Staged;
+		Staged.SetNumZeroed(View.paddedDims);
+		FMemory::Memcpy(Staged.GetData(), Query.GetData(), Query.Num() * sizeof(float));
+		if (View.metric == Metric::Cosine && View.channelCount > 0)
+		{
+			for (const QuerySegment& Segment : Segments)
+			{
+				if (Segment.weight == 0.0f)
+				{
+					continue;
+				}
+				double Norm = 0.0;
+				for (int32 J = Segment.offset; J < Segment.offset + Segment.length; ++J)
+				{
+					Norm += static_cast<double>(Staged[J]) * Staged[J];
+				}
+				if (Norm > 0.0)
+				{
+					const double Inv = 1.0 / FMath::Sqrt(Norm);
+					for (int32 J = Segment.offset; J < Segment.offset + Segment.length; ++J)
+					{
+						Staged[J] = static_cast<float>(Staged[J] * Inv);
+					}
+				}
+			}
+		}
+
+		if (ValidateQuery(View, Staged.GetData()) != Status::Ok ||
+			ValidateSegments(View, Staged.GetData(), Segments.GetData(),
+				Segments.Num()) != Status::Ok)
+		{
+			break;
+		}
+
+		OutContributions.SetNumZeroed(Segments.Num());
+		if (bCrossDeviceExact)
+		{
+			if (View.quant != Quantization::Int8 || View.paddedDims > kMaxCrossDeviceDims)
+			{
+				OutContributions.Reset();
+				break;
+			}
+			TArray<int8, TAlignedHeapAllocator<16>> Q8;
+			Q8.SetNumUninitialized(View.paddedDims);
+			XdQuery Xd;
+			QuantizeQueryXd(Staged.GetData(), View.paddedDims,
+				reinterpret_cast<int8_t*>(Q8.GetData()), &Xd.scale, &Xd.sqSum);
+			Xd.q8 = reinterpret_cast<const int8_t*>(Q8.GetData());
+			OutTotal = DecomposeRowScoreXd(View, Xd, RowIndex, Segments.GetData(),
+				Segments.Num(), OutContributions.GetData());
+			if (RowBias != 0.0f)
+			{
+				OutTotal = detail::XdComposeBiasValue(OutTotal, RowBias);
+			}
+		}
+		else
+		{
+			OutTotal = DecomposeRowScore(View, Staged.GetData(), RowIndex,
+				Segments.GetData(), Segments.Num(), OutContributions.GetData());
+			if (RowBias != 0.0f)
+			{
+				OutTotal = OutTotal + RowBias;
+			}
+		}
+		bOk = true;
+	} while (false);
+	ReleaseWorkspace(Scratch);
+	return bOk;
+}
+
 bool USuperFAISSSubsystem::QuerySimilarSync(const USuperFAISSVectorBank* Bank,
 	const TArray<float>& Query, int32 K, TArray<FSuperFAISSHit>& Hits)
 {
@@ -1719,6 +1921,65 @@ bool USuperFAISSSubsystem::MeanNearestNeighborCrossDeviceScratch(
 	return bOk;
 }
 
+// Directed max nearest-neighbour divergence from a scratch snapshot's live rows to a baked
+// TargetBank (the scratch closure of MaxNearestNeighborCrossDevice; the directed Hausdorff
+// component). Mirrors MeanNearestNeighborCrossDeviceScratch, dispatching to the core
+// MaxNNCrossDevice order-free max reduction over the pinned snapshot with its tombstones.
+bool USuperFAISSSubsystem::MaxNearestNeighborCrossDeviceScratch(
+	USuperFAISSScratchBank* SourceBank, const USuperFAISSVectorBank* TargetBank,
+	float& OutValue)
+{
+	using namespace superfaiss;
+	OutValue = 0.0f;
+	if (SourceBank == nullptr || !SourceBank->IsInitialized() ||
+		TargetBank == nullptr || !TargetBank->IsValid() || !SourceBank->TryPin())
+	{
+		return false;
+	}
+	ON_SCOPE_EXIT { SourceBank->Unpin(); };
+
+	const BankView Target = TargetBank->GetBankView();
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+	bool bOk = false;
+	do
+	{
+		BankView Source;
+		const int32 Words = ScratchBank::TombstoneWords(SourceBank->Core().Capacity());
+		if (Scratch->TombstoneStaging.Num() < Words)
+		{
+			Scratch->TombstoneStaging.SetNumZeroed(Words);
+		}
+		if (SourceBank->Core().Snapshot(&Source, Scratch->TombstoneStaging.GetData()) !=
+			Status::Ok)
+		{
+			break;
+		}
+		if (Source.count <= 0)
+		{
+			break;
+		}
+		if (Scratch->XdQueryStaging.Num() < Source.count)
+		{
+			Scratch->XdQueryStaging.SetNumUninitialized(Source.count);
+		}
+		if (Scratch->HitStaging.Num() < Source.count)
+		{
+			Scratch->HitStaging.SetNumUninitialized(Source.count);
+		}
+		if (Scratch->CountStaging.Num() < Source.count)
+		{
+			Scratch->CountStaging.SetNumUninitialized(Source.count);
+		}
+		const Status Result = MaxNNCrossDevice(Source,
+			Scratch->TombstoneStaging.GetData(), Target, nullptr,
+			Scratch->XdQueryStaging.GetData(), Scratch->HitStaging.GetData(),
+			Scratch->CountStaging.GetData(), Scratch->Core, &OutValue);
+		bOk = Result == Status::Ok;
+	} while (false);
+	ReleaseWorkspace(MoveTemp(Scratch));
+	return bOk;
+}
+
 bool USuperFAISSSubsystem::SetToSetDistanceCrossDeviceScratch(USuperFAISSScratchBank* BankA,
 	const USuperFAISSVectorBank* BankB, const TArray<int32>& RowIndicesB,
 	const TArray<int32>& WeightsB, ESuperFAISSBankMetric Metric, float& OutDistance)
@@ -1784,4 +2045,142 @@ bool USuperFAISSSubsystem::SetToSetDistanceCrossDeviceScratch(USuperFAISSScratch
 	} while (false);
 	ReleaseWorkspace(MoveTemp(Scratch));
 	return bOk;
+}
+
+// --- V3.0 Tier 2: channel-scoped analytics over BP (plan §23.5 / §23.9 slot 5) ---
+
+bool USuperFAISSSubsystem::SetToSetDistanceCrossDeviceChannel(
+	const USuperFAISSVectorBank* BankA, const TArray<int32>& RowIndicesA,
+	const TArray<int32>& WeightsA, const USuperFAISSVectorBank* BankB,
+	const TArray<int32>& RowIndicesB, const TArray<int32>& WeightsB,
+	ESuperFAISSBankMetric Metric, int32 Channel, float& OutDistance)
+{
+	using namespace superfaiss;
+	OutDistance = 0.0f;
+	if (BankA == nullptr || !BankA->IsValid() || BankB == nullptr || !BankB->IsValid() ||
+		RowIndicesA.Num() == 0 || RowIndicesB.Num() == 0)
+	{
+		return false;
+	}
+	if ((WeightsA.Num() != 0 && WeightsA.Num() != RowIndicesA.Num()) ||
+		(WeightsB.Num() != 0 && WeightsB.Num() != RowIndicesB.Num()))
+	{
+		return false;
+	}
+	const BankView ViewA = BankA->GetBankView();
+	const BankView ViewB = BankB->GetBankView();
+
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+	if (Scratch->XdImageStaging.Num() < ViewA.paddedDims)
+	{
+		Scratch->XdImageStaging.SetNumZeroed(ViewA.paddedDims);
+	}
+	if (Scratch->XdImageStagingB.Num() < ViewB.paddedDims)
+	{
+		Scratch->XdImageStagingB.SetNumZeroed(ViewB.paddedDims);
+	}
+	// Core validates Channel against the bank's table (channel-less bank or out-of-range
+	// channel -> InvalidArgument -> false), the same reject-at-the-core posture the
+	// whole-vector op uses for its own arguments.
+	const Status Result = CentroidDistanceCrossDeviceChannel(
+		ViewA, RowIndicesA.GetData(), RowIndicesA.Num(),
+		WeightsA.Num() > 0 ? WeightsA.GetData() : nullptr, nullptr,
+		ViewB, RowIndicesB.GetData(), RowIndicesB.Num(),
+		WeightsB.Num() > 0 ? WeightsB.GetData() : nullptr, nullptr,
+		static_cast<superfaiss::Metric>(Metric), Channel,
+		Scratch->XdImageStaging.GetData(), Scratch->XdImageStagingB.GetData(), &OutDistance);
+	ReleaseWorkspace(MoveTemp(Scratch));
+	return Result == Status::Ok;
+}
+
+bool USuperFAISSSubsystem::MeanNearestNeighborCrossDeviceChannel(
+	const USuperFAISSVectorBank* SourceBank, const USuperFAISSVectorBank* TargetBank,
+	int32 Channel, float& OutValue)
+{
+	using namespace superfaiss;
+	OutValue = 0.0f;
+	if (SourceBank == nullptr || !SourceBank->IsValid() ||
+		TargetBank == nullptr || !TargetBank->IsValid())
+	{
+		return false;
+	}
+	const BankView Source = SourceBank->GetBankView();
+	const BankView Target = TargetBank->GetBankView();
+
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+	if (Scratch->XdQueryStaging.Num() < Source.count)
+	{
+		Scratch->XdQueryStaging.SetNumUninitialized(Source.count);
+	}
+	if (Scratch->HitStaging.Num() < Source.count)
+	{
+		Scratch->HitStaging.SetNumUninitialized(Source.count);
+	}
+	if (Scratch->CountStaging.Num() < Source.count)
+	{
+		Scratch->CountStaging.SetNumUninitialized(Source.count);
+	}
+	const Status Result = MeanNNCrossDeviceChannel(Source, nullptr, Target, nullptr, Channel,
+		Scratch->XdQueryStaging.GetData(), Scratch->HitStaging.GetData(),
+		Scratch->CountStaging.GetData(), Scratch->Core, &OutValue);
+	ReleaseWorkspace(MoveTemp(Scratch));
+	return Result == Status::Ok;
+}
+
+bool USuperFAISSSubsystem::MaxNearestNeighborCrossDeviceChannel(
+	const USuperFAISSVectorBank* SourceBank, const USuperFAISSVectorBank* TargetBank,
+	int32 Channel, float& OutValue)
+{
+	using namespace superfaiss;
+	OutValue = 0.0f;
+	if (SourceBank == nullptr || !SourceBank->IsValid() ||
+		TargetBank == nullptr || !TargetBank->IsValid())
+	{
+		return false;
+	}
+	const BankView Source = SourceBank->GetBankView();
+	const BankView Target = TargetBank->GetBankView();
+
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+	if (Scratch->XdQueryStaging.Num() < Source.count)
+	{
+		Scratch->XdQueryStaging.SetNumUninitialized(Source.count);
+	}
+	if (Scratch->HitStaging.Num() < Source.count)
+	{
+		Scratch->HitStaging.SetNumUninitialized(Source.count);
+	}
+	if (Scratch->CountStaging.Num() < Source.count)
+	{
+		Scratch->CountStaging.SetNumUninitialized(Source.count);
+	}
+	const Status Result = MaxNNCrossDeviceChannel(Source, nullptr, Target, nullptr, Channel,
+		Scratch->XdQueryStaging.GetData(), Scratch->HitStaging.GetData(),
+		Scratch->CountStaging.GetData(), Scratch->Core, &OutValue);
+	ReleaseWorkspace(MoveTemp(Scratch));
+	return Result == Status::Ok;
+}
+
+bool USuperFAISSSubsystem::BankSpreadCrossDeviceChannel(
+	const USuperFAISSVectorBank* Bank, const TArray<int32>& RowIndices,
+	ESuperFAISSReduce Reduce, int32 Channel, float& OutValue)
+{
+	using namespace superfaiss;
+	OutValue = 0.0f;
+	if (Bank == nullptr || !Bank->IsValid() || RowIndices.Num() == 0)
+	{
+		return false;
+	}
+	const BankView View = Bank->GetBankView();
+
+	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
+	if (Scratch->XdImageStaging.Num() < View.paddedDims)
+	{
+		Scratch->XdImageStaging.SetNumZeroed(View.paddedDims);
+	}
+	const Status Result = SpreadCrossDeviceChannel(View, RowIndices.GetData(), RowIndices.Num(),
+		nullptr, static_cast<superfaiss::Reduce>(Reduce), Channel,
+		Scratch->XdImageStaging.GetData(), &OutValue);
+	ReleaseWorkspace(MoveTemp(Scratch));
+	return Result == Status::Ok;
 }

@@ -106,6 +106,140 @@ bool USuperFAISSScratchBank::GetLastRecallReport(
 	return true;
 }
 
+bool USuperFAISSScratchBank::InitWithChannels(int32 Capacity, int32 Dims,
+	ESuperFAISSBankMetric Metric, ESuperFAISSBankQuantization Quantization,
+	const TArray<FName>& InChannelNames, const TArray<int32>& InChannelOffsets,
+	const TArray<int32>& InChannelLengths, bool bRetainFloats)
+{
+	if (Bank.IsCreated())
+	{
+		return false; // re-init is rejected — the channel vocabulary is fixed for life
+	}
+	const int32 ChannelCount = InChannelNames.Num();
+	if (ChannelCount <= 0 || ChannelCount > superfaiss::kMaxChannels ||
+		InChannelOffsets.Num() != ChannelCount || InChannelLengths.Num() != ChannelCount)
+	{
+		return false; // parallel arrays must agree; count in [1, kMaxChannels]
+	}
+	// Name-uniqueness is a plugin-side rule (names are host-side, V3-G8); the core
+	// validates the offset/length table (in-bounds, ascending, non-overlapping, grid).
+	TSet<FName> Seen;
+	for (const FName& Name : InChannelNames)
+	{
+		bool bAlreadyPresent = false;
+		Seen.Add(Name, &bAlreadyPresent);
+		if (bAlreadyPresent)
+		{
+			return false;
+		}
+	}
+	superfaiss::ChannelInfo Channels[superfaiss::kMaxChannels] = {};
+	for (int32 c = 0; c < ChannelCount; ++c)
+	{
+		Channels[c].offset = InChannelOffsets[c];
+		Channels[c].length = InChannelLengths[c];
+	}
+	if (Bank.Create(Capacity, Dims, ToCoreMetric(Metric), ToCoreQuant(Quantization),
+			Channels, ChannelCount, bRetainFloats) != superfaiss::Status::Ok)
+	{
+		return false; // core InvalidArgument on a malformed table — the bank is untouched
+	}
+	ChannelNamesTable = InChannelNames;
+	ChannelOffsetsTable = InChannelOffsets;
+	ChannelLengthsTable = InChannelLengths;
+	return true;
+}
+
+bool USuperFAISSScratchBank::MeasureRecallPerChannel(
+	TArray<FSuperFAISSScratchRecallReport>& OutReports)
+{
+	OutReports.Reset();
+	const int32 ChannelCount = GetChannelCount();
+	if (!Bank.IsCreated() || !Bank.RetainsFloats() || ChannelCount <= 0)
+	{
+		// Core InvalidArgument, mapped: a non-retention bank has no reference to audit,
+		// a non-channel bank has no per-channel ranges — a defined rejection.
+		return false;
+	}
+	// Same N4 posture as MeasureRecall: refuse while a drain-requiring op is waiting;
+	// release our pin before the core call (it takes its own for the sweep's flight).
+	if (!Bank.TryPinReader())
+	{
+		return false;
+	}
+	Bank.UnpinReader();
+
+	TArray<superfaiss::ScratchRecallReport> Core;
+	Core.SetNum(ChannelCount);
+	if (Bank.MeasureScratchRecallPerChannel(RecallWorkspace, Core.GetData(), ChannelCount) !=
+		superfaiss::Status::Ok)
+	{
+		return false;
+	}
+	OutReports.SetNum(ChannelCount);
+	for (int32 c = 0; c < ChannelCount; ++c)
+	{
+		FillReport(Core[c], OutReports[c]);
+	}
+	// Cache for the read-only describe surface (Poirot #2): the MCP path surfaces these,
+	// it does not re-measure (which would race the single-thread RecallWorkspace).
+	LastChannelRecallReports = OutReports;
+	bHasChannelRecallReports = true;
+	return true;
+}
+
+bool USuperFAISSScratchBank::ScanChannelDegeneracy(
+	TArray<int32>& OutZeroCounts, int32& OutLiveRows)
+{
+	using namespace superfaiss;
+	OutZeroCounts.Reset();
+	OutLiveRows = 0;
+	const int32 ChannelCount = GetChannelCount();
+	if (!Bank.IsCreated() || ChannelCount == 0)
+	{
+		return false;
+	}
+	// Hold a reader pin across the ENTIRE view use (Poirot #1): the snapshot's
+	// channelInvNorms point into the live arena, and the pin is what refuses a
+	// concurrent Grow/Freeze/Load that would reallocate it out from under this scan.
+	// A bank draining for an exclusive op refuses the pin — a defined, safe failure.
+	if (!Bank.TryPinReader())
+	{
+		return false;
+	}
+	ON_SCOPE_EXIT { Bank.UnpinReader(); };
+	TArray<uint32> Tombstones;
+	Tombstones.SetNumZeroed(ScratchBank::TombstoneWords(Bank.Capacity()));
+	BankView View;
+	if (Bank.Snapshot(&View, Tombstones.GetData()) != Status::Ok)
+	{
+		return false;
+	}
+	OutZeroCounts.SetNumZeroed(ChannelCount);
+	// A Dot/L2 channel bank carries no sub-norm arena: a successful scan with no
+	// degeneracy (the floor is a Cosine property), not a failure.
+	if (View.channelInvNorms == nullptr || View.channelCount != ChannelCount)
+	{
+		return true;
+	}
+	for (int32 R = 0; R < View.count; ++R)
+	{
+		if ((Tombstones[R >> 5] & (1u << (R & 31))) != 0)
+		{
+			continue; // removed row — neither sampled nor counted
+		}
+		++OutLiveRows;
+		for (int32 C = 0; C < ChannelCount; ++C)
+		{
+			if (View.channelInvNorms[static_cast<int64>(R) * ChannelCount + C] == 0.0f)
+			{
+				++OutZeroCounts[C];
+			}
+		}
+	}
+	return true;
+}
+
 bool USuperFAISSScratchBank::Append(const TArray<float>& Vector, int32& OutIndex)
 {
 	OutIndex = INDEX_NONE;
@@ -222,8 +356,24 @@ USuperFAISSVectorBank* USuperFAISSScratchBank::FreezeInternal(TArray<int32>& Out
 			Scales.SetNumZeroed(Live);
 		}
 		OutIndexMap.SetNumUninitialized(Count);
-		if (Bank.Freeze(Rows.GetData(), bInt8 ? Scales.GetData() : nullptr,
-				OutIndexMap.GetData(), CoreReport, CoreWs) != Status::Ok)
+
+		// V3.0: a channel Cosine bank re-derives its per-channel sub-norms over the
+		// compacted rows through the channel-aware core Freeze; Dot/L2 (channel or not)
+		// use the base Freeze. The graduated bank is schema-2 when channels are present.
+		const int32 ChannelCount = GetChannelCount();
+		const bool bChannelCosine =
+			ChannelCount > 0 && GetMetric() == ESuperFAISSBankMetric::Cosine;
+		TArray<float> FrozenSubNorms;
+		if (bChannelCosine)
+		{
+			FrozenSubNorms.SetNumZeroed(static_cast<int64>(Live) * ChannelCount);
+		}
+		const Status FreezeStatus = bChannelCosine
+			? Bank.Freeze(Rows.GetData(), bInt8 ? Scales.GetData() : nullptr,
+				  OutIndexMap.GetData(), FrozenSubNorms.GetData(), CoreReport, CoreWs)
+			: Bank.Freeze(Rows.GetData(), bInt8 ? Scales.GetData() : nullptr,
+				  OutIndexMap.GetData(), CoreReport, CoreWs);
+		if (FreezeStatus != Status::Ok)
 		{
 			return false;
 		}
@@ -236,9 +386,25 @@ USuperFAISSVectorBank* USuperFAISSScratchBank::FreezeInternal(TArray<int32>& Out
 		FString Error;
 		// The payload is copied, not re-baked: rows were normalized/quantized at
 		// append with the importer's math, so the frozen bank is bit-identical.
-		if (!Candidate->InitFromBaked(Rows.GetData(), bInt8 ? Scales.GetData() : nullptr,
-				Live, Bank.Dims(), GetMetric(), GetQuantization(),
-				TEXT("frozen-scratch"), Error))
+		bool bInit;
+		if (ChannelCount > 0)
+		{
+			// Graduate to a schema-2 channel bank (V3-G6): the channel table + the
+			// re-derived sub-norms (empty on Dot/L2) follow the compacted rows.
+			bInit = Candidate->InitFromBaked(Rows.GetData(),
+				bInt8 ? Scales.GetData() : nullptr, Live, Bank.Dims(), GetMetric(),
+				GetQuantization(), TEXT("frozen-scratch"), Error, ChannelNamesTable,
+				ChannelOffsetsTable, ChannelLengthsTable,
+				bChannelCosine ? TConstArrayView<float>(FrozenSubNorms)
+							   : TConstArrayView<float>());
+		}
+		else
+		{
+			bInit = Candidate->InitFromBaked(Rows.GetData(),
+				bInt8 ? Scales.GetData() : nullptr, Live, Bank.Dims(), GetMetric(),
+				GetQuantization(), TEXT("frozen-scratch"), Error);
+		}
+		if (!bInit)
 		{
 			UE_LOG(LogTemp, Error, TEXT("SuperFAISSScratchBank freeze: %s"), *Error);
 			return false;
@@ -286,6 +452,10 @@ bool USuperFAISSScratchBank::LoadFromBytes(const TArray<uint8>& Bytes)
 		// stale too; a failed load keeps the bank unchanged and the cache with it.)
 		bHasRecallReport = false;
 		LastRecallReport = FSuperFAISSScratchRecallReport{};
+		// The per-channel cache describes rows a Load just replaced — drop it too, so a
+		// stale per-channel number never wears a current face across a restore.
+		bHasChannelRecallReports = false;
+		LastChannelRecallReports.Reset();
 	}
 	return bLoaded;
 }

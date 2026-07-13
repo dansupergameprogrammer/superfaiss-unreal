@@ -262,6 +262,61 @@ operator at calibration (0.9930 / 0.9885 / 0.9895 recall@10, Dot / Cosine / L2 �
 200 seeded 8-row pools over the core suite's 512×128 int8 fixtures, fixed
 recorded seed); measure per bank before adopting, as with any quantized mode.
 
+## Channel-capable scratch banks and channel-scoped analytics (v3.0)
+
+Channels — the named sub-space partition that baked banks have carried since
+v2.0 — extend to the mutable half. `InitWithChannels` sets a fixed channel table
+on a scratch bank at construction (unique names + offset/length ranges in
+logical-dims space — grid-aligned to the 16-byte element boundary, ascending,
+non-overlapping), and named `Channels` in `FSuperFAISSQueryArgs` then rank a
+scratch snapshot by a weighted
+combination of channels exactly as on a baked bank — same scores, so a scratch
+channel query and its baked twin agree bit-for-bit:
+
+```cpp
+USuperFAISSScratchBank* Mind = NewObject<USuperFAISSScratchBank>(Owner);
+Mind->InitWithChannels(/*Capacity*/ 512, Dims, ESuperFAISSBankMetric::Cosine,
+	ESuperFAISSBankQuantization::Int8,
+	/*Names*/   {TEXT("identity"), TEXT("appearance")},
+	/*Offsets*/ {0, 64}, /*Lengths*/ {64, 64}, /*bRetainFloats*/ true);
+Mind->Append(Vector, Index);   // per-channel inverse sub-norms computed at append (Cosine)
+
+FSuperFAISSQueryArgs Args;
+Args.Channels = {{TEXT("identity"), 1.0f}, {TEXT("appearance"), 0.25f}};
+Sim->QueryScratch(Mind, QueryVector, Args, Hits);   // named-channel scratch query
+Sim->DecomposeScratchHit(Mind, QueryVector, Args.Channels, Hits[0].Index,
+	Contributions, Total);      // per-channel contributions on the snapshot
+
+USuperFAISSVectorBank* Frozen = Mind->Freeze(IndexMap);  // graduates to a schema-2 channel bank
+Mind->MeasureRecallPerChannel(Reports);                  // recall@k per channel (retention banks)
+```
+
+Channel-aware `Freeze` graduates the bank to a `schemaVersion 2` channel bank,
+re-deriving the per-channel sub-norms over the compacted rows; per-channel
+recall audit reports recall@k for each channel. The whole channel surface is
+BlueprintCallable, plus `Query Similar (Scratch Channels)`.
+
+**Channel-scoped analytics** run every v2.5 analytics operator over one named
+channel's sub-range instead of the whole row — "this mind's *identity* is
+drifting but its *appearance* is stable" is a channel-scoped centroid distance
+over the identity channel versus the appearance channel:
+`SetToSetDistanceCrossDeviceChannel`, `MeanNearestNeighborCrossDeviceChannel`,
+`MaxNearestNeighborCrossDeviceChannel`, `BankSpreadCrossDeviceChannel` (BP), and
+the read-only MCP tools `SetToSetDistanceChannel` / `BankSpreadChannel`. Cosine
+channel analytics recompute the sub-range in the integer→double domain for a
+cross-device-exact reference (not the stored per-row inverse sub-norms
+(`channelInvNorms`) — a precision distinction the
+[core determinism doc](Source/ThirdParty/SuperFAISS/docs/DETERMINISM.md) §2e
+states). Cost is append-time only: the per-channel sub-norm adds ~14% to a Cosine
+int8 append at 4 channels / 256 dims (measured — see the vendored core
+[README](Source/ThirdParty/SuperFAISS/README.md)), never on the query path; the
+sub-norm arena is `channelCount × 4` bytes/row.
+
+Read-only MCP over channel scratch: `Query Scratch Bank` takes channel names,
+`Describe Scratch Bank` surfaces the per-channel recall a game-side measure
+cached, and `Lint Scratch Bank` warns on a degenerate (near-zero-energy) channel
+of a live Cosine channel scratch bank.
+
 ## The query side of the encoder seam
 
 An *encoder* is anything that turns domain state — text, images, gameplay — into a
@@ -330,18 +385,24 @@ The stripped plugin compiles and the non-demo test groups pass unchanged.
 
 ## Tests
 
-`SuperFAISS.*` automation tests (38 in this plugin; 41 with the MCP plugin enabled)
+`SuperFAISS.*` automation tests (53 in this plugin; 61 with the MCP plugin enabled)
 cover kernel correctness, SIMD/scalar mirror equality, determinism, tie-break
 stability, concurrency, asset round-trips, import rejection, quantizer recall,
 performance guards, query composition (centroid, direction, intersection, margins),
 named-channel queries and decomposition, per-row bias (both forms, snapshot
 alignment, the decomposition bias term), scratch banks (including the drain gate,
 freeze bit-identity, save/load, the recall audit, and report staleness across a
-save/load round trip), cross-device pooling (payload and hit-list equality
-against the core path, and adversarial payload rejection), the prototype
-asset's cross-device tier and version gate, bank lint analyses, prototype
-authoring, a golden semantic query on the demo bank, and the Mass swarm's
-stability (F2). Run headless:
+save/load round trip), **channel-capable scratch banks (v3.0) — construction +
+validation catalog, a named-channel scratch query proven bit-equal to its baked
+twin, per-channel decomposition, channel-aware freeze to a schema-2 bank proven by
+a brute-force query of the frozen bank, per-channel recall against the core
+measurement, and the composition set (channel scratch query × bias / cross-device /
+tombstone exclusion, zero-norm and channels+segments-mix rejection); channel-scoped
+analytics (BP and read-only MCP); the channel-scratch linter's degenerate-channel
+warning**, cross-device pooling (payload and hit-list equality against the core
+path, and adversarial payload rejection), the prototype asset's cross-device tier
+and version gate, bank lint analyses, prototype authoring, a golden semantic query
+on the demo bank, and the Mass swarm's stability (F2). Run headless:
 
 ```
 UnrealEditor-Cmd <project> -ExecCmds="Automation RunTests SuperFAISS; Quit" -unattended -nullrhi

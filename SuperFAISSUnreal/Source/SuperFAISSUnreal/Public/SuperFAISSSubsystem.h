@@ -308,6 +308,28 @@ public:
 	bool QuerySimilarCrossDevice(const USuperFAISSVectorBank* Bank,
 		const TArray<float>& Query, int32 K, TArray<FSuperFAISSHit>& Hits);
 
+	// Named-channel query over a live scratch snapshot (V3.0, plan §23.4 / §23.9 slot
+	// 5): the scratch closure of QuerySimilarChannels. Drops the QueryScratch channel
+	// guard (V3-G3) — a named-channel query on a channel-carrying scratch snapshot
+	// scores per-channel exactly as the equivalent baked channel bank; names resolve
+	// against the scratch bank's own channel table (V3-G8 / N1). A named-channel query
+	// on a single-space (channel-less) scratch bank is still rejected (no table).
+	UFUNCTION(BlueprintCallable, Category = "Similarity",
+		meta = (DisplayName = "Query Similar (Scratch Channels)"))
+	bool QuerySimilarScratchChannels(USuperFAISSScratchBank* Bank,
+		const TArray<float>& Query, const TArray<FSuperFAISSChannelWeight>& Channels,
+		int32 K, TArray<FSuperFAISSHit>& Hits);
+
+	// Per-channel decomposition over a scratch snapshot (V3.0, slot 5): the scratch
+	// closure of DecomposeHit — contributions sum to OutTotal and OutTotal equals the
+	// per-channel scan's own score for RowIndex on the snapshot.
+	UFUNCTION(BlueprintCallable, Category = "Similarity",
+		meta = (DisplayName = "Decompose Hit (Scratch)"))
+	bool DecomposeScratchHit(USuperFAISSScratchBank* Bank, const TArray<float>& Query,
+		const TArray<FSuperFAISSChannelWeight>& Channels, int32 RowIndex,
+		TArray<float>& OutContributions, float& OutTotal, float RowBias = 0.0f,
+		bool bCrossDeviceExact = false);
+
 	// Decomposition ("why did this match"): per-channel/segment contributions of one
 	// row against a segmented query; contributions sum exactly to OutTotal, and
 	// OutTotal equals the score the same query's scan produced for that row. Per-hit
@@ -478,6 +500,14 @@ public:
 	bool MeanNearestNeighborCrossDeviceScratch(USuperFAISSScratchBank* SourceBank,
 		const USuperFAISSVectorBank* TargetBank, float& OutValue);
 
+	// Directed max nearest-neighbour divergence from a scratch snapshot's live rows to
+	// a baked TargetBank (the scratch closure of MaxNearestNeighborCrossDevice; the
+	// order-free max reduction, the directed Hausdorff component).
+	UFUNCTION(BlueprintCallable, Category = "Similarity|Analytics",
+		meta = (DisplayName = "Max Nearest Neighbor (Cross-Device, Scratch Source)"))
+	bool MaxNearestNeighborCrossDeviceScratch(USuperFAISSScratchBank* SourceBank,
+		const USuperFAISSVectorBank* TargetBank, float& OutValue);
+
 	// Set-to-set centroid distance between a scratch snapshot's live rows and a baked
 	// BankB (the scratch closure of SetToSetDistanceCrossDevice).
 	UFUNCTION(BlueprintCallable, Category = "Similarity|Analytics",
@@ -485,6 +515,37 @@ public:
 	bool SetToSetDistanceCrossDeviceScratch(USuperFAISSScratchBank* BankA,
 		const USuperFAISSVectorBank* BankB, const TArray<int32>& RowIndicesB,
 		const TArray<int32>& WeightsB, ESuperFAISSBankMetric Metric, float& OutDistance);
+
+	// --- V3.0 Tier 2: channel-scoped analytics over BP (plan §23.5 / §23.9 slot 5) ---
+	// The §22 CrossDevice reductions scored over ONE named-channel sub-range instead
+	// of the whole row (Channel indexes the bank's channel table). Each wraps the
+	// vendored core *Channel operator, so the returned scalar equals a direct core
+	// call. Int8 cross-device banks carrying a channel table; a channel-less bank or a
+	// Channel outside [0, channelCount) is the mapped rejection (false). Read-only.
+
+	UFUNCTION(BlueprintCallable, Category = "Similarity|Analytics",
+		meta = (DisplayName = "Set-To-Set Distance (Cross-Device, Channel)"))
+	bool SetToSetDistanceCrossDeviceChannel(const USuperFAISSVectorBank* BankA,
+		const TArray<int32>& RowIndicesA, const TArray<int32>& WeightsA,
+		const USuperFAISSVectorBank* BankB, const TArray<int32>& RowIndicesB,
+		const TArray<int32>& WeightsB, ESuperFAISSBankMetric Metric, int32 Channel,
+		float& OutDistance);
+
+	UFUNCTION(BlueprintCallable, Category = "Similarity|Analytics",
+		meta = (DisplayName = "Mean Nearest Neighbor (Cross-Device, Channel)"))
+	bool MeanNearestNeighborCrossDeviceChannel(const USuperFAISSVectorBank* SourceBank,
+		const USuperFAISSVectorBank* TargetBank, int32 Channel, float& OutValue);
+
+	UFUNCTION(BlueprintCallable, Category = "Similarity|Analytics",
+		meta = (DisplayName = "Max Nearest Neighbor (Cross-Device, Channel)"))
+	bool MaxNearestNeighborCrossDeviceChannel(const USuperFAISSVectorBank* SourceBank,
+		const USuperFAISSVectorBank* TargetBank, int32 Channel, float& OutValue);
+
+	UFUNCTION(BlueprintCallable, Category = "Similarity|Analytics",
+		meta = (DisplayName = "Bank Spread (Cross-Device, Channel)"))
+	bool BankSpreadCrossDeviceChannel(const USuperFAISSVectorBank* Bank,
+		const TArray<int32>& RowIndices, ESuperFAISSReduce Reduce, int32 Channel,
+		float& OutValue);
 
 	// Diagnostics: workspace pool growth count (flat once warm — the B5 counter).
 	uint64 GetPoolGrowthCount() const;

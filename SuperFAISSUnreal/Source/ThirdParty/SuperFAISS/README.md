@@ -162,6 +162,19 @@ suite enforces that SIMD and mirror results are bit-identical on a device.
   result-direction convention (a `Dot` bank returns a similarity, not a distance) and
   the cosine limb's determinism condition are stated in [API.md](docs/API.md) and
   [DETERMINISM.md §2e](docs/DETERMINISM.md).
+- **Channel-capable mutable banks + channel-scoped analytics (v3.0).** A scratch bank can
+  carry a fixed channel partition set at `Create`; named-channel queries and every analytics
+  reduction run over one channel's sub-range as readily as the whole row, cross-device
+  bit-exact per channel. (For channel-scoped analytics the Cosine limb recomputes the
+  sub-range `sqrt` in the int→double domain as its full-precision reference; the per-channel
+  query path uses the bank's float32 sub-norms — both reproduce bit-for-bit across machines.)
+  Channel-aware `Freeze` and per-channel recall audit carry the capability from the mutable
+  half into the baked asset. The cost is an append-time compute one and small: the
+  per-channel inverse sub-norm adds ~14% to a Cosine int8 append at 4 channels / 256 dims
+  (~194 ns, measured); the query path reads the sub-norm arena but does no sub-norm work. The
+  arena is `channelCount × 4` bytes/row (16 B/row at 4 channels — mandatory on a Cosine
+  channel bank, ~6% of the int8 row beside it; Dot/L2 channel banks carry none).
+  [API.md](docs/API.md), [DETERMINISM.md §2e](docs/DETERMINISM.md).
 
 ## What it deliberately is not
 
