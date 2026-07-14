@@ -23,6 +23,13 @@ editor: single query **0.13 ms** (auto-parallelized across chunks — the core's
 one-core scan of the same bank is ~0.5 ms), batched **0.06 ms per query** — exact
 search, bit-deterministic, zero steady-state allocation.
 
+**New in 3.0.1:** version-header fix (the `SUPERFAISS_VERSION_*` macros now report
+3.0.1) and a zero-energy Cosine channel edge: a channel that carries no energy on a
+valid (whole-row-normalized) row now floors to a defined `0` in the NN-divergence
+reductions — consistent with the centroid/spread reductions and the documented
+contract — and the per-channel recall / freeze-with-recall audit skips such a
+sampled row instead of aborting. Bundles the MIT core library at tag `v3.0.1`.
+
 **New in 3.0:** channel-capable scratch banks and channel-scoped analytics —
 channels (the named sub-space partition baked banks have carried since 2.0) extend
 to the mutable half. `InitWithChannels` fixes a channel table on a scratch bank at
