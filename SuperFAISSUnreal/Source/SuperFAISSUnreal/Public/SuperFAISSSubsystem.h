@@ -259,8 +259,10 @@ public:
 	// (V2-G5), snapshots, and scans with the snapshot's tombstones OR'd into the
 	// exclusion set - deletion is exclusion. Refused while the bank is draining
 	// for a Grow/Freeze/Load (T-044 N4 - this is the one dispatch-point gate).
-	// Args.Channels is rejected (scratch banks carry no channel table);
-	// Args.Segments raw ranges work. Callable from any thread.
+	// Args.Channels resolves against the scratch bank's own channel table
+	// (V3.0 slot 5; the bank must have been created with InitWithChannels —
+	// a channel query on a table-less bank is rejected). Args.Segments raw
+	// ranges work. Callable from any thread.
 	bool QueryScratch(
 		USuperFAISSScratchBank* Bank,
 		TConstArrayView<float> UnpaddedQuery,

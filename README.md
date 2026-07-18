@@ -34,7 +34,16 @@ surface completes alongside it — named-channel scratch queries, per-channel sc
 recall, and the channel vocabulary surviving a save/load round trip — as do read-only
 MCP closures of the analytics reductions (spread and mean/max nearest-neighbour) over a
 live snapshot. Includes a segmented-kernel AVX2 fix (a length-4 channel could score a
-spurious `0` on the AVX2 float path). Bundles the MIT core library at tag `v3.1.1`.
+spurious `0` on the AVX2 float path). Bundles the MIT core library at tag `v3.1.2`.
+
+**New in 3.1.2:** a release-hardening point, prompted by an external review. Fixes the
+Win64 **Shipping** game build (a missing `MassEntityQuery.h` include in the demo module's
+swarm processor — Editor PCH masked the IWYU gap); scrubs stale public contracts that
+survived 3.1 (the scratch channel table is mutable via `Relabel`, and scratch channel
+queries resolve — headers, `API.md`, and `INTEGRATION.md` now say so); documents `Relabel`
+in the core API/integration docs; corrects the core version header (it still reported
+3.0.1); narrows the plugin README's portability claim to the surfaces actually verified;
+and syncs every version surface to 3.1.2.
 
 **New in 3.0.1:** version-header fix (the `SUPERFAISS_VERSION_*` macros now report
 3.0.1) and a zero-energy Cosine channel edge: a channel that carries no energy on a

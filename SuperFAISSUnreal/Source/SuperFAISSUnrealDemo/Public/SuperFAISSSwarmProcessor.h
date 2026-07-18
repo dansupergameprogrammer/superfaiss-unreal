@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "MassProcessor.h"
+#include "MassEntityQuery.h" // FMassEntityQuery held by value below; MassProcessor.h only forward-declares it (Shipping builds have no PCH to mask the omission)
 
 #include "SuperFAISSSwarmProcessor.generated.h"
 

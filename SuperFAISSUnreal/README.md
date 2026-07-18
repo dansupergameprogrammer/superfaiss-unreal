@@ -315,8 +315,11 @@ authoring library.
   (bit-identical across different machines) is the opt-in v2.2 mode above.
 - **Allocation-free once warm**: pooled workspaces, counted allocations, test-enforced.
 - **Thread-safe**: immutable banks, lock-free concurrent reads, 16-thread storm test.
-- **Every platform**: no platform code, no platform allowlist. SIMD (AVX2/SSE4.1/NEON)
-  selected automatically; NEON is CI-verified on Apple Silicon.
+- **Designed for portability**: no platform code, no platform allowlist. SIMD
+  (AVX2/SSE4.1/NEON) selected automatically. What is *verified* today: the plugin on
+  UE 5.8 Win64 (Editor + automation suite + Shipping game build); the vendored core's
+  own CI additionally covers Windows/Linux (AVX2, TSan) and Apple Silicon NEON. Other
+  UE targets should work by construction but have not been qualified.
 - Scan parallelism is configurable: `superfaiss.ParallelScan` (0 serial, 1 auto,
   2 force) and `superfaiss.ParallelScan.MinChunks`.
 
