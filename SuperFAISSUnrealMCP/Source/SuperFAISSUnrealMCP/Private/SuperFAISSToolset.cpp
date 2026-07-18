@@ -817,28 +817,7 @@ FString USuperFAISSToolset::DescribeScratchBank(const FString& ScratchBankPath)
 	{
 		return JsonError(Error);
 	}
-	const TSharedRef<FJsonObject> Object = ScratchSummary(*Bank);
-	// V3.0 (D-V3-7): SURFACE the per-channel recall a game-side MeasureRecallPerChannel
-	// cached — the MCP path never measures (Poirot #2: measuring uses the single-thread
-	// RecallWorkspace and must stay on the measuring thread, exactly as the whole-vector
-	// recallReport surfaces GetLastRecallReport, never a fresh measure). Read-only.
-	TArray<FSuperFAISSScratchRecallReport> Reports;
-	if (Bank->GetLastChannelRecallReports(Reports) && Reports.Num() > 0)
-	{
-		TArray<TSharedPtr<FJsonValue>> ChannelRecall;
-		for (const FSuperFAISSScratchRecallReport& Rep : Reports)
-		{
-			const TSharedRef<FJsonObject> Entry = MakeShared<FJsonObject>();
-			Entry->SetNumberField(TEXT("recall"), Rep.Recall);
-			Entry->SetNumberField(TEXT("k"), Rep.K);
-			Entry->SetNumberField(TEXT("sampleCount"), Rep.SampleCount);
-			Entry->SetNumberField(TEXT("liveRows"), Rep.LiveRows);
-			Entry->SetBoolField(TEXT("informative"), Rep.bInformative);
-			ChannelRecall.Add(MakeShared<FJsonValueObject>(Entry));
-		}
-		Object->SetArrayField(TEXT("channelRecall"), ChannelRecall);
-	}
-	return ToJson(Object);
+	return ToJson(ScratchSummary(*Bank));
 }
 
 FString USuperFAISSToolset::QueryScratchBank(const FString& ScratchBankPath,
@@ -886,229 +865,7 @@ FString USuperFAISSToolset::QueryScratchBank(const FString& ScratchBankPath,
 	return ToJson(Object);
 }
 
-// Set-to-set distance / directed NN divergence from a live scratch bank's snapshot to a
-// baked target (§23.3): the scratch closure of SetToSetDistance. Read-only — resolves the
-// source via FindScratchBank and the target via LoadBank, then dispatches each mode to the
-// *Scratch subsystem overloads, emitting the same scalar fields as the baked tool.
-FString USuperFAISSToolset::SetToSetDistanceScratch(const FString& ScratchBankPathA,
-	const FString& BankPathB, const TArray<int32>& RowIndicesB,
-	const FString& Metric, const FString& Mode)
-{
-	FString ErrorA;
-	USuperFAISSScratchBank* ScratchA = FindScratchBank(ScratchBankPathA, ErrorA);
-	if (ScratchA == nullptr)
-	{
-		return JsonError(ErrorA);
-	}
-	FString ErrorB;
-	USuperFAISSVectorBank* BankB = LoadBank(BankPathB, ErrorB);
-	if (BankB == nullptr)
-	{
-		return JsonError(ErrorB);
-	}
-	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
-	if (Subsystem == nullptr)
-	{
-		return JsonError(TEXT("subsystem unavailable"));
-	}
-	ESuperFAISSBankMetric MetricEnum;
-	if (!ParseMetricName(Metric, BankB->Metric, MetricEnum))
-	{
-		return JsonError(TEXT("metric must be Dot, Cosine, or L2"));
-	}
-
-	const FString ModeLower = Mode.IsEmpty() ? TEXT("all") : Mode.ToLower();
-	const bool bCentroid = ModeLower == TEXT("all") || ModeLower == TEXT("centroid");
-	const bool bMeanNN = ModeLower == TEXT("all") || ModeLower == TEXT("meannn");
-	const bool bMaxNN = ModeLower == TEXT("all") || ModeLower == TEXT("maxnn");
-	if (!bCentroid && !bMeanNN && !bMaxNN)
-	{
-		return JsonError(TEXT("mode must be centroid, meanNN, maxNN, or all"));
-	}
-
-	const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
-	Object->SetStringField(TEXT("scratchBankA"), ScratchA->GetPathName());
-	Object->SetStringField(TEXT("bankB"), BankB->GetPathName());
-
-	if (bCentroid)
-	{
-		const TArray<int32> IdxB = RowsOrAll(RowIndicesB, BankB->Count);
-		float Distance = 0.0f;
-		if (!Subsystem->SetToSetDistanceCrossDeviceScratch(ScratchA, BankB, IdxB, {},
-				MetricEnum, Distance))
-		{
-			return JsonError(
-				TEXT("centroid distance rejected (non-int8, dims mismatch, or zero-norm centroid?)"));
-		}
-		Object->SetNumberField(TEXT("centroidDistance"), Distance);
-		Object->SetStringField(TEXT("metric"), MetricName(MetricEnum));
-	}
-	if (bMeanNN)
-	{
-		float Value = 0.0f;
-		if (!Subsystem->MeanNearestNeighborCrossDeviceScratch(ScratchA, BankB, Value))
-		{
-			return JsonError(TEXT("meanNN rejected (non-int8 or dims mismatch?)"));
-		}
-		Object->SetNumberField(TEXT("meanNN"), Value);
-	}
-	if (bMaxNN)
-	{
-		float Value = 0.0f;
-		if (!Subsystem->MaxNearestNeighborCrossDeviceScratch(ScratchA, BankB, Value))
-		{
-			return JsonError(TEXT("maxNN rejected (non-int8 or dims mismatch?)"));
-		}
-		Object->SetNumberField(TEXT("maxNN"), Value);
-	}
-	return ToJson(Object);
-}
-
-// Within-bank dispersion of a live scratch bank's snapshot (§23.3): the scratch closure of
-// BankSpread. Read-only — resolves via FindScratchBank, dispatches to
-// BankSpreadCrossDeviceScratch for Mean and Max, emitting the same JSON fields.
 FString USuperFAISSToolset::BankSpreadScratch(const FString& ScratchBankPath)
-{
-	FString Error;
-	USuperFAISSScratchBank* Scratch = FindScratchBank(ScratchBankPath, Error);
-	if (Scratch == nullptr)
-	{
-		return JsonError(Error);
-	}
-	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
-	if (Subsystem == nullptr)
-	{
-		return JsonError(TEXT("subsystem unavailable"));
-	}
-	float SpreadMean = 0.0f;
-	float SpreadMax = 0.0f;
-	if (!Subsystem->BankSpreadCrossDeviceScratch(Scratch, ESuperFAISSReduce::Mean, SpreadMean) ||
-		!Subsystem->BankSpreadCrossDeviceScratch(Scratch, ESuperFAISSReduce::Max, SpreadMax))
-	{
-		return JsonError(TEXT("spread rejected (non-int8 bank or empty selection?)"));
-	}
-	const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
-	Object->SetStringField(TEXT("scratchBank"), Scratch->GetPathName());
-	Object->SetNumberField(TEXT("count"), Scratch->GetLiveCount());
-	Object->SetNumberField(TEXT("spreadMean"), SpreadMean);
-	Object->SetNumberField(TEXT("spreadMax"), SpreadMax);
-	return ToJson(Object);
-}
-
-// --- V3.0 channel-scoped analytics + channel scratch lint (plan §23.5 / §23.4, slot 5) ---
-
-FString USuperFAISSToolset::SetToSetDistanceChannel(const FString& BankPathA,
-	const FString& BankPathB, const TArray<int32>& RowIndicesA,
-	const TArray<int32>& RowIndicesB, const FString& Metric, const FString& Mode,
-	int32 Channel)
-{
-	FString ErrorA;
-	USuperFAISSVectorBank* BankA = LoadBank(BankPathA, ErrorA);
-	if (BankA == nullptr)
-	{
-		return JsonError(ErrorA);
-	}
-	FString ErrorB;
-	USuperFAISSVectorBank* BankB = LoadBank(BankPathB, ErrorB);
-	if (BankB == nullptr)
-	{
-		return JsonError(ErrorB);
-	}
-	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
-	if (Subsystem == nullptr)
-	{
-		return JsonError(TEXT("subsystem unavailable"));
-	}
-	ESuperFAISSBankMetric MetricEnum;
-	if (!ParseMetricName(Metric, BankA->Metric, MetricEnum))
-	{
-		return JsonError(TEXT("metric must be Dot, Cosine, or L2"));
-	}
-
-	const FString ModeLower = Mode.IsEmpty() ? TEXT("all") : Mode.ToLower();
-	const bool bCentroid = ModeLower == TEXT("all") || ModeLower == TEXT("centroid");
-	const bool bMeanNN = ModeLower == TEXT("all") || ModeLower == TEXT("meannn");
-	const bool bMaxNN = ModeLower == TEXT("all") || ModeLower == TEXT("maxnn");
-	if (!bCentroid && !bMeanNN && !bMaxNN)
-	{
-		return JsonError(TEXT("mode must be centroid, meanNN, maxNN, or all"));
-	}
-
-	const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
-	Object->SetStringField(TEXT("bankA"), BankA->GetPathName());
-	Object->SetStringField(TEXT("bankB"), BankB->GetPathName());
-	Object->SetNumberField(TEXT("channel"), Channel);
-
-	if (bCentroid)
-	{
-		const TArray<int32> IdxA = RowsOrAll(RowIndicesA, BankA->Count);
-		const TArray<int32> IdxB = RowsOrAll(RowIndicesB, BankB->Count);
-		float Distance = 0.0f;
-		if (!Subsystem->SetToSetDistanceCrossDeviceChannel(BankA, IdxA, {}, BankB, IdxB, {},
-				MetricEnum, Channel, Distance))
-		{
-			return JsonError(TEXT("centroid distance rejected (non-int8, dims mismatch, "
-								  "zero-norm centroid, or channel out of range?)"));
-		}
-		Object->SetNumberField(TEXT("centroidDistance"), Distance);
-		Object->SetStringField(TEXT("metric"), MetricName(MetricEnum));
-	}
-	if (bMeanNN)
-	{
-		float Value = 0.0f;
-		if (!Subsystem->MeanNearestNeighborCrossDeviceChannel(BankA, BankB, Channel, Value))
-		{
-			return JsonError(TEXT("meanNN rejected (non-int8, dims mismatch, or bad channel?)"));
-		}
-		Object->SetNumberField(TEXT("meanNN"), Value);
-	}
-	if (bMaxNN)
-	{
-		float Value = 0.0f;
-		if (!Subsystem->MaxNearestNeighborCrossDeviceChannel(BankA, BankB, Channel, Value))
-		{
-			return JsonError(TEXT("maxNN rejected (non-int8, dims mismatch, or bad channel?)"));
-		}
-		Object->SetNumberField(TEXT("maxNN"), Value);
-	}
-	return ToJson(Object);
-}
-
-FString USuperFAISSToolset::BankSpreadChannel(const FString& BankPath,
-	const TArray<int32>& RowIndices, int32 Channel)
-{
-	FString Error;
-	USuperFAISSVectorBank* Bank = LoadBank(BankPath, Error);
-	if (Bank == nullptr)
-	{
-		return JsonError(Error);
-	}
-	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
-	if (Subsystem == nullptr)
-	{
-		return JsonError(TEXT("subsystem unavailable"));
-	}
-	const TArray<int32> Idx = RowsOrAll(RowIndices, Bank->Count);
-	float SpreadMean = 0.0f;
-	float SpreadMax = 0.0f;
-	if (!Subsystem->BankSpreadCrossDeviceChannel(Bank, Idx, ESuperFAISSReduce::Mean, Channel,
-			SpreadMean) ||
-		!Subsystem->BankSpreadCrossDeviceChannel(Bank, Idx, ESuperFAISSReduce::Max, Channel,
-			SpreadMax))
-	{
-		return JsonError(TEXT("spread rejected (non-int8 bank, empty selection, or "
-							  "channel out of range?)"));
-	}
-	const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
-	Object->SetStringField(TEXT("bank"), Bank->GetPathName());
-	Object->SetNumberField(TEXT("channel"), Channel);
-	Object->SetNumberField(TEXT("count"), Idx.Num());
-	Object->SetNumberField(TEXT("spreadMean"), SpreadMean);
-	Object->SetNumberField(TEXT("spreadMax"), SpreadMax);
-	return ToJson(Object);
-}
-
-FString USuperFAISSToolset::LintScratchBank(const FString& ScratchBankPath)
 {
 	FString Error;
 	USuperFAISSScratchBank* Bank = FindScratchBank(ScratchBankPath, Error);
@@ -1116,45 +873,105 @@ FString USuperFAISSToolset::LintScratchBank(const FString& ScratchBankPath)
 	{
 		return JsonError(Error);
 	}
-	if (!Bank->IsInitialized() || Bank->GetChannelCount() == 0 ||
-		Bank->GetMetric() != ESuperFAISSBankMetric::Cosine)
+	if (!Bank->IsInitialized())
 	{
-		return JsonError(TEXT("lint requires a live Cosine channel scratch bank "
-							  "(the per-channel sub-norm floor is a Cosine property)"));
+		return JsonError(TEXT("scratch bank is not initialized"));
+	}
+	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+	if (Subsystem == nullptr)
+	{
+		return JsonError(TEXT("subsystem unavailable"));
+	}
+	float SpreadMean = 0.0f;
+	float SpreadMax = 0.0f;
+	if (!Subsystem->BankSpreadCrossDeviceScratch(Bank, ESuperFAISSReduce::Mean, SpreadMean) ||
+		!Subsystem->BankSpreadCrossDeviceScratch(Bank, ESuperFAISSReduce::Max, SpreadMax))
+	{
+		return JsonError(
+			TEXT("spread rejected (non-int8 bank, empty snapshot, or bank draining?)"));
+	}
+	const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+	Object->SetStringField(TEXT("scratchBank"), Bank->GetPathName());
+	Object->SetNumberField(TEXT("liveCount"), Bank->GetLiveCount());
+	Object->SetNumberField(TEXT("spreadMean"), SpreadMean);
+	Object->SetNumberField(TEXT("spreadMax"), SpreadMax);
+	return ToJson(Object);
+}
+
+FString USuperFAISSToolset::SetToSetDistanceScratch(const FString& ScratchBankPathA,
+	const FString& BankPathB, const TArray<int32>& RowIndicesB, const FString& Metric,
+	const FString& Mode)
+{
+	FString ErrorA;
+	USuperFAISSScratchBank* BankA = FindScratchBank(ScratchBankPathA, ErrorA);
+	if (BankA == nullptr)
+	{
+		return JsonError(ErrorA);
+	}
+	if (!BankA->IsInitialized())
+	{
+		return JsonError(TEXT("scratch bank is not initialized"));
+	}
+	FString ErrorB;
+	USuperFAISSVectorBank* BankB = LoadBank(BankPathB, ErrorB);
+	if (BankB == nullptr)
+	{
+		return JsonError(ErrorB);
+	}
+	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+	if (Subsystem == nullptr)
+	{
+		return JsonError(TEXT("subsystem unavailable"));
+	}
+	ESuperFAISSBankMetric MetricEnum;
+	if (!ParseMetricName(Metric, BankA->GetMetric(), MetricEnum))
+	{
+		return JsonError(TEXT("metric must be Dot, Cosine, or L2"));
 	}
 
-	// The snapshot + per-channel sub-norm scan runs in the plugin module (where the core
-	// Snapshot symbol is linked); the MCP tool only shapes the result.
-	TArray<int32> ZeroCount;
-	int32 LiveRows = 0;
-	if (!Bank->ScanChannelDegeneracy(ZeroCount, LiveRows))
+	const FString ModeLower = Mode.IsEmpty() ? TEXT("all") : Mode.ToLower();
+	const bool bCentroid = ModeLower == TEXT("all") || ModeLower == TEXT("centroid");
+	const bool bMeanNN = ModeLower == TEXT("all") || ModeLower == TEXT("meannn");
+	const bool bMaxNN = ModeLower == TEXT("all") || ModeLower == TEXT("maxnn");
+	if (!bCentroid && !bMeanNN && !bMaxNN)
 	{
-		return JsonError(TEXT("scratch channel scan failed"));
-	}
-	const int32 ChannelCount = ZeroCount.Num();
-	const TConstArrayView<FName> Names = Bank->GetChannelNames();
-
-	TArray<TSharedPtr<FJsonValue>> Degenerate;
-	TArray<TSharedPtr<FJsonValue>> Weak;
-	for (int32 C = 0; C < ChannelCount; ++C)
-	{
-		const FString Name = (C < Names.Num()) ? Names[C].ToString() : FString::FromInt(C);
-		if (LiveRows > 0 && ZeroCount[C] * 2 > LiveRows)
-		{
-			// A majority of live rows carry no energy in this channel — degenerate.
-			Degenerate.Add(MakeShared<FJsonValueString>(Name));
-		}
-		else if (ZeroCount[C] > 0)
-		{
-			// Some rows are degenerate in this channel — a weaker warning.
-			Weak.Add(MakeShared<FJsonValueString>(Name));
-		}
+		return JsonError(TEXT("mode must be centroid, meanNN, maxNN, or all"));
 	}
 
 	const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
-	Object->SetStringField(TEXT("scratchBank"), Bank->GetPathName());
-	Object->SetNumberField(TEXT("liveRows"), LiveRows);
-	Object->SetArrayField(TEXT("degenerateChannels"), Degenerate);
-	Object->SetArrayField(TEXT("weakChannels"), Weak);
+	Object->SetStringField(TEXT("scratchBankA"), BankA->GetPathName());
+	Object->SetStringField(TEXT("bankB"), BankB->GetPathName());
+
+	if (bCentroid)
+	{
+		const TArray<int32> IdxB = RowsOrAll(RowIndicesB, BankB->Count);
+		float Distance = 0.0f;
+		if (!Subsystem->SetToSetDistanceCrossDeviceScratch(BankA, BankB, IdxB, {},
+				MetricEnum, Distance))
+		{
+			return JsonError(
+				TEXT("centroid distance rejected (non-int8, dims mismatch, empty snapshot, or zero-norm centroid?)"));
+		}
+		Object->SetNumberField(TEXT("centroidDistance"), Distance);
+		Object->SetStringField(TEXT("metric"), MetricName(MetricEnum));
+	}
+	if (bMeanNN)
+	{
+		float Value = 0.0f;
+		if (!Subsystem->MeanNearestNeighborCrossDeviceScratch(BankA, BankB, Value))
+		{
+			return JsonError(TEXT("meanNN rejected (non-int8, dims mismatch, or empty snapshot?)"));
+		}
+		Object->SetNumberField(TEXT("meanNN"), Value);
+	}
+	if (bMaxNN)
+	{
+		float Value = 0.0f;
+		if (!Subsystem->MaxNearestNeighborCrossDeviceScratch(BankA, BankB, Value))
+		{
+			return JsonError(TEXT("maxNN rejected (non-int8, dims mismatch, or empty snapshot?)"));
+		}
+		Object->SetNumberField(TEXT("maxNN"), Value);
+	}
 	return ToJson(Object);
 }

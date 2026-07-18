@@ -40,6 +40,80 @@ namespace
 			return true;
 		}
 	};
+
+	// The host-side channel-name frame (Poirot S2). The core scratch archive carries the
+	// channel table's element RANGES but not the host FName vocabulary — the core never
+	// sees names — so a save/load round trip would restore the core channels with an empty
+	// host name list, and every named-channel query on the loaded bank would miss. The
+	// plugin appends this frame AFTER the core archive: the core Load reads exactly the
+	// archive and stops, so a legacy (frame-less) blob loads unchanged and a new blob loads
+	// unchanged in an older plugin (the trailing frame is ignored) — back-compatible both
+	// ways. Format: int32 count, then per channel { int32 utf8-len, utf8 bytes, int32
+	// offset, int32 length }.
+	void WriteI32(TArray<uint8>& Out, int32 V)
+	{
+		Out.Append(reinterpret_cast<const uint8*>(&V), sizeof(int32));
+	}
+
+	void WriteChannelFrame(TArray<uint8>& Out, const TArray<FName>& Names,
+		const TArray<int32>& Offsets, const TArray<int32>& Lengths)
+	{
+		WriteI32(Out, Names.Num());
+		for (int32 C = 0; C < Names.Num(); ++C)
+		{
+			const FString S = Names[C].ToString();
+			const FTCHARToUTF8 Utf8(*S);
+			WriteI32(Out, Utf8.Length());
+			Out.Append(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length());
+			WriteI32(Out, Offsets[C]);
+			WriteI32(Out, Lengths[C]);
+		}
+	}
+
+	bool ReadI32(FByteReader& R, int32& OutV)
+	{
+		return FByteReader::Read(&R, &OutV, sizeof(int32));
+	}
+
+	// Parses the frame into temporaries; returns false (adopting nothing) on any short or
+	// malformed read, so a corrupt trailer degrades to a name-less load rather than a crash.
+	bool ReadChannelFrame(FByteReader& R, TArray<FName>& OutNames,
+		TArray<int32>& OutOffsets, TArray<int32>& OutLengths)
+	{
+		int32 Count = 0;
+		if (!ReadI32(R, Count) || Count < 0 || Count > superfaiss::kMaxChannels)
+		{
+			return false;
+		}
+		OutNames.Reset();
+		OutOffsets.Reset();
+		OutLengths.Reset();
+		for (int32 C = 0; C < Count; ++C)
+		{
+			int32 Len = 0;
+			if (!ReadI32(R, Len) || Len < 0 || Len > 65536)
+			{
+				return false;
+			}
+			TArray<uint8> Buf;
+			Buf.SetNumUninitialized(Len + 1);
+			if (Len > 0 && !FByteReader::Read(&R, Buf.GetData(), Len))
+			{
+				return false;
+			}
+			Buf[Len] = 0;
+			int32 Offset = 0;
+			int32 Length = 0;
+			if (!ReadI32(R, Offset) || !ReadI32(R, Length))
+			{
+				return false;
+			}
+			OutNames.Add(FName(UTF8_TO_TCHAR(reinterpret_cast<const char*>(Buf.GetData()))));
+			OutOffsets.Add(Offset);
+			OutLengths.Add(Length);
+		}
+		return true;
+	}
 } // namespace
 
 bool USuperFAISSScratchBank::Init(int32 Capacity, int32 Dims,
@@ -48,6 +122,138 @@ bool USuperFAISSScratchBank::Init(int32 Capacity, int32 Dims,
 {
 	return Bank.Create(Capacity, Dims, ToCoreMetric(Metric), ToCoreQuant(Quantization),
 			   bRetainFloats) == superfaiss::Status::Ok;
+}
+
+bool USuperFAISSScratchBank::InitWithChannels(int32 Capacity, int32 Dims,
+	ESuperFAISSBankMetric Metric, ESuperFAISSBankQuantization Quantization,
+	const TArray<FName>& InChannelNames,
+	const TArray<int32>& InChannelOffsets,
+	const TArray<int32>& InChannelLengths,
+	bool bRetainFloats)
+{
+	// Parallel-array agreement is a host-side contract — the core never sees the
+	// names, so a mismatched Names/Offsets/Lengths table is a defined rejection here,
+	// before anything is allocated (mirrors the baked RebuildChannelTable refusal).
+	if (InChannelNames.Num() != InChannelOffsets.Num() ||
+		InChannelNames.Num() != InChannelLengths.Num())
+	{
+		return false;
+	}
+	// Duplicate names would make GetChannelIndex ambiguous — also host-side, also
+	// rejected before allocation.
+	for (int32 A = 0; A < InChannelNames.Num(); ++A)
+	{
+		for (int32 B = A + 1; B < InChannelNames.Num(); ++B)
+		{
+			if (InChannelNames[A] == InChannelNames[B])
+			{
+				return false;
+			}
+		}
+	}
+
+	// Build the core-facing channel table (padded-grid ranges), mirroring the baked
+	// bank's RebuildChannelTable: a channel ending at Dims extends across the zero
+	// pad lanes so its stored range stays on the element grid (pads contribute
+	// nothing). Range validity — in-bounds, ascending, non-overlapping, on the
+	// 16-byte element grid, count in [1, kMaxChannels] — is the core Create's
+	// contract; a malformed range fails there and leaves the bank uncreated.
+	const int32 PaddedDims = superfaiss::PaddedDims(Dims, ToCoreQuant(Quantization));
+	TArray<superfaiss::ChannelInfo> Table;
+	Table.Reserve(InChannelNames.Num());
+	for (int32 C = 0; C < InChannelNames.Num(); ++C)
+	{
+		superfaiss::ChannelInfo Info;
+		Info.offset = InChannelOffsets[C];
+		Info.length = (InChannelOffsets[C] + InChannelLengths[C] == Dims)
+			? PaddedDims - InChannelOffsets[C]
+			: InChannelLengths[C];
+		Table.Add(Info);
+	}
+
+	const superfaiss::ChannelInfo* Channels = Table.Num() > 0 ? Table.GetData() : nullptr;
+	if (Bank.Create(Capacity, Dims, ToCoreMetric(Metric), ToCoreQuant(Quantization),
+			Channels, Table.Num(), bRetainFloats) != superfaiss::Status::Ok)
+	{
+		return false;
+	}
+
+	// Store the host-side vocabulary only after a successful create — a rejected
+	// table leaves the bank uninitialized and channel-less (reject-over-degrade,
+	// the posture Init and LoadFromBytes hold elsewhere on this class).
+	ChannelNames = InChannelNames;
+	ChannelOffsets = InChannelOffsets;
+	ChannelLengths = InChannelLengths;
+	return true;
+}
+
+bool USuperFAISSScratchBank::Relabel(const TArray<FName>& InChannelNames,
+	const TArray<int32>& InChannelOffsets, const TArray<int32>& InChannelLengths)
+{
+	if (!Bank.IsCreated())
+	{
+		return false;
+	}
+	// Host-side table validation, identical to InitWithChannels: the core never sees the
+	// names, so a mismatched Names/Offsets/Lengths table or a duplicate name is a defined
+	// rejection here — evaluated BEFORE the drain, so a malformed request never disturbs
+	// live readers. An empty table is legal: it demotes the bank to single-space.
+	if (InChannelNames.Num() != InChannelOffsets.Num() ||
+		InChannelNames.Num() != InChannelLengths.Num())
+	{
+		return false;
+	}
+	for (int32 A = 0; A < InChannelNames.Num(); ++A)
+	{
+		for (int32 B = A + 1; B < InChannelNames.Num(); ++B)
+		{
+			if (InChannelNames[A] == InChannelNames[B])
+			{
+				return false;
+			}
+		}
+	}
+
+	// Build the core-facing channel table on the padded grid, mirroring InitWithChannels
+	// (a channel ending at Dims extends across the zero pad lanes). Range validity —
+	// in-bounds, ascending, non-overlapping, on the 16-byte element grid — is the core
+	// Relabel's contract; a malformed range fails there, reject-over-degrade, leaving the
+	// bank under the old table.
+	const int32 Dims = Bank.Dims();
+	const int32 PaddedDims = superfaiss::PaddedDims(Dims, Bank.GetQuantization());
+	TArray<superfaiss::ChannelInfo> Table;
+	Table.Reserve(InChannelNames.Num());
+	for (int32 C = 0; C < InChannelNames.Num(); ++C)
+	{
+		superfaiss::ChannelInfo Info;
+		Info.offset = InChannelOffsets[C];
+		Info.length = (InChannelOffsets[C] + InChannelLengths[C] == Dims)
+			? PaddedDims - InChannelOffsets[C]
+			: InChannelLengths[C];
+		Table.Add(Info);
+	}
+
+	// Relabel is EXCLUSIVE (drains readers, refuses new pins) like Grow/Load; the core
+	// applies the swap reject-over-degrade and advances the generation on success.
+	const superfaiss::ChannelInfo* Channels = Table.Num() > 0 ? Table.GetData() : nullptr;
+	return DrainAndRun([this, Channels, &Table, &InChannelNames, &InChannelOffsets,
+						   &InChannelLengths]() {
+		if (Bank.Relabel(Channels, Table.Num()) != superfaiss::Status::Ok)
+		{
+			return false;
+		}
+		// Adopt the host-side vocabulary INSIDE the exclusive window, published by the
+		// same EndExclusive/TryPin seq_cst pairing that publishes the core table swap
+		// (Poirot C1). The host name list (`GetChannelIndex` reads it on the reader
+		// side) and the core channel table are two objects that must move as one; doing
+		// it here means no pinned reader ever observes host names skewed against the core
+		// table. A rejected relabel returns above, leaving the old names in place
+		// (reject-over-degrade); a demote (empty table) clears them.
+		ChannelNames = InChannelNames;
+		ChannelOffsets = InChannelOffsets;
+		ChannelLengths = InChannelLengths;
+		return true;
+	});
 }
 
 void USuperFAISSScratchBank::FillReport(
@@ -92,6 +298,43 @@ bool USuperFAISSScratchBank::MeasureRecall(FSuperFAISSScratchRecallReport& OutRe
 	return true;
 }
 
+bool USuperFAISSScratchBank::MeasureRecallPerChannel(
+	TArray<FSuperFAISSScratchRecallReport>& OutReports)
+{
+	OutReports.Reset();
+	const int32 ChannelCount = ChannelNames.Num();
+	if (!Bank.IsCreated() || !Bank.RetainsFloats() || ChannelCount <= 0)
+	{
+		// The core's InvalidArgument, mapped: a non-retention bank has no reference to
+		// audit, and a channel-less bank has nothing to scope per channel (MeasureRecall
+		// is its surface). A defined rejection, never a guessed number.
+		return false;
+	}
+	// The N4 posture: refuse while a drain-requiring operation is waiting, like any
+	// query dispatch. The pin is released before the core call — the core takes its own
+	// reader pin for the sweep's flight; holding ours across it would deadlock a drain
+	// that starts in between (the MeasureRecall idiom).
+	if (!Bank.TryPinReader())
+	{
+		return false;
+	}
+	Bank.UnpinReader();
+
+	TArray<superfaiss::ScratchRecallReport> CoreReports;
+	CoreReports.SetNum(ChannelCount);
+	if (Bank.MeasureScratchRecallPerChannel(RecallWorkspace, CoreReports.GetData(),
+			ChannelCount) != superfaiss::Status::Ok)
+	{
+		return false;
+	}
+	OutReports.SetNum(ChannelCount);
+	for (int32 C = 0; C < ChannelCount; ++C)
+	{
+		FillReport(CoreReports[C], OutReports[C]);
+	}
+	return true;
+}
+
 bool USuperFAISSScratchBank::GetLastRecallReport(
 	FSuperFAISSScratchRecallReport& OutReport, bool& bOutStale) const
 {
@@ -103,140 +346,6 @@ bool USuperFAISSScratchBank::GetLastRecallReport(
 	}
 	OutReport = LastRecallReport;
 	bOutStale = IsRecallReportStale(LastRecallReport);
-	return true;
-}
-
-bool USuperFAISSScratchBank::InitWithChannels(int32 Capacity, int32 Dims,
-	ESuperFAISSBankMetric Metric, ESuperFAISSBankQuantization Quantization,
-	const TArray<FName>& InChannelNames, const TArray<int32>& InChannelOffsets,
-	const TArray<int32>& InChannelLengths, bool bRetainFloats)
-{
-	if (Bank.IsCreated())
-	{
-		return false; // re-init is rejected — the channel vocabulary is fixed for life
-	}
-	const int32 ChannelCount = InChannelNames.Num();
-	if (ChannelCount <= 0 || ChannelCount > superfaiss::kMaxChannels ||
-		InChannelOffsets.Num() != ChannelCount || InChannelLengths.Num() != ChannelCount)
-	{
-		return false; // parallel arrays must agree; count in [1, kMaxChannels]
-	}
-	// Name-uniqueness is a plugin-side rule (names are host-side, V3-G8); the core
-	// validates the offset/length table (in-bounds, ascending, non-overlapping, grid).
-	TSet<FName> Seen;
-	for (const FName& Name : InChannelNames)
-	{
-		bool bAlreadyPresent = false;
-		Seen.Add(Name, &bAlreadyPresent);
-		if (bAlreadyPresent)
-		{
-			return false;
-		}
-	}
-	superfaiss::ChannelInfo Channels[superfaiss::kMaxChannels] = {};
-	for (int32 c = 0; c < ChannelCount; ++c)
-	{
-		Channels[c].offset = InChannelOffsets[c];
-		Channels[c].length = InChannelLengths[c];
-	}
-	if (Bank.Create(Capacity, Dims, ToCoreMetric(Metric), ToCoreQuant(Quantization),
-			Channels, ChannelCount, bRetainFloats) != superfaiss::Status::Ok)
-	{
-		return false; // core InvalidArgument on a malformed table — the bank is untouched
-	}
-	ChannelNamesTable = InChannelNames;
-	ChannelOffsetsTable = InChannelOffsets;
-	ChannelLengthsTable = InChannelLengths;
-	return true;
-}
-
-bool USuperFAISSScratchBank::MeasureRecallPerChannel(
-	TArray<FSuperFAISSScratchRecallReport>& OutReports)
-{
-	OutReports.Reset();
-	const int32 ChannelCount = GetChannelCount();
-	if (!Bank.IsCreated() || !Bank.RetainsFloats() || ChannelCount <= 0)
-	{
-		// Core InvalidArgument, mapped: a non-retention bank has no reference to audit,
-		// a non-channel bank has no per-channel ranges — a defined rejection.
-		return false;
-	}
-	// Same N4 posture as MeasureRecall: refuse while a drain-requiring op is waiting;
-	// release our pin before the core call (it takes its own for the sweep's flight).
-	if (!Bank.TryPinReader())
-	{
-		return false;
-	}
-	Bank.UnpinReader();
-
-	TArray<superfaiss::ScratchRecallReport> Core;
-	Core.SetNum(ChannelCount);
-	if (Bank.MeasureScratchRecallPerChannel(RecallWorkspace, Core.GetData(), ChannelCount) !=
-		superfaiss::Status::Ok)
-	{
-		return false;
-	}
-	OutReports.SetNum(ChannelCount);
-	for (int32 c = 0; c < ChannelCount; ++c)
-	{
-		FillReport(Core[c], OutReports[c]);
-	}
-	// Cache for the read-only describe surface (Poirot #2): the MCP path surfaces these,
-	// it does not re-measure (which would race the single-thread RecallWorkspace).
-	LastChannelRecallReports = OutReports;
-	bHasChannelRecallReports = true;
-	return true;
-}
-
-bool USuperFAISSScratchBank::ScanChannelDegeneracy(
-	TArray<int32>& OutZeroCounts, int32& OutLiveRows)
-{
-	using namespace superfaiss;
-	OutZeroCounts.Reset();
-	OutLiveRows = 0;
-	const int32 ChannelCount = GetChannelCount();
-	if (!Bank.IsCreated() || ChannelCount == 0)
-	{
-		return false;
-	}
-	// Hold a reader pin across the ENTIRE view use (Poirot #1): the snapshot's
-	// channelInvNorms point into the live arena, and the pin is what refuses a
-	// concurrent Grow/Freeze/Load that would reallocate it out from under this scan.
-	// A bank draining for an exclusive op refuses the pin — a defined, safe failure.
-	if (!Bank.TryPinReader())
-	{
-		return false;
-	}
-	ON_SCOPE_EXIT { Bank.UnpinReader(); };
-	TArray<uint32> Tombstones;
-	Tombstones.SetNumZeroed(ScratchBank::TombstoneWords(Bank.Capacity()));
-	BankView View;
-	if (Bank.Snapshot(&View, Tombstones.GetData()) != Status::Ok)
-	{
-		return false;
-	}
-	OutZeroCounts.SetNumZeroed(ChannelCount);
-	// A Dot/L2 channel bank carries no sub-norm arena: a successful scan with no
-	// degeneracy (the floor is a Cosine property), not a failure.
-	if (View.channelInvNorms == nullptr || View.channelCount != ChannelCount)
-	{
-		return true;
-	}
-	for (int32 R = 0; R < View.count; ++R)
-	{
-		if ((Tombstones[R >> 5] & (1u << (R & 31))) != 0)
-		{
-			continue; // removed row — neither sampled nor counted
-		}
-		++OutLiveRows;
-		for (int32 C = 0; C < ChannelCount; ++C)
-		{
-			if (View.channelInvNorms[static_cast<int64>(R) * ChannelCount + C] == 0.0f)
-			{
-				++OutZeroCounts[C];
-			}
-		}
-	}
 	return true;
 }
 
@@ -356,24 +465,8 @@ USuperFAISSVectorBank* USuperFAISSScratchBank::FreezeInternal(TArray<int32>& Out
 			Scales.SetNumZeroed(Live);
 		}
 		OutIndexMap.SetNumUninitialized(Count);
-
-		// V3.0: a channel Cosine bank re-derives its per-channel sub-norms over the
-		// compacted rows through the channel-aware core Freeze; Dot/L2 (channel or not)
-		// use the base Freeze. The graduated bank is schema-2 when channels are present.
-		const int32 ChannelCount = GetChannelCount();
-		const bool bChannelCosine =
-			ChannelCount > 0 && GetMetric() == ESuperFAISSBankMetric::Cosine;
-		TArray<float> FrozenSubNorms;
-		if (bChannelCosine)
-		{
-			FrozenSubNorms.SetNumZeroed(static_cast<int64>(Live) * ChannelCount);
-		}
-		const Status FreezeStatus = bChannelCosine
-			? Bank.Freeze(Rows.GetData(), bInt8 ? Scales.GetData() : nullptr,
-				  OutIndexMap.GetData(), FrozenSubNorms.GetData(), CoreReport, CoreWs)
-			: Bank.Freeze(Rows.GetData(), bInt8 ? Scales.GetData() : nullptr,
-				  OutIndexMap.GetData(), CoreReport, CoreWs);
-		if (FreezeStatus != Status::Ok)
+		if (Bank.Freeze(Rows.GetData(), bInt8 ? Scales.GetData() : nullptr,
+				OutIndexMap.GetData(), CoreReport, CoreWs) != Status::Ok)
 		{
 			return false;
 		}
@@ -386,25 +479,9 @@ USuperFAISSVectorBank* USuperFAISSScratchBank::FreezeInternal(TArray<int32>& Out
 		FString Error;
 		// The payload is copied, not re-baked: rows were normalized/quantized at
 		// append with the importer's math, so the frozen bank is bit-identical.
-		bool bInit;
-		if (ChannelCount > 0)
-		{
-			// Graduate to a schema-2 channel bank (V3-G6): the channel table + the
-			// re-derived sub-norms (empty on Dot/L2) follow the compacted rows.
-			bInit = Candidate->InitFromBaked(Rows.GetData(),
-				bInt8 ? Scales.GetData() : nullptr, Live, Bank.Dims(), GetMetric(),
-				GetQuantization(), TEXT("frozen-scratch"), Error, ChannelNamesTable,
-				ChannelOffsetsTable, ChannelLengthsTable,
-				bChannelCosine ? TConstArrayView<float>(FrozenSubNorms)
-							   : TConstArrayView<float>());
-		}
-		else
-		{
-			bInit = Candidate->InitFromBaked(Rows.GetData(),
-				bInt8 ? Scales.GetData() : nullptr, Live, Bank.Dims(), GetMetric(),
-				GetQuantization(), TEXT("frozen-scratch"), Error);
-		}
-		if (!bInit)
+		if (!Candidate->InitFromBaked(Rows.GetData(), bInt8 ? Scales.GetData() : nullptr,
+				Live, Bank.Dims(), GetMetric(), GetQuantization(),
+				TEXT("frozen-scratch"), Error))
 		{
 			UE_LOG(LogTemp, Error, TEXT("SuperFAISSScratchBank freeze: %s"), *Error);
 			return false;
@@ -428,7 +505,13 @@ bool USuperFAISSScratchBank::SaveToBytes(TArray<uint8>& OutBytes) const
 	superfaiss::ScratchArchive Archive;
 	Archive.write = &FByteWriter::Write;
 	Archive.user = &Writer;
-	return Bank.Save(Archive) == superfaiss::Status::Ok;
+	if (Bank.Save(Archive) != superfaiss::Status::Ok)
+	{
+		return false;
+	}
+	// Append the host-side channel-name frame the core archive cannot carry (Poirot S2).
+	WriteChannelFrame(OutBytes, ChannelNames, ChannelOffsets, ChannelLengths);
+	return true;
 }
 
 bool USuperFAISSScratchBank::LoadFromBytes(const TArray<uint8>& Bytes)
@@ -441,7 +524,34 @@ bool USuperFAISSScratchBank::LoadFromBytes(const TArray<uint8>& Bytes)
 		superfaiss::ScratchArchive Archive;
 		Archive.read = &FByteReader::Read;
 		Archive.user = &Reader;
-		return Bank.Load(Archive) == superfaiss::Status::Ok;
+		if (Bank.Load(Archive) != superfaiss::Status::Ok)
+		{
+			return false;
+		}
+		// The core Load succeeded and replaced the rows; the pre-load host vocabulary is
+		// now stale, so it is cleared and repopulated from the appended frame (Poirot S2).
+		// The core reader stopped exactly at the archive end, so anything left is the
+		// frame; a legacy (frame-less) blob leaves the loaded bank host-channel-less, and
+		// a malformed or count-mismatched frame is ignored rather than half-adopted. Done
+		// inside the exclusive window so the host names publish with the loaded core table
+		// (the Poirot C1 discipline), never observed skewed by a pinned reader.
+		ChannelNames.Reset();
+		ChannelOffsets.Reset();
+		ChannelLengths.Reset();
+		if (Reader.Pos < Bytes.Num())
+		{
+			TArray<FName> Names;
+			TArray<int32> Offsets;
+			TArray<int32> Lengths;
+			if (ReadChannelFrame(Reader, Names, Offsets, Lengths) &&
+				Names.Num() == Bank.GetChannelCount())
+			{
+				ChannelNames = MoveTemp(Names);
+				ChannelOffsets = MoveTemp(Offsets);
+				ChannelLengths = MoveTemp(Lengths);
+			}
+		}
+		return true;
 	});
 	if (bLoaded)
 	{
@@ -452,10 +562,6 @@ bool USuperFAISSScratchBank::LoadFromBytes(const TArray<uint8>& Bytes)
 		// stale too; a failed load keeps the bank unchanged and the cache with it.)
 		bHasRecallReport = false;
 		LastRecallReport = FSuperFAISSScratchRecallReport{};
-		// The per-channel cache describes rows a Load just replaced — drop it too, so a
-		// stale per-channel number never wears a current face across a restore.
-		bHasChannelRecallReports = false;
-		LastChannelRecallReports.Reset();
 	}
 	return bLoaded;
 }

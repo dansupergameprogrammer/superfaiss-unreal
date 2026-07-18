@@ -23,6 +23,19 @@ editor: single query **0.13 ms** (auto-parallelized across chunks — the core's
 one-core scan of the same bank is ~0.5 ms), batched **0.06 ms per query** — exact
 search, bit-deterministic, zero steady-state allocation.
 
+**New in 3.1:** a runtime-mutable channel vocabulary. `Relabel` re-partitions the
+channel table on a live scratch bank — add or remove channels, change their count
+*and* boundaries, or promote a single-space bank to channels and demote it back —
+without a rebuild. The rows are unchanged; only the partition moves. It is exclusive
+like `Grow`/`Load` (it drains in-flight queries) and reject-over-degrade (a malformed
+table leaves the bank exactly as it was), and a relabeled bank scores identically to a
+fresh bank created under the new table over the same rows. The Blueprint channel-scratch
+surface completes alongside it — named-channel scratch queries, per-channel scratch
+recall, and the channel vocabulary surviving a save/load round trip — as do read-only
+MCP closures of the analytics reductions (spread and mean/max nearest-neighbour) over a
+live snapshot. Includes a segmented-kernel AVX2 fix (a length-4 channel could score a
+spurious `0` on the AVX2 float path). Bundles the MIT core library at tag `v3.1`.
+
 **New in 3.0.1:** version-header fix (the `SUPERFAISS_VERSION_*` macros now report
 3.0.1) and a zero-energy Cosine channel edge: a channel that carries no energy on a
 valid (whole-row-normalized) row now floors to a defined `0` in the NN-divergence

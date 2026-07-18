@@ -129,25 +129,6 @@ public:
 		const FString& InSourceHash,
 		FString& OutError);
 
-	// Channel-aware baked-init (V3.0, plan section 23.4): graduates a channel scratch
-	// bank's Freeze output to a schemaVersion 2 channel bank. As InitFromBaked above,
-	// plus the channel table (names + logical offsets/lengths) and the per-channel
-	// inverse sub-norms the core Freeze RE-DERIVED over the compacted rows (accepted,
-	// not recomputed — empty for Dot/L2 channel banks). Content validation still runs.
-	bool InitFromBaked(
-		const void* BakedRows,
-		const float* BakedScales,
-		int32 InCount,
-		int32 InDims,
-		ESuperFAISSBankMetric InMetric,
-		ESuperFAISSBankQuantization InQuantization,
-		const FString& InSourceHash,
-		FString& OutError,
-		TConstArrayView<FName> InChannelNames,
-		TConstArrayView<int32> InChannelOffsets,
-		TConstArrayView<int32> InChannelLengths,
-		TConstArrayView<float> InChannelInvNorms);
-
 	UFUNCTION(BlueprintPure, Category = "Bank")
 	int32 GetChannelCount() const { return ChannelNames.Num(); }
 

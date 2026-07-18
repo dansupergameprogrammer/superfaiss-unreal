@@ -80,6 +80,46 @@ public:
 	bool Init(int32 Capacity, int32 Dims, ESuperFAISSBankMetric Metric,
 		ESuperFAISSBankQuantization Quantization, bool bRetainFloats = false);
 
+	// V3.0 slot 5 (T-099): channel-carrying init — the scratch-bank sibling of the
+	// baked bank's InitFromSource channel carry. Stores the host-side channel table
+	// (Names/Offsets/Lengths, dims-space ranges) and allocates through the core
+	// channel Create overload so named-channel scratch queries resolve against this
+	// bank's own vocabulary. BP cannot overload Init by name, so this is a distinct
+	// entry point mirroring the baked-path convention. Offsets/Lengths are parallel
+	// to Names; a malformed table (mismatched lengths, out-of-range ranges) is a
+	// defined rejection. Fails on a re-init, like Init.
+	UFUNCTION(BlueprintCallable, Category = "Similarity|Scratch")
+	bool InitWithChannels(int32 Capacity, int32 Dims, ESuperFAISSBankMetric Metric,
+		ESuperFAISSBankQuantization Quantization,
+		const TArray<FName>& InChannelNames,
+		const TArray<int32>& InChannelOffsets,
+		const TArray<int32>& InChannelLengths,
+		bool bRetainFloats = false);
+
+	// Channel count carried by this bank; 0 for a single-space (channel-less) bank.
+	UFUNCTION(BlueprintPure, Category = "Similarity|Scratch")
+	int32 GetChannelCount() const { return ChannelNames.Num(); }
+
+	// Channel index by name, or INDEX_NONE — mirrors the baked bank's GetChannelIndex.
+	UFUNCTION(BlueprintPure, Category = "Similarity|Scratch")
+	int32 GetChannelIndex(FName Name) const { return ChannelNames.IndexOfByKey(Name); }
+
+	// Mutable channel vocabulary (V3.1 slot 4, T-099): atomically re-partition the
+	// channel table on a LIVE bank — add/remove channels, change count AND boundaries,
+	// or promote (channel-less -> channels) / demote (channels -> single-space, an
+	// empty table) — without a rebuild. The rows are unchanged (channels are sub-ranges
+	// over the same dims); only the partition moves. EXCLUSIVE like Grow/Load: drains
+	// in-flight queries, refuses new pins while it waits, and advances the generation so
+	// a pre-relabel recall report reads stale. Reject-over-degrade: a malformed table
+	// (mismatched Names/Offsets/Lengths, duplicate names, or a range the core rejects)
+	// or an arena realloc failure leaves the bank EXACTLY as before under the old table,
+	// host-side names included. On a Cosine bank the per-channel sub-norm arena is
+	// re-derived under the new table, so a relabeled bank scores identically to a fresh
+	// InitWithChannels+Append of the same rows. An empty table demotes to single-space.
+	UFUNCTION(BlueprintCallable, Category = "Similarity|Scratch")
+	bool Relabel(const TArray<FName>& InChannelNames,
+		const TArray<int32>& InChannelOffsets, const TArray<int32>& InChannelLengths);
+
 	// Validates like the importer (finite values, dims match); Cosine banks
 	// normalize on append and reject zero-norm rows; int8 banks quantize the row
 	// standalone. Returns false with the capacity exhausted — Grow to proceed.
@@ -138,6 +178,19 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Similarity|Scratch")
 	bool MeasureRecall(FSuperFAISSScratchRecallReport& OutReport);
 
+	// Per-channel recall audit (V3.0, D-V3-7): on a retention-enabled Cosine bank
+	// that carries a channel table, measures recall@k PER CHANNEL over each channel's
+	// sub-range, filling OutReports[c] for c in [0, GetChannelCount()). The channel-
+	// scoped self-query is scored against the double-precision reference restricted to
+	// that channel's elements — the per-channel analogue of MeasureRecall. Fails (empty
+	// output) on a non-retention bank (no float reference) or a bank with no channel
+	// table (use MeasureRecall for the whole vector) — a defined rejection, never a
+	// guessed number. Runs under the reader pin and is refused while the bank drains
+	// (the N4 posture); writer-side, call from one thread like Append. The reports are
+	// not cached (GetLastRecallReport remains the whole-vector cache).
+	UFUNCTION(BlueprintCallable, Category = "Similarity|Scratch")
+	bool MeasureRecallPerChannel(TArray<FSuperFAISSScratchRecallReport>& OutReports);
+
 	// The last measured report, with its staleness evaluated AT READ against the
 	// bank's current generation. False if no report was ever taken.
 	UFUNCTION(BlueprintPure, Category = "Similarity|Scratch")
@@ -150,66 +203,6 @@ public:
 	bool IsRecallReportStale(const FSuperFAISSScratchRecallReport& Report) const
 	{
 		return static_cast<uint64>(Report.Generation) != Bank.Generation();
-	}
-
-	// --- V3.0 channel-capable scratch (plan §23.4 / §23.9 slot 5) ---
-
-	// Channel-capable Init: a channel table (parallel name/offset/length arrays,
-	// dims-space ranges; the plugin holds the host-side names per V3-G8) fixed for
-	// the bank's lifetime (D-V3-2). Validated at construction with the importer's
-	// channel rules (in-bounds, ascending, non-overlapping, on the quantization
-	// element grid, 1..kMaxChannels, unique names) — a bad table is rejected. On a
-	// Cosine bank the per-channel sub-norm arena joins the single allocation. Fails
-	// on a re-init.
-	UFUNCTION(BlueprintCallable, Category = "Similarity|Scratch")
-	bool InitWithChannels(int32 Capacity, int32 Dims, ESuperFAISSBankMetric Metric,
-		ESuperFAISSBankQuantization Quantization, const TArray<FName>& InChannelNames,
-		const TArray<int32>& InChannelOffsets, const TArray<int32>& InChannelLengths,
-		bool bRetainFloats = false);
-
-	// The channel-table size set at InitWithChannels (0 for a single-space bank).
-	UFUNCTION(BlueprintPure, Category = "Similarity|Scratch")
-	int32 GetChannelCount() const { return ChannelNamesTable.Num(); }
-
-	// Channel index by name, or INDEX_NONE. This is the plugin-side name->index
-	// resolution the scratch channel query uses (V3-G8 / N1 — a scratch resolver,
-	// NOT the baked USuperFAISSSubsystem::ResolveSegments, which is typed on
-	// USuperFAISSVectorBank and cannot be reused literally on a scratch bank).
-	UFUNCTION(BlueprintPure, Category = "Similarity|Scratch")
-	int32 GetChannelIndex(FName Name) const { return ChannelNamesTable.IndexOfByKey(Name); }
-
-	// The channel names in table order (for index->name reporting, e.g. the linter).
-	TConstArrayView<FName> GetChannelNames() const { return ChannelNamesTable; }
-
-	// V3.0 (slot 5): the per-channel degeneracy scan behind the linter's sub-norm-floor
-	// warning. Snapshots the bank and counts, per channel, the live rows whose quantized
-	// channel sub-vector has a zero inverse sub-norm (the §23.4 W2c degenerate case).
-	// OutZeroCounts gets GetChannelCount() entries; OutLiveRows the live-row total. Runs
-	// here (not in the MCP module) so the core Snapshot symbol resolves. Non-const and
-	// holds a reader pin across the whole view use (Poirot slot-5 #1): the snapshot's
-	// channelInvNorms point into the live arena, so a concurrent Grow/Freeze/Load must be
-	// held off — an MCP lint can run off the game thread. Cosine-only signal; false on a
-	// non-created/non-channel bank or while the bank is draining for an exclusive op.
-	bool ScanChannelDegeneracy(TArray<int32>& OutZeroCounts, int32& OutLiveRows);
-
-	// Per-channel recall audit (V3.0 D-V3-7 — the slot-5 reporting surface over the
-	// slot-3 core measurement): fills one report per channel over each channel's
-	// sub-range, surfacing core MeasureScratchRecallPerChannel. Requires a
-	// retention-enabled Cosine channel bank; a non-retention or non-channel bank is a
-	// defined rejection, never a guessed number. The per-channel numbers equal a
-	// direct core MeasureScratchRecallPerChannel over the same rows and seed.
-	UFUNCTION(BlueprintCallable, Category = "Similarity|Scratch")
-	bool MeasureRecallPerChannel(TArray<FSuperFAISSScratchRecallReport>& OutReports);
-
-	// The per-channel reports cached by the last MeasureRecallPerChannel, for the
-	// read-only describe surface (Poirot #2). Like GetLastRecallReport, this SURFACES a
-	// game-measured number; the MCP describe path never measures (measuring uses the
-	// single-thread RecallWorkspace and must stay on the measuring thread). False until a
-	// per-channel measure has run.
-	bool GetLastChannelRecallReports(TArray<FSuperFAISSScratchRecallReport>& OutReports) const
-	{
-		OutReports = LastChannelRecallReports;
-		return bHasChannelRecallReports;
 	}
 
 	// Index-preserving reallocation (T-044 W4). Drains in-flight queries first;
@@ -274,22 +267,17 @@ private:
 		FSuperFAISSScratchRecallReport& Out);
 
 	superfaiss::ScratchBank Bank;
+	// V3.0 slot 5 (T-099): the host-side channel vocabulary, parallel arrays in
+	// dims space — the scratch-bank mirror of USuperFAISSVectorBank's channel table.
+	// Empty on a channel-less bank. The core ScratchBank holds its own ChannelInfo
+	// table (padded space); these Names index into it by position.
+	TArray<FName> ChannelNames;
+	TArray<int32> ChannelOffsets;
+	TArray<int32> ChannelLengths;
 	// Recall-audit scratch (core Workspace: single-owner). MeasureRecall and
 	// FreezeWithRecall are writer-side, one at a time, so one workspace serves.
 	superfaiss::Workspace RecallWorkspace;
 	// The last measured report, cached for the descriptor/MCP surface.
 	FSuperFAISSScratchRecallReport LastRecallReport;
 	bool bHasRecallReport = false;
-	// The last per-channel reports (V3.0, D-V3-7), cached the same way for the read-only
-	// describe surface — measured game-side, surfaced (never re-measured) through MCP.
-	TArray<FSuperFAISSScratchRecallReport> LastChannelRecallReports;
-	bool bHasChannelRecallReports = false;
-	// V3.0 (slot 5): plugin-side channel names for a channel-capable scratch bank,
-	// set at InitWithChannels (empty for a single-space bank). The core ScratchBank
-	// carries the ChannelInfo offset/length table; names are host-side (V3-G8).
-	TArray<FName> ChannelNamesTable;
-	// The caller-provided logical offsets/lengths, retained for the channel-aware
-	// Freeze (the graduated schema-2 bank stores channel ranges in logical-dims space).
-	TArray<int32> ChannelOffsetsTable;
-	TArray<int32> ChannelLengthsTable;
 };

@@ -179,61 +179,29 @@ public:
 		const TArray<float>& Vector, int32 K = 10);
 
 	/**
-	 * Set-to-set divergence from a live scratch bank's snapshot (source A, by object
-	 * path) to a baked int8 target bank B (plan section 23.3, slot 1). The scratch
-	 * closure of SetToSetDistance: A is the mutable snapshot (all live rows, tombstones
-	 * excluded), B the baked reference (RowIndicesB — empty selects all). Mode selects
-	 * the read: "centroid" (SetToSetDistanceCrossDeviceScratch), "meanNN"
-	 * (MeanNearestNeighborCrossDeviceScratch), "maxNN"
-	 * (MaxNearestNeighborCrossDeviceScratch), or "all" (default, all three). Metric
-	 * ("Dot"/"Cosine"/"L2", empty = bank B's metric) sets the centroid distance sense.
-	 * Read-only: the scratch bank is snapshotted, never mutated or baked.
-	 */
-	UFUNCTION(meta = (AICallable), Category = "SuperFAISS")
-	static FString SetToSetDistanceScratch(const FString& ScratchBankPathA,
-		const FString& BankPathB, const TArray<int32>& RowIndicesB,
-		const FString& Metric, const FString& Mode);
-
-	/**
-	 * Within-scratch dispersion (plan section 23.3, slot 1): the mean and max distance
-	 * of a live scratch bank's snapshot rows to the snapshot's own cross-device centroid,
-	 * in the bank's metric (the scratch closure of BankSpread via
-	 * BankSpreadCrossDeviceScratch). Read-only: the scratch bank is snapshotted, never
-	 * mutated or baked.
+	 * Within-bank dispersion over a LIVE scratch bank's snapshot (V3.1 slot 1, plan
+	 * section 23.3): the scratch closure of BankSpread — the mean and max distance of
+	 * each live (non-tombstoned) row to the snapshot's own cross-device centroid, in
+	 * the bank's metric. Int8 cross-device scratch banks only. Read-only: the snapshot
+	 * is taken under a reader pin, the bank is never mutated. Refused while the bank
+	 * drains for a Grow/Freeze/Load.
 	 */
 	UFUNCTION(meta = (AICallable), Category = "SuperFAISS")
 	static FString BankSpreadScratch(const FString& ScratchBankPath);
 
 	/**
-	 * Channel-scoped set-to-set divergence between two int8 channel banks (V3.0, plan
-	 * section 23.5, slot 5): as SetToSetDistance but scored over one named channel's
-	 * sub-range instead of the whole row. Channel is a channel-table index (the bank's
-	 * schemaVersion-2 named channels). Mode selects the read ("centroid"/"meanNN"/
-	 * "maxNN"/"all"); Metric sets the centroid distance sense. Both banks int8
-	 * cross-device with a channel table. Read-only.
+	 * Directed set divergence from a LIVE scratch bank's snapshot to a baked bank (V3.1
+	 * slot 1, plan section 23.3): the scratch closure of SetToSetDistance with the
+	 * scratch bank as the source/A side. Mode selects the read: "centroid" (cross-device
+	 * centroid distance of the scratch snapshot's live rows to bank B's selected rows,
+	 * RowIndicesB — empty selects all of B), "meanNN"/"maxNN" (directed nearest-neighbour
+	 * divergence from the scratch snapshot to B), or "all" (default). Metric
+	 * ("Dot"/"Cosine"/"L2", empty = the scratch bank's metric) sets the centroid distance
+	 * sense; the NN divergences score in bank B's own metric. Both banks int8 cross-device
+	 * with equal dimensions. Read-only.
 	 */
 	UFUNCTION(meta = (AICallable), Category = "SuperFAISS")
-	static FString SetToSetDistanceChannel(const FString& BankPathA, const FString& BankPathB,
-		const TArray<int32>& RowIndicesA, const TArray<int32>& RowIndicesB,
-		const FString& Metric, const FString& Mode, int32 Channel);
-
-	/**
-	 * Channel-scoped within-bank dispersion (V3.0, plan section 23.5, slot 5): the mean
-	 * and max distance of each selected row (RowIndices — empty selects all) to the
-	 * selection's own cross-device centroid, scored over one named channel's sub-range
-	 * (Channel is a channel-table index). Int8 channel banks only. Read-only.
-	 */
-	UFUNCTION(meta = (AICallable), Category = "SuperFAISS")
-	static FString BankSpreadChannel(const FString& BankPath, const TArray<int32>& RowIndices,
-		int32 Channel);
-
-	/**
-	 * Health lint over a live channel scratch bank (V3.0, plan section 23.4 / 23.9 slot
-	 * 5): per-channel degenerate/weak-channel sub-norm-floor warnings — a channel whose
-	 * rows carry near-zero energy makes its per-channel scores unreliable, and the
-	 * report names it. Read-only: scratch banks are mutated by game code, never through
-	 * MCP.
-	 */
-	UFUNCTION(meta = (AICallable), Category = "SuperFAISS")
-	static FString LintScratchBank(const FString& ScratchBankPath);
+	static FString SetToSetDistanceScratch(const FString& ScratchBankPathA,
+		const FString& BankPathB, const TArray<int32>& RowIndicesB,
+		const FString& Metric, const FString& Mode);
 };

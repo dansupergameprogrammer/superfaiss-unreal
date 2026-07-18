@@ -1151,6 +1151,45 @@ bool FSuperFAISSAnalyticsScratchTest::RunTest(const FString& Parameters)
 		TestTrue(TEXT("scratch meanNN bit-equals core snapshot"), BitEqual(Plugin, Core));
 	}
 
+	// --- Max nearest-neighbour from the scratch snapshot to the baked target (V3.1
+	// slot 1): the order-free sibling of meanNN. Same snapshot oracle, MaxNNCrossDevice ---
+	{
+		float Plugin = 0.0f;
+		TestTrue(TEXT("scratch maxNN ok"),
+			Subsystem->MaxNearestNeighborCrossDeviceScratch(Scratch, Target, Plugin));
+
+		float Core = 0.0f;
+		bool bRefOk = false;
+		if (Scratch->TryPin())
+		{
+			BankView View;
+			TArray<uint32> Tombstones;
+			Tombstones.SetNumZeroed(ScratchBank::TombstoneWords(Scratch->Core().Capacity()));
+			if (Scratch->Core().Snapshot(&View, Tombstones.GetData()) == Status::Ok &&
+				View.count > 0)
+			{
+				TArray<XdQuery> Q;
+				TArray<Hit> H;
+				TArray<int32> C;
+				Q.SetNumUninitialized(View.count);
+				H.SetNumUninitialized(View.count);
+				C.SetNumUninitialized(View.count);
+				Workspace Ws;
+				bRefOk = MaxNNCrossDevice(View, Tombstones.GetData(), TargetView, nullptr,
+					Q.GetData(), H.GetData(), C.GetData(), Ws, &Core) == Status::Ok;
+			}
+			Scratch->Unpin();
+		}
+		TestTrue(TEXT("core maxNN over snapshot ok"), bRefOk);
+		TestTrue(TEXT("scratch maxNN bit-equals core snapshot"), BitEqual(Plugin, Core));
+		// maxNN (order-free max) and meanNN differ on this fixture — a sanity guard that the
+		// two reductions are not silently the same code path.
+		float PluginMean = 0.0f;
+		TestTrue(TEXT("scratch meanNN ok (for max!=mean guard)"),
+			Subsystem->MeanNearestNeighborCrossDeviceScratch(Scratch, Target, PluginMean));
+		TestFalse(TEXT("maxNN differs from meanNN on this fixture"), BitEqual(Plugin, PluginMean));
+	}
+
 	// --- Set-to-set between the scratch snapshot and the baked target ---
 	{
 		float Plugin = 0.0f;
@@ -1187,123 +1226,6 @@ bool FSuperFAISSAnalyticsScratchTest::RunTest(const FString& Parameters)
 		}
 		TestTrue(TEXT("core set-to-set over snapshot ok"), bRefOk);
 		TestTrue(TEXT("scratch set-to-set bit-equals core snapshot"), BitEqual(Plugin, Core));
-	}
-
-	return true;
-}
-
-// T-V3-S1 (plan section 23.3 / test design section 9, slot 1): the max-NN scratch
-// overload closes Forge W1 — spread, mean-NN, and set-to-set already have scratch
-// overloads, but max-NN did not, while the MCP SetToSetDistance tool exposes a maxNN
-// mode. This mirrors FSuperFAISSAnalyticsScratchTest's mean-NN block exactly (INV): the
-// overload drives MaxNNCrossDevice over the live Snapshot() with the snapshot's
-// tombstones as the exclusion set, and the returned scalar bit-equals the core
-// MaxNNCrossDevice run directly over the identical snapshot (the baked twin of the same
-// live rows). RED until Hastings implements MaxNearestNeighborCrossDeviceScratch (the
-// scaffold returns false, so both the overload call and its snapshot reference fail).
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FSuperFAISSAnalyticsMaxScratchTest,
-	"SuperFAISS.A.AnalyticsMaxScratch",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext |
-		EAutomationTestFlags::ProductFilter)
-
-bool FSuperFAISSAnalyticsMaxScratchTest::RunTest(const FString& Parameters)
-{
-	using namespace superfaiss;
-
-	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
-	if (!TestNotNull(TEXT("subsystem"), Subsystem))
-	{
-		return true;
-	}
-
-	auto BitEqual = [](float A, float B)
-	{
-		uint32 a, b;
-		FMemory::Memcpy(&a, &A, 4);
-		FMemory::Memcpy(&b, &B, 4);
-		return a == b;
-	};
-
-	constexpr int32 Dims = 32;
-	constexpr int32 Capacity = 64;
-	const TArray<float> Feed = CompositionRows(48, Dims, 0x5C9A7C4ull);
-
-	USuperFAISSScratchBank* Scratch = NewObject<USuperFAISSScratchBank>();
-	if (!TestTrue(TEXT("scratch init"), Scratch->Init(Capacity, Dims,
-			ESuperFAISSBankMetric::Dot, ESuperFAISSBankQuantization::Int8)))
-	{
-		return true;
-	}
-	// Append 24 rows; one deliberate outlier we then remove, so the max reduction sees a
-	// tombstoned bank (the exclusion set is non-empty, matching the mean-NN fixture).
-	int32 OutlierIndex = -1;
-	for (int32 R = 0; R < 24; ++R)
-	{
-		TArray<float> Row;
-		Row.SetNumUninitialized(Dims);
-		for (int32 J = 0; J < Dims; ++J)
-		{
-			Row[J] = Feed[R * Dims + J];
-		}
-		int32 Index = -1;
-		if (R == 12)
-		{
-			for (float& V : Row)
-			{
-				V *= 40.0f; // a far-off row: removing it changes the divergence
-			}
-		}
-		TestTrue(TEXT("scratch append"), Scratch->Append(Row, Index));
-		if (R == 12)
-		{
-			OutlierIndex = Index;
-		}
-	}
-	TestTrue(TEXT("outlier removed"), Scratch->Remove(OutlierIndex));
-
-	// A baked int8 target bank for the divergence overload (same dims/metric).
-	const TArray<float> TargetRows = CompositionRows(40, Dims, 0x9E3779B9ull);
-	USuperFAISSVectorBank* Target = NewObject<USuperFAISSVectorBank>();
-	FString Error;
-	if (!TestTrue(TEXT("target bank"), Target->InitFromSource(TargetRows, 40, Dims,
-			ESuperFAISSBankMetric::Dot, ESuperFAISSBankQuantization::Int8, {},
-			TEXT("scratch-target-max"), Error)))
-	{
-		return true;
-	}
-	const BankView TargetView = Target->GetBankView();
-
-	// --- Max nearest-neighbour from the scratch snapshot to the baked target ---
-	{
-		float Plugin = 0.0f;
-		TestTrue(TEXT("scratch maxNN ok"),
-			Subsystem->MaxNearestNeighborCrossDeviceScratch(Scratch, Target, Plugin));
-
-		float Core = 0.0f;
-		bool bRefOk = false;
-		if (Scratch->TryPin())
-		{
-			BankView View;
-			TArray<uint32> Tombstones;
-			Tombstones.SetNumZeroed(ScratchBank::TombstoneWords(Scratch->Core().Capacity()));
-			if (Scratch->Core().Snapshot(&View, Tombstones.GetData()) == Status::Ok &&
-				View.count > 0)
-			{
-				TArray<XdQuery> Q;
-				TArray<Hit> H;
-				TArray<int32> C;
-				Q.SetNumUninitialized(View.count);
-				H.SetNumUninitialized(View.count);
-				C.SetNumUninitialized(View.count);
-				Workspace Ws;
-				bRefOk = MaxNNCrossDevice(View, Tombstones.GetData(), TargetView, nullptr,
-					Q.GetData(), H.GetData(), C.GetData(), Ws, &Core) == Status::Ok;
-			}
-			Scratch->Unpin();
-		}
-		TestTrue(TEXT("core maxNN over snapshot ok"), bRefOk);
-		TestTrue(TEXT("scratch maxNN bit-equals core snapshot"), BitEqual(Plugin, Core));
 	}
 
 	return true;
