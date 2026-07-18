@@ -34,7 +34,7 @@ surface completes alongside it — named-channel scratch queries, per-channel sc
 recall, and the channel vocabulary surviving a save/load round trip — as do read-only
 MCP closures of the analytics reductions (spread and mean/max nearest-neighbour) over a
 live snapshot. Includes a segmented-kernel AVX2 fix (a length-4 channel could score a
-spurious `0` on the AVX2 float path). Bundles the MIT core library at tag `v3.1`.
+spurious `0` on the AVX2 float path). Bundles the MIT core library at tag `v3.1.1`.
 
 **New in 3.0.1:** version-header fix (the `SUPERFAISS_VERSION_*` macros now report
 3.0.1) and a zero-energy Cosine channel edge: a channel that carries no energy on a
