@@ -30,10 +30,34 @@ prerequisite note at the top of `plugin-build.yml`), so it cannot gate a
 pull request from a fork or a contributor without that runner's access. It
 still runs on every push to `main` and is checked before every release.
 
-## Rule: tags matching `v*`
+## Ruleset: tags matching `v*`
 
-- **Restrict who can push matching tags** — enabled, allowing only the
-  `release.yml` workflow (via its `GITHUB_TOKEN`) and repository admins.
-  This is the enforcement side of "release tags are cut by the workflow, not
-  by hand" — a hand-pushed tag that skips `release.yml`'s coherence gate is
-  exactly the F4 finding this rule closes.
+Settings -> Rules -> Rulesets -> New ruleset -> **Target: Tags**.
+Target pattern: `v*`.
+
+Enable **Restrict creations**, **Restrict updates**, and **Restrict deletions**.
+
+There is no "who can push" dropdown. *Who* is expressed entirely through the
+**Bypass list**, and this is the part that is easy to get wrong in both
+directions:
+
+- An **empty** bypass list blocks everyone, including `release.yml` — its
+  `GITHUB_TOKEN` acts as `github-actions[bot]`, which is subject to the same
+  ruleset. The release workflow would fail on the tag push.
+- Adding **Repository admin** makes the rule advisory for the sole maintainer,
+  who then bypasses it automatically. That documents intent; it does not
+  enforce anything.
+
+The configuration that actually enforces "release tags are cut by the workflow,
+not by hand" is: bypass list contains **only the GitHub Actions app**. The
+maintainer then cannot hand-cut a `v*` tag, and the only path to one is
+dispatching `release.yml`, which is gated on the coherence checks. That is the
+enforcement side of the release-process finding.
+
+If the GitHub Actions app is not offered as a bypass actor (availability differs
+between user-owned and organization repositories), the fallback is a
+fine-grained PAT with `contents: write`, stored as a repository secret and used
+by `release.yml` in place of `GITHUB_TOKEN`.
+
+Note that `release.yml` runs on `ubuntu-latest` and needs no self-hosted runner,
+so this path is usable as-is.
