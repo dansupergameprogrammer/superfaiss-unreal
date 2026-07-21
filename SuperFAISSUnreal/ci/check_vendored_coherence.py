@@ -73,12 +73,24 @@ def materialize_core_at_commit(
         return wt, (core_repo, wt)
 
     clone_dir = workdir / "core-clone"
+    # A blobless clone carries the FULL commit history (only file contents are
+    # deferred), so a pin reachable from the default branch is already present
+    # and needs no fetch. Check out directly.
     subprocess.run(["git", "clone", "--filter=blob:none", core_remote, str(clone_dir)],
                     check=True, capture_output=True, text=True)
-    subprocess.run(["git", "-C", str(clone_dir), "fetch", "--depth", "1", "origin", commit],
-                    check=True, capture_output=True, text=True)
-    subprocess.run(["git", "-C", str(clone_dir), "checkout", commit],
-                    check=True, capture_output=True, text=True)
+    checkout = subprocess.run(["git", "-C", str(clone_dir), "checkout", commit],
+                              capture_output=True, text=True)
+    if checkout.returncode != 0:
+        # Pin not reachable from the default branch (e.g. it lives only on a
+        # side branch). Fall back to fetching it explicitly. NOTE: this path
+        # requires the FULL 40-character sha — `git fetch <remote> <short-sha>`
+        # is not a valid ref and fails with "couldn't find remote ref", which is
+        # exactly how this check failed the first time it ran in CI while
+        # passing locally against a --core-repo clone.
+        subprocess.run(["git", "-C", str(clone_dir), "fetch", "origin", commit],
+                        check=True, capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(clone_dir), "checkout", commit],
+                        check=True, capture_output=True, text=True)
     return clone_dir, None
 
 

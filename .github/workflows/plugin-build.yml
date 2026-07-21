@@ -28,10 +28,18 @@
 
 name: plugin-build
 
+# TRIGGER: manual only, deliberately.
+#
+# Every job below needs a self-hosted Windows runner with Unreal Engine
+# installed (see the prerequisites at the top of this file). No such runner is
+# provisioned for this repository, and GitHub-hosted runners cannot build UE.
+#
+# If this workflow triggered on push it would queue forever against a runner
+# label nothing answers to -- presenting, on a public repository, a build gate
+# that appears to run and never does. A gate that cannot fail is worse than no
+# gate, because it is counted. It is therefore opt-in: provision a runner with
+# the labels below, then dispatch it manually or restore the push trigger.
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 env:
