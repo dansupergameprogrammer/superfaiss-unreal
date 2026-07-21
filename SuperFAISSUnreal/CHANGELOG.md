@@ -7,6 +7,15 @@ release vendors.
 
 The format follows [Keep a Changelog](https://keepachangelog.com).
 
+## [3.2.1] — 2026-07-21
+
+### Fixed
+- Vendored core advanced to 3.2.1, which repairs the core test suite on Linux and
+  macOS arm64 (an unguarded reference to x86-only kernel mirrors, and a stack buffer
+  overrun in an allocation cell). The core library itself is byte-identical to 3.2.0,
+  so plugin behaviour is unchanged; this release exists so the vendored tree and the
+  version it reports are the repaired ones.
+
 ## [3.2.0] — 2026-07-20
 
 ### Added
