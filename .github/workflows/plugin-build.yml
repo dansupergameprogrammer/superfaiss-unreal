@@ -1,0 +1,137 @@
+# PREREQUISITE — READ BEFORE ENABLING THIS WORKFLOW
+#
+# Every job in this file requires a SELF-HOSTED Windows runner with Unreal
+# Engine installed, registered under the `self-hosted`, `windows`, `unreal`
+# labels used below. GitHub's hosted runners do not offer Unreal Engine, and
+# there is no supported way to install a full Editor build on one within a
+# job's time and disk budget. Attempting to fake this on a hosted runner
+# (e.g. skipping the actual build and reporting success) would defeat the
+# purpose of this workflow, which exists specifically to catch a build break
+# hosted CI cannot see.
+#
+# To provision the runner:
+#   1. Install Unreal Engine (the version this plugin targets) on the host.
+#   2. Set the machine-level environment variable UE_ROOT to the engine
+#      installation directory (the folder containing `Engine\Build\BatchFiles`).
+#   3. Install the GitHub Actions self-hosted runner and register it with
+#      labels: self-hosted, windows, unreal.
+#   4. Ensure the runner account can write to a scratch build directory with
+#      several GB free (UBT intermediate/derived-data output).
+#
+# The orphan-sweep coherence check (job `orphan-sweep`) additionally requires
+# the runner to have read access to the private source-of-truth plugin tree
+# used to publish this repo, via the SUPERFAISS_UNREAL_SOURCE_ROOT repository
+# variable (Settings > Secrets and variables > Actions > Variables). That
+# tree lives outside this repository and is not something hosted CI, or a
+# contributor's fork, can ever see — this job only runs meaningfully on the
+# maintainer's own self-hosted runner.
+
+name: plugin-build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  UPROJECT: ExampleProject/ExampleProject.uproject
+  PLUGIN_UPLUGIN: SuperFAISSUnreal/SuperFAISSUnreal.uplugin
+
+jobs:
+  editor-build:
+    runs-on: [self-hosted, windows, unreal]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build Editor target (Development)
+        shell: pwsh
+        run: |
+          & "$env:UE_ROOT\Engine\Build\BatchFiles\Build.bat" `
+            ExampleProjectEditor Win64 Development `
+            -Project="$PWD\$env:UPROJECT" -WaitMutex
+          if ($LASTEXITCODE -ne 0) { throw "Editor build failed (exit $LASTEXITCODE)" }
+
+  automation-tests:
+    needs: editor-build
+    runs-on: [self-hosted, windows, unreal]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build Editor target (Development)
+        shell: pwsh
+        run: |
+          & "$env:UE_ROOT\Engine\Build\BatchFiles\Build.bat" `
+            ExampleProjectEditor Win64 Development `
+            -Project="$PWD\$env:UPROJECT" -WaitMutex
+          if ($LASTEXITCODE -ne 0) { throw "Editor build failed (exit $LASTEXITCODE)" }
+      - name: Run SuperFAISS.* automation tests (headless)
+        shell: pwsh
+        run: |
+          $logPath = "$PWD\Saved\Logs\AutomationTests.log"
+          & "$env:UE_ROOT\Engine\Binaries\Win64\UnrealEditor-Cmd.exe" `
+            "$PWD\$env:UPROJECT" `
+            -ExecCmds="Automation RunTests SuperFAISS.*;Quit" `
+            -unattended -nopause -nullrhi -log="$logPath"
+          $exit = $LASTEXITCODE
+          if (Test-Path $logPath) { Get-Content $logPath }
+          if ($exit -ne 0) { throw "Automation test run failed (exit $exit)" }
+          $log = Get-Content $logPath -Raw
+          if ($log -notmatch "Automation Test Succeeded" -or $log -match "Automation Test Failed") {
+            throw "SuperFAISS.* automation suite did not report a clean pass"
+          }
+
+  shipping-build:
+    # The gate that would have caught the Shipping-only compile break an
+    # external reviewer found in v3.1: a missing include masked by the
+    # Editor PCH/unity build never surfaces in editor-build or
+    # automation-tests above, only in an actual Shipping compile.
+    needs: editor-build
+    runs-on: [self-hosted, windows, unreal]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build Win64 Shipping
+        shell: pwsh
+        run: |
+          & "$env:UE_ROOT\Engine\Build\BatchFiles\Build.bat" `
+            ExampleProject Win64 Shipping `
+            -Project="$PWD\$env:UPROJECT" -WaitMutex
+          if ($LASTEXITCODE -ne 0) { throw "Shipping build failed (exit $LASTEXITCODE)" }
+
+  package-plugin:
+    needs: [automation-tests, shipping-build]
+    runs-on: [self-hosted, windows, unreal]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: RunUAT BuildPlugin
+        shell: pwsh
+        run: |
+          $out = "$env:RUNNER_TEMP\SuperFAISSUnreal-package"
+          & "$env:UE_ROOT\Engine\Build\BatchFiles\RunUAT.bat" BuildPlugin `
+            -Plugin="$PWD\$env:PLUGIN_UPLUGIN" -Package="$out" -Rocket
+          if ($LASTEXITCODE -ne 0) { throw "RunUAT BuildPlugin failed (exit $LASTEXITCODE)" }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: SuperFAISSUnreal-packaged-plugin
+          path: ${{ runner.temp }}/SuperFAISSUnreal-package
+          if-no-files-found: error
+
+  orphan-sweep:
+    # Needs the private source-of-truth tree this repo is published from —
+    # only meaningful on the maintainer's own self-hosted runner. See the
+    # prerequisite note at the top of this file.
+    runs-on: [self-hosted, windows, unreal]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.x"
+      - name: Orphan sweep against the source-of-truth tree
+        shell: pwsh
+        env:
+          SOURCE_ROOT: ${{ vars.SUPERFAISS_UNREAL_SOURCE_ROOT }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SOURCE_ROOT)) {
+            throw "SUPERFAISS_UNREAL_SOURCE_ROOT is not set — see the prerequisite note at the top of this file."
+          }
+          python SuperFAISSUnreal/ci/check_orphan_sweep.py `
+            --source-root "$env:SOURCE_ROOT" --public-root "$PWD\SuperFAISSUnreal"
+          if ($LASTEXITCODE -ne 0) { throw "Orphan sweep failed (exit $LASTEXITCODE)" }

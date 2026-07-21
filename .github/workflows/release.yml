@@ -1,0 +1,73 @@
+name: release
+
+# Cuts the release tag from CI instead of by hand (a hand-cut tag is how a
+# release ships with a tag that does not match version.h/.uplugin/CHANGELOG —
+# see check_version_identity.py). Triggered manually, on purpose: a release
+# is a decision, not something that fires on every push to main.
+#
+# What this workflow does NOT do: publish a packaged plugin build. That is
+# plugin-build.yml's `package-plugin` job, which requires the self-hosted
+# Unreal runner — trigger it (or its artifact from a prior main-branch run)
+# separately and attach the package to the GitHub Release this workflow
+# creates.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  cut-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.x"
+
+      - name: Coherence gate (must agree before a tag is cut)
+        run: |
+          python SuperFAISSUnreal/ci/check_vendored_coherence.py --plugin-root SuperFAISSUnreal
+          python SuperFAISSUnreal/ci/check_doc_signatures.py --vendored-root SuperFAISSUnreal/Source/ThirdParty/SuperFAISS
+          python SuperFAISSUnreal/ci/check_asset_references.py --repo-root . README.md SuperFAISSUnreal/README.md SuperFAISSUnrealMCP/README.md
+          python SuperFAISSUnreal/ci/check_version_identity.py --plugin-root SuperFAISSUnreal --allow-untagged
+
+      - name: Read release version from .uplugin
+        id: version
+        run: |
+          v=$(python -c "import json; print(json.load(open('SuperFAISSUnreal/SuperFAISSUnreal.uplugin'))['VersionName'])")
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to re-cut an existing tag
+        run: |
+          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "::error::tag v${{ steps.version.outputs.version }} already exists"
+            exit 1
+          fi
+
+      - name: Tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${{ steps.version.outputs.version }}" -m "SuperFAISS For Unreal Engine v${{ steps.version.outputs.version }}"
+          git push origin "v${{ steps.version.outputs.version }}"
+
+      - name: Version identity gate — the tag just cut must agree too
+        run: |
+          python SuperFAISSUnreal/ci/check_version_identity.py --plugin-root SuperFAISSUnreal
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.version.outputs.version }}" \
+            --title "SuperFAISS For Unreal Engine v${{ steps.version.outputs.version }}" \
+            --notes-file <(python -c "
+import re
+text = open('SuperFAISSUnreal/CHANGELOG.md', encoding='utf-8').read()
+m = re.search(r'^## \[.*?\].*?\n(.*?)(?=\n## \[|\Z)', text, re.MULTILINE | re.DOTALL)
+print(m.group(1).strip() if m else '')
+")
