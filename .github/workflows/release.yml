@@ -59,15 +59,14 @@ jobs:
         run: |
           python SuperFAISSUnreal/ci/check_version_identity.py --plugin-root SuperFAISSUnreal
 
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          python SuperFAISSUnreal/ci/changelog_notes.py SuperFAISSUnreal/CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "v${{ steps.version.outputs.version }}" \
             --title "SuperFAISS For Unreal Engine v${{ steps.version.outputs.version }}" \
-            --notes-file <(python -c "
-import re
-text = open('SuperFAISSUnreal/CHANGELOG.md', encoding='utf-8').read()
-m = re.search(r'^## \[.*?\].*?\n(.*?)(?=\n## \[|\Z)', text, re.MULTILINE | re.DOTALL)
-print(m.group(1).strip() if m else '')
-")
+            --notes-file "$RUNNER_TEMP/release-notes.md"
