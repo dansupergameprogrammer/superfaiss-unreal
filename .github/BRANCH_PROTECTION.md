@@ -30,34 +30,22 @@ prerequisite note at the top of `plugin-build.yml`), so it cannot gate a
 pull request from a fork or a contributor without that runner's access. It
 still runs on every push to `main` and is checked before every release.
 
-## Ruleset: tags matching `v*`
+## Tags: no ruleset, deliberately
 
-Settings -> Rules -> Rulesets -> New ruleset -> **Target: Tags**.
-Target pattern: `v*`.
+No tag protection rule is configured, and this is a decision rather than an
+omission.
 
-Enable **Restrict creations**, **Restrict updates**, and **Restrict deletions**.
+GitHub Rulesets expresses *who* only through a bypass list, and on a user-owned
+repository the selectable actors are Deploy keys, the Repository admin /
+Maintain / Write roles, and a pair of Copilot apps. The GitHub Actions app is
+not among them, so a workflow's `GITHUB_TOKEN` cannot be granted bypass. Every
+role entry resolves to the sole maintainer, and a fine-grained PAT carries that
+same identity, so any of those choices makes the rule advisory against the only
+person it would apply to. The one genuinely distinct actor is a deploy key,
+which would mean a write-capable private key held in repository secrets.
 
-There is no "who can push" dropdown. *Who* is expressed entirely through the
-**Bypass list**, and this is the part that is easy to get wrong in both
-directions:
-
-- An **empty** bypass list blocks everyone, including `release.yml` — its
-  `GITHUB_TOKEN` acts as `github-actions[bot]`, which is subject to the same
-  ruleset. The release workflow would fail on the tag push.
-- Adding **Repository admin** makes the rule advisory for the sole maintainer,
-  who then bypasses it automatically. That documents intent; it does not
-  enforce anything.
-
-The configuration that actually enforces "release tags are cut by the workflow,
-not by hand" is: bypass list contains **only the GitHub Actions app**. The
-maintainer then cannot hand-cut a `v*` tag, and the only path to one is
-dispatching `release.yml`, which is gated on the coherence checks. That is the
-enforcement side of the release-process finding.
-
-If the GitHub Actions app is not offered as a bypass actor (availability differs
-between user-owned and organization repositories), the fallback is a
-fine-grained PAT with `contents: write`, stored as a repository secret and used
-by `release.yml` in place of `GITHUB_TOKEN`.
-
-Note that `release.yml` runs on `ubuntu-latest` and needs no self-hosted runner,
-so this path is usable as-is.
+That cost buys protection against a single failure mode: a maintainer hand-cutting
+a release tag outside the gate. Releases here are produced by an automated
+publish sequence that runs the coherence checks before tagging, so the failure
+mode is not one this project has. The checks themselves are the gate, and they
+run on every push and before every release.
