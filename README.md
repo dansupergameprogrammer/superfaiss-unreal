@@ -20,7 +20,7 @@ answers "what's most similar to this?" exactly, in microseconds, on any thread.
 
 Measured on the shipped demo bank (40,000 words x 100 dims, int8, ~4 MB), desktop
 editor: single query **0.13 ms** (auto-parallelized across chunks — the core's serial
-one-core scan of the same bank is ~0.5 ms), batched **0.06 ms per query** — exact
+one-core scan of the same bank is ~0.65 ms), batched **0.06 ms per query** — exact
 search, bit-deterministic, zero steady-state allocation.
 
 **New in 3.1:** a runtime-mutable channel vocabulary. `Relabel` re-partitions the
