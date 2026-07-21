@@ -71,7 +71,7 @@ and the order-free max that is the Hausdorff component), within-bank dispersion,
 the shared query-vs-query pair score they rest on — all bit-identical across machines
 by the same integer-accumulation proof as the query path, on the Blueprint subsystem
 and (read-only) as MCP tools. Plus an offline per-device probe-direction projection
-report. The editor's **Bank Inspector** (Window > SuperFAISS Bank Inspector) shows a
+report. The editor's **Bank Inspector** (Tools > SuperFAISS Bank Inspector) shows a
 live PCA projection beside its ranked-query view. Result-direction convention (a `Dot`
 bank returns a similarity, not a distance) and the cosine limb's determinism condition
 are stated in the docs.
@@ -113,7 +113,7 @@ so plainly. See the [plugin README](SuperFAISSUnreal/README.md).
 
 ![The shipped demo: one query against two GloVe banks, sub-millisecond async results](docs/demo.png)
 
-The editor **Bank Inspector** (Window > SuperFAISS Bank Inspector) — live queries with
+The editor **Bank Inspector** (Tools > SuperFAISS Bank Inspector) — live queries with
 score and margin, and a PCA projection, over any bank asset:
 
 ![Bank Inspector: a live `wizard` query over a 40k-word bank, ranked with scores and margins, beside a PCA point cloud](docs/inspector.png)
@@ -123,7 +123,7 @@ score and margin, and a PCA projection, over any bank asset:
 | Path | What |
 |---|---|
 | `SuperFAISSUnreal/` | The plugin. Copy this folder into your project's `Plugins/`. |
-| `SuperFAISSUnrealMCP/` | Optional agent toolset: MCP tools over your banks. Requires Experimental engine plugins most distributions don't carry — see its README. Disabled by default; everything else works without it. |
+| `SuperFAISSUnrealMCP/` | Optional MCP toolset: enumerate, describe, query, import, validate, and lint tools over your banks. Requires Experimental engine plugins most distributions don't carry — see its README. Disabled by default; everything else works without it. |
 | `ExampleProject/` | Minimal host project; opens straight into the demo map. |
 
 ## Try it
@@ -138,7 +138,7 @@ Or headless, from the repo root:
 UnrealEditor-Cmd ExampleProject/ExampleProject.uproject -ExecCmds="Automation RunTests SuperFAISS; Quit" -unattended -nullrhi
 ```
 
-53 automation tests (61 with the MCP toolset plugin enabled): kernel correctness,
+104 automation tests (108 with the MCP toolset plugin enabled): kernel correctness,
 SIMD/scalar mirror equality, determinism, tie-break stability, concurrency, asset
 round-trips, import rejection, quantizer recall, performance guards, query composition
 (centroid, direction, intersection, margins), named-channel queries and decomposition,
@@ -159,6 +159,12 @@ depends only on stable engine modules (the demo module adds Slate/InputCore and
 Mass — UE 5.8 engine modules, no plugin references — and is strippable in three
 steps) — see the [plugin README](SuperFAISSUnreal/README.md) for
 the API quick start, bank authoring, guarantees, and demo-strip steps.
+
+**Designed for portability, verified on one target.** No platform code, no platform
+allowlist — SIMD is selected automatically. What is *verified* today: the plugin on
+UE 5.8 Win64 (Editor + automation suite + Shipping game build); the vendored core's own
+CI additionally covers Windows/Linux (AVX2, TSan) and Apple Silicon NEON. Other UE
+targets should work by construction but have not been qualified.
 
 ## Engine versions
 

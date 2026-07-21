@@ -1,8 +1,8 @@
 # SuperFAISS MCP Toolset
 
-Agent-callable tools over SuperFAISS vector banks: an AI agent connected to a running
-editor's MCP server can enumerate, describe, query, import, validate, and lint banks
-directly. Ships as its own plugin beside `SuperFAISSUnreal`, disabled by default.
+MCP tools over SuperFAISS vector banks: exposes enumerate, describe, query, import,
+validate, and lint operations over a running editor's MCP server. Ships as its own
+plugin beside `SuperFAISSUnreal`, disabled by default.
 
 ## Requirements — read this first
 
