@@ -1,4 +1,4 @@
-SuperFAISS at core master commit 4f4b5b6 (UNTAGGED — release identity reads v3.2.0 in
+SuperFAISS at core master commit df420b7 (UNTAGGED — release identity reads v3.2.0 in
 version.h; no v3.2.0 git tag exists yet). v3.1.2 carried v3.0 channel-capable scratch
 banks + channel-scoped analytics + archive v3, v3.1 runtime-mutable channel vocabulary
 (Relabel), v3.1.1 AVX2 float32 dot/L2 sub-8 segment-remainder fix, and v3.1.2's own
