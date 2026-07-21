@@ -3,7 +3,7 @@
 // FP policy: SuperFAISS forbids implicit FP contraction (scalar/SIMD bit-equality
 // depends on exact mul-then-add rounding). The guarantee comes from the module-wide
 // FPSemantics = Precise in Build.cs — NOT from source pragmas, which do not stop
-// clang backend fusion under fast-math (verified at the compiler, Poirot S4).
+// clang backend fusion under fast-math (verified at the compiler, S4).
 // The SuperFAISS.B.SimdMirrorEquality automation test is the standing tripwire
 // on every platform.
 
@@ -17,3 +17,9 @@
 #include "../../../ThirdParty/SuperFAISS/src/analytics.cpp"
 #include "../../../ThirdParty/SuperFAISS/src/pca.cpp"
 #include "../../../ThirdParty/SuperFAISS/src/scratch.cpp"
+
+// V3.2 Bank Inspector I, Tier 1 (plan section 25.4) — pure post-processing over exact
+// query output, in M1/M2/M3 build order (Sec.25.10 slots 1-2).
+#include "../../../ThirdParty/SuperFAISS/src/graph.cpp"
+#include "../../../ThirdParty/SuperFAISS/src/novelty.cpp"
+#include "../../../ThirdParty/SuperFAISS/src/matching.cpp"

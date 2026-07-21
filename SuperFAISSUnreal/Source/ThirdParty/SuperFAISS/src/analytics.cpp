@@ -458,7 +458,7 @@ Status NNDivergenceChannel(
 	// Unlike the whole-vector NNDivergence (which routes through QueryXdBatch), the channel
 	// path scores each nearest in place, so it needs only the source-lift buffer
 	// (queryScratch) — the Hit/count/Workspace scratch the public signature carries for
-	// parity with the whole-vector twin is unused here and not required non-null (Poirot #2).
+	// parity with the whole-vector twin is unused here and not required non-null.
 	if (outValue == nullptr || queryScratch == nullptr ||
 		!IsInt8CrossDevice(source) || !IsInt8CrossDevice(target) ||
 		source.paddedDims != target.paddedDims)
@@ -515,7 +515,7 @@ Status NNDivergenceChannel(
 		return Status::InvalidArgument; // empty source
 	}
 	// A zero sub-norm member (source or target) is NOT rejected here: this is a reduction
-	// (a set statistic), and C-5/D-V3-11 floors a degenerate Cosine member to a defined 0
+	// (a set statistic), and a degenerate Cosine member floors to a defined 0
 	// via XdChannelPairScore -- consistent with CentroidDistance/Spread. The query-side
 	// ZeroNormQuery rejection is for a SINGLE per-channel query, not a reduction over a pool
 	// (a valid row can have a whole-row-normalized image with one channel exactly zero).

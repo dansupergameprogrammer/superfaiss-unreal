@@ -2,11 +2,21 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/EngineSubsystem.h"
+#include "Trace/Trace.h"
 
 #include "SuperFAISSSubsystem.generated.h"
 
 class USuperFAISSVectorBank;
 class USuperFAISSScratchBank;
+
+// Plugin plan section 5.1 "Instrumentation & Unreal Insights": a dedicated, toggleable,
+// zero-cost-when-off trace channel — the identifier IS the registered name
+// (TRACE_PRIVATE_CHANNEL_IMPL stringifies it via `#ChannelName`), so this must read
+// exactly `SuperFAISS` for `UE::Trace::ToggleChannel(TEXT("SuperFAISS"), ...)` to find
+// it. Declared here (not SuperFAISSSubsystem.cpp-local) so the editor module's own
+// three named Inspector-pass scopes (plan section 25.6) share the same channel.
+// Defined once, in SuperFAISSSubsystem.cpp.
+UE_TRACE_CHANNEL_EXTERN(SuperFAISS, SUPERFAISSUNREAL_API);
 
 // Reduction kind for the V2.5 divergence/spread reductions (plan section 22) — the
 // Blueprint-facing mirror of core superfaiss::Reduce (ordinals shared): Mean is a
@@ -494,8 +504,8 @@ public:
 	// Directed max nearest-neighbour divergence from a scratch snapshot's live rows to a
 	// baked TargetBank — the scratch closure of MaxNearestNeighborCrossDevice, and the
 	// order-free (max) sibling of MeanNearestNeighborCrossDeviceScratch. Added so the
-	// read-only MCP SetToSetDistance tool's maxNN mode has a scratch path (V3-G7 / §23.3
-	// Forge W1); the core MaxNNCrossDevice reduction is shared with the baked overload.
+	// read-only MCP SetToSetDistance tool's maxNN mode has a scratch path; the core
+	// MaxNNCrossDevice reduction is shared with the baked overload.
 	UFUNCTION(BlueprintCallable, Category = "Similarity|Analytics",
 		meta = (DisplayName = "Max Nearest Neighbor (Cross-Device, Scratch Source)"))
 	bool MaxNearestNeighborCrossDeviceScratch(USuperFAISSScratchBank* SourceBank,
@@ -511,6 +521,28 @@ public:
 
 	// Diagnostics: workspace pool growth count (flat once warm — the B5 counter).
 	uint64 GetPoolGrowthCount() const;
+
+	// Diagnostics (B9): the most recently COMPLETED
+	// query's claim-backing telemetry — the live values STATGROUP_SuperFAISS's
+	// counters publish from. "Last" is a live gauge (like the stat group's SET_ pattern), not an
+	// accumulator — distinct from GetPoolGrowthCount()/superfaiss::AllocationCount(),
+	// which already are accumulators (B5).
+	//   - GetLastQueryBytesStreamed(): bytes streamed for the queried bank — the
+	//     PHYSICAL N*PaddedDims*ElementSize traffic the SIMD kernel actually loads
+	//     (superfaiss::BankBytes(view); kernels_avx2.cpp iterates paddedDims, not the
+	//     logical N*Dims*B the section 5 model states as its floor). Set on every
+	//     SUCCESSFUL QuerySync/QueryAsync/QueryBatch/QueryIntersect/QueryScratch
+	//     dispatch (a rejected/failed call leaves it at whatever the last success
+	//     left it -- the same "last COMPLETED query" gauge the class comment above
+	//     already states).
+	//   - GetLastQueryChunkCount(): the ACTUAL scan partition the last query used — 1
+	//     when the serial path ran (Chunks<=1 or the parallel-scan cvar forced/
+	//     resolved serial), else the parallel fan-out's superfaiss::ChunkCount(view).
+	//   - GetLastQueryBatchSize(): M for the last QueryBatch call. Untouched by
+	//     QuerySync/QueryIntersect/QueryScratch — only QueryBatch sets it.
+	uint64 GetLastQueryBytesStreamed() const;
+	int32 GetLastQueryChunkCount() const;
+	int32 GetLastQueryBatchSize() const;
 
 	// Drains in-flight async queries. The UObject exit purge runs before the task
 	// graph shuts down, so a query in flight at engine exit would read freed bank
@@ -533,4 +565,14 @@ private:
 	// Deinitialize; new dispatches during the drain fail immediately.
 	std::atomic<int32> InFlightAsync{0};
 	std::atomic<bool> bDraining{false};
+
+	// V3.2 slot 5 (plugin plan section 5.1 / B9): the last-completed-query telemetry
+	// GetLastQuery{BytesStreamed,ChunkCount,BatchSize}() read. Atomics because queries
+	// are callable from any thread (QuerySync's own documented contract) and the async
+	// path's worker thread writes them too — "last" is inherently racy across
+	// concurrent callers by design (a live gauge, not a per-query-scoped value), the
+	// same shape STATGROUP_SuperFAISS's own SET_ counters already have.
+	std::atomic<uint64> LastQueryBytesStreamed{0};
+	std::atomic<int32> LastQueryChunkCount{0};
+	std::atomic<int32> LastQueryBatchSize{0};
 };

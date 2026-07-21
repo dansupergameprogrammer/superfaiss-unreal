@@ -287,7 +287,7 @@ bool FSuperFAISSAssetIndexBlockTest::RunTest(const FString& Parameters)
 
 	// A future writer appends block content: emulate by editing the serialized stream's
 	// trailing block (version int32 + int32 count + payload).
-	// LAYOUT DEPENDENCY (Poirot O5): this splice assumes the index block is the LAST
+	// LAYOUT DEPENDENCY (O5): this splice assumes the index block is the LAST
 	// thing USuperFAISSVectorBank::Serialize writes — the final 8 bytes are
 	// IndexBlockVersion=0, ArrayNum=0. Appending any field after the block in
 	// Serialize() breaks this test; update both together.

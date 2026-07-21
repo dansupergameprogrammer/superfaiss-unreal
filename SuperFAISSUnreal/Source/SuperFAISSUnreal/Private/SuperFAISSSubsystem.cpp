@@ -6,11 +6,25 @@
 #include "Async/ParallelFor.h"
 #include "Async/TaskGraphInterfaces.h"
 #include "HAL/IConsoleManager.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
+#include "ProfilingDebugging/CsvProfiler.h"
 #include "Stats/Stats.h"
+#include "Trace/Trace.h"
 #include "UObject/StrongObjectPtr.h"
 #include "SuperFAISSVectorBank.h"
 
 #include "superfaiss/superfaiss.h"
+
+// Plugin plan section 5.1: the dedicated, zero-cost-when-off channel (declared
+// SUPERFAISSUNREAL_API in the header so the editor module's own three named scopes,
+// plan section 25.6, share it). Defined exactly once, here. The description is an
+// ANSI string (FChannel::InitArgs::Desc is `const ANSICHAR*`, not TCHAR) — no TEXT().
+UE_TRACE_CHANNEL_DEFINE(SuperFAISS, "SuperFAISS query/scan/pool instrumentation");
+
+// Plugin plan section 5.1: per-query scan cost, captured for automated perf-regression
+// runs (the section 13 Day-1 calibration numbers as a guarded trend, not a one-time
+// measurement).
+CSV_DEFINE_CATEGORY(SuperFAISS, true);
 
 // Parallel-chunk scan selection (plan §6/§13.5): 0 = serial, 1 = auto (parallel when
 // the bank has at least superfaiss.ParallelScan.MinChunks chunks), 2 = force parallel.
@@ -28,6 +42,23 @@ DECLARE_CYCLE_STAT(TEXT("QuerySync"), STAT_SuperFAISSQuerySync, STATGROUP_SuperF
 DECLARE_CYCLE_STAT(TEXT("QueryBatch"), STAT_SuperFAISSQueryBatch, STATGROUP_SuperFAISS);
 DECLARE_CYCLE_STAT(TEXT("QueryAsyncTask"), STAT_SuperFAISSQueryAsync, STATGROUP_SuperFAISS);
 DECLARE_CYCLE_STAT(TEXT("QueryIntersect"), STAT_SuperFAISSQueryIntersect, STATGROUP_SuperFAISS);
+DECLARE_CYCLE_STAT(TEXT("QueryScratch"), STAT_SuperFAISSQueryScratch, STATGROUP_SuperFAISS);
+
+// Plugin plan section 5.1's claim-backing counters (section 12 B9), live gauges/
+// accumulators surfaced in `stat superfaiss`. Bytes-streamed/bandwidth/chunk-count/
+// batch-size/per-query-time are the last-COMPLETED-query telemetry (the same live
+// values USuperFAISSSubsystem::GetLastQuery*() reads back for B9's oracle); queries-
+// in-flight and the two B5 allocation counters are accumulators/gauges already tracked
+// elsewhere in this file (InFlightAsync, PoolGrowth, superfaiss::AllocationCount()) —
+// this just surfaces them, it does not introduce new tracking state.
+DECLARE_MEMORY_STAT(TEXT("Bytes Streamed (Last Query)"), STAT_SuperFAISSBytesStreamed, STATGROUP_SuperFAISS);
+DECLARE_FLOAT_COUNTER_STAT(TEXT("Effective Bandwidth MB/s (Last Query)"), STAT_SuperFAISSBandwidth, STATGROUP_SuperFAISS);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Chunk Count (Last Query)"), STAT_SuperFAISSChunkCount, STATGROUP_SuperFAISS);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Batch Size (Last QueryBatch)"), STAT_SuperFAISSBatchSize, STATGROUP_SuperFAISS);
+DECLARE_FLOAT_COUNTER_STAT(TEXT("Per-Query Time ms (Last QueryBatch)"), STAT_SuperFAISSPerQueryTimeMs, STATGROUP_SuperFAISS);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Queries In Flight"), STAT_SuperFAISSQueriesInFlight, STATGROUP_SuperFAISS);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Core Allocation Count"), STAT_SuperFAISSCoreAllocationCount, STATGROUP_SuperFAISS);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Workspace Pool Growth Count"), STAT_SuperFAISSPoolGrowthCount, STATGROUP_SuperFAISS);
 
 // Per-task scratch: a core Workspace (single-owner, per the core contract) plus an
 // aligned staging buffer for padded queries. Pooled; a warm pool never allocates.
@@ -56,7 +87,7 @@ struct USuperFAISSSubsystem::FPooledWorkspace
 	// buffers above; the tombstone words reuse TombstoneStaging (as QueryScratch does).
 
 	// Parallel-scan scratch, all from this one pooled workspace so the parallel path
-	// stays allocation-free once warm (Poirot T-033 constraint): per-chunk heap and
+	// stays allocation-free once warm (T-033 constraint): per-chunk heap and
 	// finalized-list storage, list pointers/counts for the merge, and the merge heap.
 	TArray<superfaiss::Hit> ChunkHeapStorage;
 	TArray<superfaiss::Hit> ChunkSorted;
@@ -175,13 +206,13 @@ namespace
 		}
 		for (const superfaiss::QuerySegment& Segment : Segments)
 		{
-			// Bounds-guard before the in-place read (Poirot P-1): a raw Args.Segments
+			// Bounds-guard before the in-place read (P-1): a raw Args.Segments
 			// range is not validated until the core Query() below, so an out-of-range
 			// segment would over-read/write PaddedQuery (sized paddedDims) here first.
 			// Skip it; the core then rejects the query. Channel-derived segments always
 			// resolve in range, so this only fires on a malformed raw Args.Segments range.
 			// int64 sum mirrors the core ValidateSegments overflow-clean posture
-			// (Poirot N-1): two large positives cannot wrap int32 past the bound.
+			// (N-1): two large positives cannot wrap int32 past the bound.
 			if (Segment.offset < 0 || Segment.length < 0 ||
 				static_cast<int64>(Segment.offset) + Segment.length > Bank->PaddedDims)
 			{
@@ -210,14 +241,54 @@ namespace
 
 	// Stages an unpadded query into aligned, zero-padded scratch and runs the core
 	// query. Shared by the sync, async, and Blueprint paths.
+	// Plugin plan section 5.1's B9 counters, set at every successful dispatch. A free
+	// function (no `this`) so this takes the values directly rather than reaching into
+	// USuperFAISSSubsystem's private state; RunQuery's two callers (QuerySync,
+	// QueryAsync's worker) both own an atomic pair to write into.
+	void PublishQueryTelemetry(std::atomic<uint64>& OutBytesStreamed,
+		std::atomic<int32>& OutChunkCount, uint64 Bytes, int32 Chunks)
+	{
+		OutBytesStreamed.store(Bytes, std::memory_order_relaxed);
+		OutChunkCount.store(Chunks, std::memory_order_relaxed);
+		SET_MEMORY_STAT(STAT_SuperFAISSBytesStreamed, Bytes);
+		SET_DWORD_STAT(STAT_SuperFAISSChunkCount, Chunks);
+		// The core allocator-seam count (the OTHER B5 zero-steady-state-allocation
+		// counter, alongside PoolGrowth) has no natural "changed" event of its own —
+		// it is a global core-side accumulator — so it is kept live here, on every
+		// successful query, the cheapest point that is guaranteed to run often enough
+		// for `stat superfaiss` to read a current value.
+		SET_DWORD_STAT(STAT_SuperFAISSCoreAllocationCount,
+			static_cast<uint32>(superfaiss::AllocationCount()));
+	}
+
+	// Effective bandwidth (plugin plan section 5.1's "bytes streamed and the derived
+	// effective bandwidth"): needs a timing denominator RunQuery/PublishQueryTelemetry
+	// don't have on their own, so the CALLER (which already opens the cycle-stat scope)
+	// wraps its own RunQuery call in a wall-clock stopwatch and reports here.
+	void PublishQueryBandwidth(double StartSeconds, uint64 BytesStreamed)
+	{
+		const double Elapsed = FPlatformTime::Seconds() - StartSeconds;
+		// Guard against a near-zero elapsed time reporting a meaningless spike (a
+		// warm-pool query can complete in well under a microsecond).
+		if (Elapsed > 1e-9)
+		{
+			const float MBPerSecond = static_cast<float>(
+				(static_cast<double>(BytesStreamed) / Elapsed) / (1024.0 * 1024.0));
+			SET_FLOAT_STAT(STAT_SuperFAISSBandwidth, MBPerSecond);
+		}
+	}
+
 	bool RunQuery(
 		const USuperFAISSVectorBank* Bank,
 		TConstArrayView<float> UnpaddedQuery,
 		const FSuperFAISSQueryArgs& Args,
 		USuperFAISSSubsystem::FPooledWorkspace& Scratch,
-		TArray<FSuperFAISSHit>& OutHits)
+		TArray<FSuperFAISSHit>& OutHits,
+		std::atomic<uint64>& OutBytesStreamed,
+		std::atomic<int32>& OutChunkCount)
 	{
 		using namespace superfaiss;
+		TRACE_CPUPROFILER_EVENT_SCOPE_ON_CHANNEL(TEXT("SuperFAISS.Query"), SuperFAISS);
 
 		OutHits.Reset();
 		if (Bank == nullptr || !Bank->IsValid() || Args.K <= 0 ||
@@ -305,6 +376,9 @@ namespace
 					? Margin(Scratch.HitStaging[i], Scratch.HitStaging[i + 1], ScoredMetric)
 					: 0.0f;
 			}
+			// Segmented/biased/cross-device queries always run the single serial core
+			// call above — one partition, never the pooled parallel fan-out.
+			PublishQueryTelemetry(OutBytesStreamed, OutChunkCount, BankBytes(View), 1);
 			return true;
 		}
 
@@ -329,7 +403,7 @@ namespace
 			// the list arrays with Chunks alone (a many-chunks/small-K query must not
 			// be satisfied by a large Chunks*K reservation from a previous query).
 			const int32 K = Args.K;
-			// int64 guard mirrors the batch path (Poirot M6): caller-unbounded K must
+			// int64 guard mirrors the batch path (M6): caller-unbounded K must
 			// not wrap the capacity math.
 			const int64 SingleCellCount = static_cast<int64>(Chunks) * K;
 			if (SingleCellCount > MAX_int32)
@@ -360,6 +434,11 @@ namespace
 			ParallelFor(Chunks, [&Scoring, &Scratch, HeapBase, SortedBase, ListPtrs,
 				ListCounts, Exclude, K](int32 Chunk)
 			{
+				// The per-chunk scan kernel scope (plugin plan section 5.1): "the one a
+				// developer reads to see the section 5 bandwidth model in the timeline."
+				// Zero-cost when the channel is off (the trace macro's own contract) —
+				// safe to emit at this frequency (once per chunk per query).
+				TRACE_CPUPROFILER_EVENT_SCOPE_ON_CHANNEL(TEXT("SuperFAISS.ScanChunk"), SuperFAISS);
 				TopK ChunkTopK;
 				ChunkTopK.Init(HeapBase + static_cast<int64>(Chunk) * K, K, Scoring.metric);
 				ScoreChunk(Scoring, Scratch.QueryStaging.GetData(), Chunk, Exclude, ChunkTopK);
@@ -367,8 +446,11 @@ namespace
 				ListCounts[Chunk] = ChunkTopK.Finalize(SortedBase + static_cast<int64>(Chunk) * K);
 			});
 
-			HitCount = MergeTopK(ListPtrs, ListCounts, Chunks, Scoring.metric, K,
-				Scratch.MergeHeap.GetData(), Scratch.HitStaging.GetData());
+			{
+				TRACE_CPUPROFILER_EVENT_SCOPE_ON_CHANNEL(TEXT("SuperFAISS.MergeTopK"), SuperFAISS);
+				HitCount = MergeTopK(ListPtrs, ListCounts, Chunks, Scoring.metric, K,
+					Scratch.MergeHeap.GetData(), Scratch.HitStaging.GetData());
+			}
 		}
 		else
 		{
@@ -379,6 +461,9 @@ namespace
 				return false;
 			}
 		}
+
+		PublishQueryTelemetry(OutBytesStreamed, OutChunkCount, BankBytes(View),
+			(bParallel && Chunks > 1) ? Chunks : 1);
 
 		OutHits.SetNum(HitCount);
 		for (int32 i = 0; i < HitCount; ++i)
@@ -397,6 +482,10 @@ namespace
 TSharedPtr<USuperFAISSSubsystem::FPooledWorkspace>
 USuperFAISSSubsystem::AcquireWorkspace()
 {
+	// "scratch-pool alloc/free" (plugin plan section 5.1): the whole acquire, not
+	// just the growth branch, so a warm-pool pop (the steady-state, zero-alloc case)
+	// is visible in the timeline too, at the same cost the growth path pays.
+	TRACE_CPUPROFILER_EVENT_SCOPE_ON_CHANNEL(TEXT("SuperFAISS.WorkspacePoolAcquire"), SuperFAISS);
 	{
 		FScopeLock Lock(&PoolLock);
 		if (Pool.Num() > 0)
@@ -405,11 +494,16 @@ USuperFAISSSubsystem::AcquireWorkspace()
 		}
 	}
 	PoolGrowth.fetch_add(1, std::memory_order_relaxed);
+	SET_DWORD_STAT(STAT_SuperFAISSPoolGrowthCount, PoolGrowth.load(std::memory_order_relaxed));
+	// Insights bookmark (plugin plan section 5.1): "the visual signature of a
+	// zero-allocation-contract violation" — B5's guard, made a timeline marker.
+	TRACE_BOOKMARK(TEXT("SuperFAISS: workspace pool grew"));
 	return MakeShared<FPooledWorkspace>();
 }
 
 void USuperFAISSSubsystem::ReleaseWorkspace(TSharedPtr<FPooledWorkspace> Workspace)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE_ON_CHANNEL(TEXT("SuperFAISS.WorkspacePoolRelease"), SuperFAISS);
 	FScopeLock Lock(&PoolLock);
 	Pool.Push(MoveTemp(Workspace));
 }
@@ -419,13 +513,32 @@ uint64 USuperFAISSSubsystem::GetPoolGrowthCount() const
 	return PoolGrowth.load(std::memory_order_relaxed);
 }
 
+// V3.2 slot 5 (plugin plan section 5.1 / B9): the last-completed-query telemetry
+// STATGROUP_SuperFAISS's own counters publish from — see the header's doc comment for
+// the exact contract. Set by PublishQueryTelemetry (RunQuery/QueryBatch/QueryIntersect/
+// QueryScratch's already-resolved View) and, for batch size, QueryBatch alone.
+uint64 USuperFAISSSubsystem::GetLastQueryBytesStreamed() const
+{
+	return LastQueryBytesStreamed.load(std::memory_order_relaxed);
+}
+
+int32 USuperFAISSSubsystem::GetLastQueryChunkCount() const
+{
+	return LastQueryChunkCount.load(std::memory_order_relaxed);
+}
+
+int32 USuperFAISSSubsystem::GetLastQueryBatchSize() const
+{
+	return LastQueryBatchSize.load(std::memory_order_relaxed);
+}
+
 void USuperFAISSSubsystem::Deinitialize()
 {
 	// Refuse new dispatches, then wait out the fleet. Deliveries are queued to the
 	// game thread — which is this thread — so the queue must be pumped while waiting
 	// or the counter can never reach zero.
 	// The bDraining/InFlightAsync ordering is race-free only because dispatch and
-	// drain share the game thread (Poirot O7) — pin the assumption.
+	// drain share the game thread (O7) — pin the assumption.
 	check(IsInGameThread());
 	bDraining.store(true);
 	while (InFlightAsync.load() > 0)
@@ -443,9 +556,21 @@ bool USuperFAISSSubsystem::QuerySync(
 	TArray<FSuperFAISSHit>& OutHits)
 {
 	SCOPE_CYCLE_COUNTER(STAT_SuperFAISSQuerySync);
+	CSV_SCOPED_TIMING_STAT(SuperFAISS, QuerySync);
+	const double StartSeconds = FPlatformTime::Seconds();
 	TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
-	const bool bOk = RunQuery(Bank, UnpaddedQuery, Args, *Scratch, OutHits);
+	const bool bOk = RunQuery(Bank, UnpaddedQuery, Args, *Scratch, OutHits,
+		LastQueryBytesStreamed, LastQueryChunkCount);
 	ReleaseWorkspace(MoveTemp(Scratch));
+	if (bOk)
+	{
+		// A failed RunQuery never touches LastQueryBytesStreamed (it stays whatever
+		// the previous successful query left it), so publishing bandwidth on a
+		// rejection would divide a stale byte count by this call's own near-zero
+		// elapsed time — a garbage spike in the gauge, not a real measurement
+		// (QueryAsync/QueryScratch already guard this correctly).
+		PublishQueryBandwidth(StartSeconds, LastQueryBytesStreamed.load(std::memory_order_relaxed));
+	}
 	return bOk;
 }
 
@@ -455,7 +580,7 @@ FSuperFAISSTicket USuperFAISSSubsystem::QueryAsync(
 	const FSuperFAISSQueryArgs& Args,
 	FSuperFAISSNativeResultDelegate Completion)
 {
-	check(IsInGameThread()); // dispatch must share the drain's thread (Poirot O7)
+	check(IsInGameThread()); // dispatch must share the drain's thread (O7)
 	FSuperFAISSTicket Ticket;
 	Ticket.CancelFlag = MakeShared<std::atomic<bool>, ESPMode::ThreadSafe>(false);
 
@@ -472,7 +597,7 @@ FSuperFAISSTicket USuperFAISSSubsystem::QueryAsync(
 	// Pin the bank against GC for the task's lifetime; copy the query, the
 	// exclusion bits, and the FULL args — the caller's views need not outlive
 	// this call, and an async query must run the same query the sync path would
-	// (Poirot P-3: the original copy carried only K/ExcludeBits/bScoreAsDot, so
+	// (P-3: the original copy carried only K/ExcludeBits/bScoreAsDot, so
 	// async segmented/channel/bias/cross-device queries silently ran plain and
 	// reported success). The TArray members deep-copy; ExcludeBits is a view, so
 	// it is detached here and re-pointed at the task-owned copy inside the task.
@@ -486,6 +611,7 @@ FSuperFAISSTicket USuperFAISSSubsystem::QueryAsync(
 	// Counted from dispatch until the game-thread delivery finishes, so the
 	// Deinitialize drain covers the whole lifetime that touches `this` or the bank.
 	InFlightAsync.fetch_add(1);
+	SET_DWORD_STAT(STAT_SuperFAISSQueriesInFlight, InFlightAsync.load(std::memory_order_relaxed));
 
 	FFunctionGraphTask::CreateAndDispatchWhenReady(
 		[this, PinnedBank = MoveTemp(PinnedBank), QueryCopy = MoveTemp(QueryCopy),
@@ -493,6 +619,10 @@ FSuperFAISSTicket USuperFAISSSubsystem::QueryAsync(
 			CancelFlag, Completion = MoveTemp(Completion)]() mutable
 		{
 			SCOPE_CYCLE_COUNTER(STAT_SuperFAISSQueryAsync);
+			// "async dispatch + result marshalling" (plugin plan section 5.1): the whole
+			// dispatched worker body, submit through hand-off, is one Insights span.
+			TRACE_CPUPROFILER_EVENT_SCOPE_ON_CHANNEL(TEXT("SuperFAISS.AsyncDispatch"), SuperFAISS);
+			const double StartSeconds = FPlatformTime::Seconds();
 
 			TArray<FSuperFAISSHit> Hits;
 			bool bOk = false;
@@ -500,8 +630,20 @@ FSuperFAISSTicket USuperFAISSSubsystem::QueryAsync(
 			{
 				ArgsCopy.ExcludeBits = ExcludeCopy; // task-owned storage, task-local view
 				TSharedPtr<FPooledWorkspace> Scratch = AcquireWorkspace();
-				bOk = RunQuery(PinnedBank.Get(), QueryCopy, ArgsCopy, *Scratch, Hits);
+				bOk = RunQuery(PinnedBank.Get(), QueryCopy, ArgsCopy, *Scratch, Hits,
+					LastQueryBytesStreamed, LastQueryChunkCount);
 				ReleaseWorkspace(MoveTemp(Scratch));
+				if (bOk)
+				{
+					PublishQueryBandwidth(StartSeconds,
+						LastQueryBytesStreamed.load(std::memory_order_relaxed));
+				}
+			}
+			else
+			{
+				// Insights bookmark (plugin plan section 5.1): an async query cancellation,
+				// one of the four named events a developer hunts for in a timeline.
+				TRACE_BOOKMARK(TEXT("SuperFAISS: async query cancelled"));
 			}
 			const bool bSuccess = bOk && !CancelFlag->load();
 
@@ -514,6 +656,8 @@ FSuperFAISSTicket USuperFAISSSubsystem::QueryAsync(
 					Completion.ExecuteIfBound(Hits, bSuccess);
 					PinnedBank.Reset();
 					InFlightAsync.fetch_sub(1);
+					SET_DWORD_STAT(STAT_SuperFAISSQueriesInFlight,
+						InFlightAsync.load(std::memory_order_relaxed));
 				});
 		},
 		TStatId(), nullptr, ENamedThreads::AnyBackgroundThreadNormalTask);
@@ -528,6 +672,9 @@ bool USuperFAISSSubsystem::QueryScratch(
 	TArray<FSuperFAISSHit>& OutHits)
 {
 	using namespace superfaiss;
+	SCOPE_CYCLE_COUNTER(STAT_SuperFAISSQueryScratch);
+	TRACE_CPUPROFILER_EVENT_SCOPE_ON_CHANNEL(TEXT("SuperFAISS.Query"), SuperFAISS);
+	const double StartSeconds = FPlatformTime::Seconds();
 
 	OutHits.Reset();
 	// V3.0 slot 5 (T-099): scratch banks now carry a channel table (InitWithChannels),
@@ -551,7 +698,7 @@ bool USuperFAISSSubsystem::QueryScratch(
 	do
 	{
 		BankView View;
-		// Size the staging from CAPACITY, not the current count (Poirot P-1): the
+		// Size the staging from CAPACITY, not the current count (P-1): the
 		// pin excludes Grow/Freeze/Load but NOT Append - that concurrency is the
 		// scratch bank's designed model - so Snapshot's own count read can exceed
 		// a count read here, and a word-boundary crossing in that window would
@@ -597,7 +744,7 @@ bool USuperFAISSSubsystem::QueryScratch(
 		// and raw segments are mutually exclusive (the baked path's rule); an unknown
 		// channel name is a defined rejection. V3.1 Relabel relaxes D-V3-2 (the table is
 		// mutable), but Relabel swaps the host name list and the core channel table
-		// together inside its exclusive drain (SuperFAISSScratchBank::Relabel, Poirot C1),
+		// together inside its exclusive drain (SuperFAISSScratchBank::Relabel, C1),
 		// so under this reader pin GetChannelIndex's position still indexes View.channels
 		// directly — host names and snapshot table are never observed skewed.
 		if (Args.Channels.Num() > 0 && Args.Segments.Num() > 0)
@@ -648,14 +795,14 @@ bool USuperFAISSSubsystem::QueryScratch(
 			float* PaddedQuery = Scratch->QueryStaging.GetData();
 			for (const QuerySegment& Segment : Segments)
 			{
-				// Bounds-guard before the in-place read (Poirot P-1): raw Args.Segments
+				// Bounds-guard before the in-place read (P-1): raw Args.Segments
 				// arrive unvalidated and the core's segment validation runs later inside
 				// Query(), so an out-of-range segment would over-read/write QueryStaging
 				// (sized paddedDims) here first. Skip it; the core then rejects the query.
 				// Named-channel segments come from the validated snapshot table and always
 				// pass, so this only ever fires on a malformed raw Args.Segments range.
 				// int64 sum mirrors the core ValidateSegments overflow-clean posture
-				// (Poirot N-1): two large positives cannot wrap int32 past the bound.
+				// (N-1): two large positives cannot wrap int32 past the bound.
 				if (Segment.offset < 0 || Segment.length < 0 ||
 					static_cast<int64>(Segment.offset) + Segment.length > View.paddedDims)
 				{
@@ -720,9 +867,17 @@ bool USuperFAISSSubsystem::QueryScratch(
 				? Margin(Scratch->HitStaging[i], Scratch->HitStaging[i + 1], ScoredMetric)
 				: 0.0f;
 		}
+		// QueryScratch always runs the single serial core call above — no ParallelFor
+		// fan-out exists in this function, so the partition is always 1.
+		PublishQueryTelemetry(LastQueryBytesStreamed, LastQueryChunkCount,
+			BankBytes(View), 1);
 		bOk = true;
 	} while (false);
 	ReleaseWorkspace(Scratch);
+	if (bOk)
+	{
+		PublishQueryBandwidth(StartSeconds, LastQueryBytesStreamed.load(std::memory_order_relaxed));
+	}
 	return bOk;
 }
 
@@ -754,6 +909,12 @@ bool USuperFAISSSubsystem::QueryBatch(
 	TConstArrayView<FSuperFAISSBiasPair> PerQueryBiasPairs)
 {
 	SCOPE_CYCLE_COUNTER(STAT_SuperFAISSQueryBatch);
+	// "the batch bank-pass" (plugin plan section 5.1) — one span for the whole
+	// M-query pass, distinct from the per-chunk spans inside it.
+	TRACE_CPUPROFILER_EVENT_SCOPE_ON_CHANNEL(TEXT("SuperFAISS.QueryBatch"), SuperFAISS);
+	CSV_SCOPED_TIMING_STAT(SuperFAISS, QueryBatch);
+	TRACE_BOOKMARK(TEXT("SuperFAISS: batch dispatch (%d queries)"), QueryCount);
+	const double StartSeconds = FPlatformTime::Seconds();
 	using namespace superfaiss;
 
 	OutHits.Reset();
@@ -940,6 +1101,7 @@ bool USuperFAISSSubsystem::QueryBatch(
 		ParallelFor(Chunks, [&Scoring, HeapBase, SortedBase, CellCounts, QueryBase, Exclude,
 			K, QueryCount, Pd](int32 Chunk)
 		{
+			TRACE_CPUPROFILER_EVENT_SCOPE_ON_CHANNEL(TEXT("SuperFAISS.ScanChunk"), SuperFAISS);
 			TopK PairA;
 			TopK PairB;
 			int32 M = 0;
@@ -972,17 +1134,20 @@ bool USuperFAISSSubsystem::QueryBatch(
 		}
 		const superfaiss::Hit** ListPtrs = Scratch->ChunkListPtrs.GetData();
 		int32_t* PerChunkCounts = Scratch->MergeCountScratch.GetData();
-		for (int32 M = 0; M < QueryCount; ++M)
 		{
-			for (int32 Chunk = 0; Chunk < Chunks; ++Chunk)
+			TRACE_CPUPROFILER_EVENT_SCOPE_ON_CHANNEL(TEXT("SuperFAISS.MergeTopK"), SuperFAISS);
+			for (int32 M = 0; M < QueryCount; ++M)
 			{
-				const int64 Cell = static_cast<int64>(Chunk) * QueryCount + M;
-				ListPtrs[Chunk] = SortedBase + Cell * K;
-				PerChunkCounts[Chunk] = CellCounts[Cell];
+				for (int32 Chunk = 0; Chunk < Chunks; ++Chunk)
+				{
+					const int64 Cell = static_cast<int64>(Chunk) * QueryCount + M;
+					ListPtrs[Chunk] = SortedBase + Cell * K;
+					PerChunkCounts[Chunk] = CellCounts[Cell];
+				}
+				Counts[M] = MergeTopK(ListPtrs, PerChunkCounts, Chunks, Scoring.metric,
+					K, Scratch->MergeHeap.GetData(),
+					Scratch->HitStaging.GetData() + static_cast<int64>(M) * K);
 			}
-			Counts[M] = MergeTopK(ListPtrs, PerChunkCounts, Chunks, Scoring.metric,
-				K, Scratch->MergeHeap.GetData(),
-				Scratch->HitStaging.GetData() + static_cast<int64>(M) * K);
 		}
 	}
 	else
@@ -995,6 +1160,20 @@ bool USuperFAISSSubsystem::QueryBatch(
 			return false;
 		}
 	}
+
+	PublishQueryTelemetry(LastQueryBytesStreamed, LastQueryChunkCount, BankBytes(View),
+		(bParallel && Chunks > 1) ? Chunks : 1);
+	LastQueryBatchSize.store(QueryCount, std::memory_order_relaxed);
+	SET_DWORD_STAT(STAT_SuperFAISSBatchSize, QueryCount);
+	{
+		const double Elapsed = FPlatformTime::Seconds() - StartSeconds;
+		if (Elapsed > 1e-9 && QueryCount > 0)
+		{
+			SET_FLOAT_STAT(STAT_SuperFAISSPerQueryTimeMs,
+				static_cast<float>((Elapsed * 1000.0) / QueryCount));
+		}
+	}
+	PublishQueryBandwidth(StartSeconds, LastQueryBytesStreamed.load(std::memory_order_relaxed));
 
 	OutCounts.SetNum(QueryCount);
 	OutHits.SetNum(HitCapacity);
@@ -1026,6 +1205,8 @@ bool USuperFAISSSubsystem::QueryIntersect(
 	TArray<FSuperFAISSHit>& OutHits)
 {
 	SCOPE_CYCLE_COUNTER(STAT_SuperFAISSQueryIntersect);
+	TRACE_CPUPROFILER_EVENT_SCOPE_ON_CHANNEL(TEXT("SuperFAISS.Query"), SuperFAISS);
+	const double StartSeconds = FPlatformTime::Seconds();
 	using namespace superfaiss;
 
 	OutHits.Reset();
@@ -1130,6 +1311,7 @@ bool USuperFAISSSubsystem::QueryIntersect(
 		ParallelFor(Chunks, [&Scoring, HeapBase, SortedBase, ListPtrs, ListCounts,
 			QueryBase, Exclude, K, QueryCount](int32 Chunk)
 		{
+			TRACE_CPUPROFILER_EVENT_SCOPE_ON_CHANNEL(TEXT("SuperFAISS.ScanChunk"), SuperFAISS);
 			TopK ChunkTopK;
 			ChunkTopK.Init(HeapBase + static_cast<int64>(Chunk) * K, K, Scoring.metric);
 			ScoreChunkFused(Scoring, QueryBase, QueryCount, Chunk, Exclude, ChunkTopK);
@@ -1137,8 +1319,11 @@ bool USuperFAISSSubsystem::QueryIntersect(
 			ListCounts[Chunk] = ChunkTopK.Finalize(SortedBase + static_cast<int64>(Chunk) * K);
 		});
 
-		HitCount = MergeTopK(ListPtrs, ListCounts, Chunks, Scoring.metric, K,
-			Scratch->MergeHeap.GetData(), Scratch->HitStaging.GetData());
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE_ON_CHANNEL(TEXT("SuperFAISS.MergeTopK"), SuperFAISS);
+			HitCount = MergeTopK(ListPtrs, ListCounts, Chunks, Scoring.metric, K,
+				Scratch->MergeHeap.GetData(), Scratch->HitStaging.GetData());
+		}
 	}
 	else
 	{
@@ -1151,6 +1336,10 @@ bool USuperFAISSSubsystem::QueryIntersect(
 			return false;
 		}
 	}
+
+	PublishQueryTelemetry(LastQueryBytesStreamed, LastQueryChunkCount, BankBytes(View),
+		(bParallel && Chunks > 1) ? Chunks : 1);
+	PublishQueryBandwidth(StartSeconds, LastQueryBytesStreamed.load(std::memory_order_relaxed));
 
 	OutHits.SetNum(HitCount);
 	for (int32 i = 0; i < HitCount; ++i)

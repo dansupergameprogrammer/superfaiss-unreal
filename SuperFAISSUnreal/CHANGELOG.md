@@ -1,0 +1,61 @@
+# Changelog
+
+All notable changes to the SuperFAISSUnreal plugin. Versions follow the plugin's own
+`.uplugin` `VersionName`, tracking (but not identical to) the vendored core's version —
+see `Source/ThirdParty/SuperFAISS/VENDORED_VERSION.txt` for the exact core commit each
+release vendors.
+
+The format follows [Keep a Changelog](https://keepachangelog.com).
+
+## [3.2.0] — 2026-07-20
+
+### Added
+- **Bank Inspector — structure, novelty, and correspondence.** A new editor tab (**Tools
+  > SuperFAISS Bank Inspector**) built on the vendored core's `graph.h`/`novelty.h`/
+  `matching.h` primitives, answering three questions a raw query can't:
+  - **View A — Structure.** Clusters the current sample by mutual k-nearest-neighbor
+    agreement plus exact-duplicate grouping, then connected components. One result row
+    per cluster (plus an Outliers row below the configured minimum size), expandable to
+    each member's bank id. Selecting a cluster highlights every one of its points in the
+    PCA scatter; selecting a single row highlights the row itself, its k-nearest
+    neighbors, and the rest of its cluster as three distinct signals.
+  - **View B — Novelty.** A probe box (row id or `#index`) answers duplicate / familiar
+    / novel against the bank's own content — an exact-distance identity check first (a
+    true 0.0 metric distance on a real duplicate under Cosine int8 or a byte-identical
+    float32 row; a disclosed double-precision epsilon on L2's expanded form), falling
+    through to a statistical rank against a calibrated k-th-neighbor baseline only when
+    the identity check does not already resolve it. An evidence list shows the probe's
+    actual nearest neighbors with scores and margins.
+  - **View C — Correspondence.** Given a second bank (asset picker, or an opened scratch
+    archive), reports each sampled row of the primary bank's matched partner in the
+    second bank, with a CSLS margin and a matched/ambiguous state. Disclosed as the
+    HEAVY pass in the set — cost scales with both banks' sizes — before it runs.
+  - **Open scratch archive…**, on both the primary and second-bank slots, loads a saved
+    `USuperFAISSScratchBank` archive file directly as a transient inspection source, with
+    no need to bake it to an asset first. Tombstoned rows are honored throughout — never
+    sampled, clustered, or reported as a match.
+  - **Analysis parameters** (sample cap, structure's k and minimum cluster size,
+    novelty's k and lambda, correspondence's match-k and CSLS threshold) live in one
+    per-user, per-project editor settings object and persist across sessions.
+- **Insights instrumentation bar.** Every analysis pass, and the runtime query path
+  underneath it, is wrapped in a dedicated, zero-cost-when-off `SuperFAISS` trace channel
+  for Unreal Insights, plus a `STATGROUP_SuperFAISS` stat group (bytes streamed,
+  effective bandwidth, chunk count, batch size, per-query time, queries in flight, and
+  the zero-steady-state-allocation counters). The determinism suite runs trace-OFF and
+  trace-ON and asserts one identical result, so a profiling session cannot itself change
+  the answer.
+
+### Changed
+- **Vendored core bumped to v3.2.0** (see `Source/ThirdParty/SuperFAISS/CHANGELOG.md` and
+  `VENDORED_VERSION.txt` for the full delta) — the `graph.h`/`novelty.h`/`matching.h`/
+  `inspector_common.h` headers the Bank Inspector is built on, plus the release-identity
+  correction to `version.h` and the documentation of `NoveltyProbeDistance`'s off-grid
+  int8 channel rejection.
+
+### Fixed
+- **Novelty panel's `duplicate` verdict no longer renders a meaningless CDF readout.**
+  A `duplicate` verdict is decided entirely by the exact-identity check (limb 1); the
+  statistical-rank baseline (limb 2) is never consulted for it and its fields stay at
+  their zeroed defaults. The rendered text previously printed them anyway
+  (`duplicate — novelty 0.0000 vs 0 of 0 sampled rows`); it now renders the plain
+  verdict word for this case.

@@ -206,7 +206,7 @@ bool FSuperFAISSScratchBankTest::RunTest(const FString& Parameters)
 			Sub->QueryScratch(Bank, Row, Args, Hits));
 	}
 
-	// R-5 (Poirot deep review): freezing zero live rows yields an EMPTY VALID
+	// R-5 (deep review): freezing zero live rows yields an EMPTY VALID
 	// bank, not a null indistinguishable from failure.
 	{
 		USuperFAISSScratchBank* Fresh = NewObject<USuperFAISSScratchBank>();
@@ -240,7 +240,7 @@ bool FSuperFAISSScratchBankTest::RunTest(const FString& Parameters)
 		}
 	}
 
-	// P-2 (Poirot sweep): querying an EMPTY scratch bank is well-defined - true
+	// P-2 (sweep): querying an EMPTY scratch bank is well-defined - true
 	// with zero hits - regardless of the pooled workspace's history (pre-fix it
 	// returned false on a cold buffer and true on a warm one).
 	{
@@ -257,7 +257,7 @@ bool FSuperFAISSScratchBankTest::RunTest(const FString& Parameters)
 		TestEqual(TEXT("empty-bank zero hits"), Hits.Num(), 0);
 	}
 
-	// P-1 (Poirot sweep): appends racing pinned queries - the scratch bank's
+	// P-1 (sweep): appends racing pinned queries - the scratch bank's
 	// designed model - must never corrupt staging. The fix sizes tombstone
 	// staging from capacity (pin-stable); this storm drives appends across many
 	// 32-row word boundaries while queries run, and every returned hit must be a
@@ -476,7 +476,7 @@ bool FSuperFAISSScratchRecallTest::RunTest(const FString& Parameters)
 	return true;
 }
 
-// Review S1 / Japp S-1 — staleness across Save/Load at the plugin surface: a
+// S-1 — staleness across Save/Load at the plugin surface: a
 // recall report taken before a LoadFromBytes must read STALE after it, never
 // silently current. The trap is the append-only same-count restore (a save-game
 // round trip): the pre-fix core reset the generation to the loaded row count —

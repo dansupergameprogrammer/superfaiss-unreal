@@ -1,4 +1,4 @@
-// Scratch-bank channel tests (T-099 slot 5, red suite authored by Curie against the
+// Scratch-bank channel tests (T-099 slot 5, red suite authored against the
 // red-scaffold stub): the scratch wrapper gets a named-channel query surface it has
 // none of today. Mirrors SuperFAISSChannelTests.cpp's baked-path idiom (InitFromSource
 // with a channel table, named-channel query, named==raw-range equivalence, malformed-
@@ -398,7 +398,7 @@ bool FSuperFAISSScratchChannelMalformedTableTest::RunTest(const FString& Paramet
 }
 
 // -----------------------------------------------------------------------------------
-// Cell 5 — P-1 renorm bounds safety (Poirot P-1, committed guard 16830d4). On a Cosine
+// Cell 5 — P-1 renorm bounds safety (committed guard 16830d4). On a Cosine
 // channel scratch bank the per-channel-cosine renorm reads/writes the padded query
 // staging over each segment's range BEFORE the core Query() validates segment bounds.
 // A raw Args.Segments range with offset+length > paddedDims used to over-read/over-write

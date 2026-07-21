@@ -1,1 +1,60 @@
-SuperFAISS at tag v3.1.2 (documentation/version-header point over v3.1.1's library source, commit d62c162) — v3.0 channel-capable scratch banks + channel-scoped analytics + archive v3, v3.1 runtime-mutable channel vocabulary (Relabel), v3.1.1 AVX2 float32 dot/L2 sub-8 segment-remainder fix. v3.1.2 delta: stale channel-table contracts scrubbed in scratch.h/scratch.cpp/API.md/INTEGRATION.md, Relabel documented in API.md/INTEGRATION.md, version.h corrected to the released version (was 3.0.1). No kernel or behavior change since v3.1.1.
+SuperFAISS at core master commit 4f4b5b6 (UNTAGGED — release identity reads v3.2.0 in
+version.h; no v3.2.0 git tag exists yet). v3.1.2 carried v3.0 channel-capable scratch
+banks + channel-scoped analytics + archive v3, v3.1 runtime-mutable channel vocabulary
+(Relabel), v3.1.1 AVX2 float32 dot/L2 sub-8 segment-remainder fix, and v3.1.2's own
+doc/version-header corrections — no kernel or behavior change since v3.1.1.
+
+v3.2 delta — four new Tier 1 headers for Bank Inspector I, each dependency-free,
+caller-provided buffers, deterministic with pinned tie-breaks, consuming exact query
+output only (no kernel, quantization, or format change):
+- `graph.h` — `BuildKnnNeighbors`/`MutualFilter`/`BuildDuplicateGroups`/`ConnectedComponents`,
+  the mutual k-NN graph + connected-components mechanic behind the Structure view.
+- `novelty.h` — `NoveltyScore`/`NoveltyProbeDistance`/`KthNeighborDistance`/
+  `CalibrateNoveltyBaseline`, the two-limb (exact-identity + statistical-rank) novelty
+  probe behind the Novelty view. `NoveltyProbeDistance`'s int8 leg is routed through the
+  caller's `Workspace` (its quantized-probe staging is no longer a per-call heap
+  allocation) and its channel leg rejects an off-grid channel range on a hand-built
+  `BankView` (a validated bank's channel table is always grid-aligned, so this never
+  fires on production data).
+- `matching.h` — `MutualNearestMatches`, the sampled-A-over-full-banks CSLS matching
+  behind the Correspondence view.
+- `inspector_common.h` — `DequantizeRowAsQuery`, the shared row-to-query decode helper
+  the three modules above and the plugin's own centroid-query path both build against.
+
+All four headers are wired into the `superfaiss.h` umbrella header and documented in
+`docs/API.md`.
+
+Publish-gate corrections in this sync (commits ef25c5c, 6f43d62):
+- Public headers, src, and tests cited the private records tree by path and named
+  internal reviewer personas directly in shipped comments — stripped; the underlying
+  technical content (invariants, disclosed limits, design rationale) is unchanged.
+- The v3.0 channel-table contract ("fixed for the bank's lifetime"), repealed by v3.1's
+  `Relabel`, was still asserted in `docs/API.md`, `docs/DETERMINISM.md`, `docs/FORMAT.md`,
+  `scratch.h`, and `README.md` — corrected to the current mutable-via-Relabel contract.
+- `inspector_common.h` was wired into the umbrella header but undocumented in `docs/API.md`
+  — a full section added. Two further undocumented public free functions found by a new
+  reverse doc-signature check (`Better` in topk.h, `ScoreChunkFused` in kernels.h) and one
+  from an earlier release (`ValidateBiasPairs` in validate.h, `MaxNNCrossDeviceChannel` in
+  analytics.h) were documented in the same pass.
+- The README's "true 0.0 on Cosine" claim for `NoveltyProbeDistance` did not carry the
+  qualifier `novelty.h`'s own header discloses (the guarantee is int8, or a byte-identical
+  float32 row) — corrected to match `docs/API.md`'s already-correct scoping.
+- The README's headline "Measured" table read as an ~8x single-thread win from batching
+  alone; measured single-thread batch amortization is 1.16-1.44x, and the ~8x gap is host
+  parallelism. The table now states threading explicitly per row and cites its bench
+  source; `tests/bench_main.cpp` gained the table's own 40k x 100 workload so the
+  single-threaded rows are reproducible from the core repo.
+
+Publish-gate corrections in this sync (commit 4f4b5b6):
+- The serial-scan figure (~0.5 ms) was superseded by two independent re-measurements
+  (0.629 ms and 0.719 ms) settling on ~0.65 ms, corrected in the README's own table in an
+  earlier pass, but the derived "~8x gap" statement and INTEGRATION.md's "10 GB/s-
+  equivalent" bandwidth figure were still computed from the old number — recomputed to
+  5.0x (chunk-parallel) / 10.8x (batched, host-parallelized) and ~6 GB/s-equivalent.
+- "Three header-only Tier-1 modules" corrected to "Four" (`inspector_common.h` was
+  omitted from the README's own count, though already documented and wired).
+- `superfaiss_bench` (`tests/bench_main.cpp`) had no CMake target and no `build.bat`
+  wiring — nothing in a fresh clone produced the executable the README's Reproduce
+  column named. Added the CMake target and `build.bat` wiring; verified by a clean build
+  producing and running `superfaiss_bench.exe`, reproducing ~0.65 ms on the 40k x 100
+  int8 workload.

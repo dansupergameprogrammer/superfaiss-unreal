@@ -103,6 +103,8 @@ Status ValidateBank(const BankView&);                        // structural; chea
 Status ValidateQuery(const BankView&, const float* query);   // per query-buffer
 Status ValidateSegments(const BankView&, const float* query, // v2.0: segment lists
                         const QuerySegment*, int32_t count);
+Status ValidateBiasPairs(const BankView&, const BiasPair* pairs, // v2.1: sparse bias
+                        int32_t pairCount, uint32_t* seenBits);
 Status ValidateBankData(const BankView&, int32_t* outBadRow);// full content; load-time
 ```
 
@@ -110,7 +112,12 @@ Status ValidateBankData(const BankView&, int32_t* outBadRow);// full content; lo
 rejects everything the kernels cannot tolerate (non-finite lanes, non-zero padding,
 bad int8 scales). `ValidateQuery` (and `ValidateSegments` when segments are present -
 count/grid/order/bounds, finite weights, and the Cosine zero-norm-sub-vector rule) is
-called by the query entry points automatically.
+called by the query entry points automatically. `ValidateBiasPairs` checks a sparse
+per-row bias list before a scan uses it: `pairCount` in `[0, bank.count]`, every index
+unique and in range, every bias value finite. `seenBits` is caller scratch
+(`ceil(count/32)` zeroed `uint32` words); on return, the pair rows' bits are set so
+callers can detect pair rows among scan candidates. Dense bias is not pre-validated —
+its finite check fuses into the scan itself.
 
 ## bake.h — producing banks
 
@@ -183,9 +190,12 @@ For hosts that want to fan a single query out across threads:
 
 ```cpp
 void ScoreChunk(const BankView&, const float* paddedQuery, int32_t chunkIndex,
-                const uint32_t* excludeBits, TopK& inout);
+                const uint32_t* excludeBits, TopK& inout,
+                const float* rowBias = nullptr, bool* outNonFiniteBias = nullptr);
 void ScoreChunkPair(const BankView&, const float* qA, const float* qB, int32_t chunkIndex,
-                    const uint32_t* excludeBits, TopK& inoutA, TopK& inoutB);
+                    const uint32_t* excludeBits, TopK& inoutA, TopK& inoutB,
+                    const float* rowBiasA = nullptr, const float* rowBiasB = nullptr,
+                    bool* outNonFiniteBias = nullptr);
 
 class TopK {            // bounded top-k over caller storage
     void    Init(Hit* storage, int32_t k, Metric);
@@ -195,6 +205,18 @@ class TopK {            // bounded top-k over caller storage
 
 int32_t MergeTopK(const Hit* const* lists, const int32_t* listCounts, int32_t listCount,
                   Metric, int32_t k, Hit* heapScratch, Hit* out);
+
+// TopK's own scan-order comparator: true iff `a` ranks strictly ahead of `b` under
+// `metric`'s better-direction (min for Dot/Cosine, max for L2). Push/HeapAbove above
+// are built on it; a caller comparing two Hits by hand uses the same function.
+bool  Better(const Hit& a, const Hit& b, Metric metric);
+
+void  ScoreChunkFused(const BankView&, const float* paddedQueries, int32_t queryCount,
+                      int32_t chunkIndex, const uint32_t* excludeBits, TopK& inout,
+                      const float* rowBias = nullptr, bool* outNonFiniteBias = nullptr);
+                      // the intersection primitive: per-query scores come from the
+                      // same per-row kernels as ScoreChunk, so fused scores are
+                      // bit-identical to the corresponding single-query scores.
 
 // v2.0 segmented chunk scoring (the dense path; dot-family folded queries just
 // use ScoreChunk/ScoreChunkPair on the weight-folded query):
@@ -240,7 +262,9 @@ Status MakeCentroidCrossDevice(const BankView&, const int32_t* rowIndices,
                                                             //   else one positive int per row
                                const uint32_t* excludeBits, // e.g. snapshot tombstones
                                int8_t* outQ8,               // paddedDims bytes, 16-aligned
-                               double* outScale, int64_t* outSqSum);
+                               double* outScale, int64_t* outSqSum,
+                               int32_t offset = 0,          // sub-range start element (V3.0); 0 = whole vector
+                               int32_t length = -1);        // sub-range length; < 0 = bank.dims (whole vector)
 ```
 
 Pure, allocation-free, deterministic (serial double-precision accumulation).
@@ -369,7 +393,10 @@ Status CentroidDistanceCrossDeviceChannel(/* CentroidDistanceCrossDevice args */
     Metric, int32_t channel, int8_t* scratchA, int8_t* scratchB, float* out);
 Status MeanNNCrossDeviceChannel(const BankView& source, const uint32_t* srcExclude,
     const BankView& target, const uint32_t* tgtExclude, int32_t channel,
-    XdQuery*, Hit*, int32_t*, Workspace&, float* out);   // MaxNNCrossDeviceChannel: order-free max
+    XdQuery*, Hit*, int32_t*, Workspace&, float* out);
+Status MaxNNCrossDeviceChannel(const BankView& source, const uint32_t* srcExclude,
+    const BankView& target, const uint32_t* tgtExclude, int32_t channel,
+    XdQuery*, Hit*, int32_t*, Workspace&, float* out);   // order-free max, same shape as Mean
 Status SpreadCrossDeviceChannel(const BankView&, const int32_t* rows, int32_t rowCount,
     const uint32_t* exclude, Reduce, int32_t channel, int8_t* scratch, float* out);
 ```
@@ -406,6 +433,118 @@ iteration, no dims^2 matrix, no allocation, deterministic (fixed seed vector, se
 row-order accumulation). The projection-visualizer substrate; a degenerate direction
 yields a zero component rather than an error.
 
+## inspector_common.h — row->query decode (v3.2)
+
+```cpp
+inline void DequantizeRowAsQuery(const BankView& bank, int32_t row,
+                                  float* outFloatQuery, int32_t targetPaddedDims = -1);
+```
+
+The row->query conversion shared across every Bank Inspector Tier-1 module (`graph.h`,
+`novelty.h`, `matching.h`): `Query`/`QueryBatch` take a float query, not a stored row, so
+this decodes stored row `row` exactly as the kernels decode it — int8 as `(byte) *
+scale`, float32 as-is — into a `targetPaddedDims`-length float buffer, zero-padding the
+tail. `targetPaddedDims` defaults to `bank.paddedDims` (the common same-bank case);
+`matching.h`'s cross-bank mutual match passes a different target's `paddedDims`
+explicitly, since the two banks may differ in quantization. Header-only, no allocation,
+no rejection path — the caller guarantees `row` is in range and `outFloatQuery` holds
+`targetPaddedDims` floats.
+
+## graph.h — mutual k-NN graph + connected components (v3.2)
+
+```cpp
+Status BuildKnnNeighbors(const BankView&, int32_t k, bool excludeSelf,
+                          int32_t* outNeighbors, Workspace&);
+Status MutualFilter     (int32_t count, int32_t k, const int32_t* neighbors,
+                          uint8_t* outMutualFlags);
+Status BuildDuplicateGroups(const BankView&, int32_t* outGroupOf, int32_t* scratch);
+Status ConnectedComponents(int32_t count, int32_t k, const int32_t* neighbors,
+                          const uint8_t* mutualFlags, const int32_t* duplicateGroups,
+                          int32_t* outComponentId, int32_t* unionFindScratch);
+```
+
+Post-processing over exact query output — touches no kernel, quantization, or format.
+`BuildKnnNeighbors` is a top-k query per row (ties break ascending index); `MutualFilter`
+keeps only edges where each row is in the other's top-k (a pure integer scan, no
+tolerance); `BuildDuplicateGroups` finds exact byte-identical rows by construction (a
+hash pass confirmed by full byte comparison — hash agreement alone never groups, so
+same-decode-different-bytes rows are near-duplicates, not duplicates, and stay ungrouped);
+`ConnectedComponents` unions duplicate-group edges first, then the surviving mutual edges
+in ascending `(i, j)` order, with component ids canonicalized to the smallest member row
+index — deterministic, never an allocation-order artifact. PER-DEVICE deterministic, no
+cross-device claim. Caller-owned `Workspace`/scratch throughout; every function rejects
+`k < 1`, `k >= count`, or a null buffer with no partial write.
+
+## novelty.h — k-th-neighbour distance + calibrated baseline (v3.2)
+
+```cpp
+Status NoveltyScore         (const float* sortedBaseline, int32_t count,
+                              float distance, float* outScore);
+Status NoveltyProbeDistance (const BankView&, const float* paddedProbeQuery,
+                              int32_t storedRow, int32_t channel /* -1 = whole-row */,
+                              float* outDistance, Workspace&);
+Status KthNeighborDistance  (const BankView&, const float* query, int32_t k,
+                              const uint32_t* excludeBits, float* outDistance, Workspace&);
+Status CalibrateNoveltyBaseline(const BankView&, int32_t k, int32_t sampleLimit,
+                              float* outSortedDistances, int32_t* outCount, Workspace&);
+```
+
+Two independent limbs, composed by the CALLER into a tri-state verdict (no separate
+"verdict" entry exists — the same caller-composes-from-primitives shape `compose.h`'s
+query construction uses). **Limb 1 (identity):** `NoveltyProbeDistance` is the metric's
+own exact distance between a probe and one stored row — on Cosine int8 this is a true
+bit-exact 0.0 for a real duplicate (the parallel-code int arithmetic never rounds until
+one final division+sqrt); on L2's expanded form it carries a disclosed double-precision
+cancellation residue even on an exact duplicate, so a caller checks it against a small
+epsilon (`1e-8f`), never bare equality. `channel == -1` scores the whole row; a channel
+index scores that sub-range only, and a zero-energy Cosine slice on either side rejects
+(`ZeroNormQuery`) rather than silently floors to a false match. Dot banks are rejected
+outright — the verdict domain is L2 and Cosine only. On an int8 bank, a channel whose
+`offset`/`length` is not a multiple of the int8 SIMD grid is `InvalidArgument` — every
+validated bank's channel table is grid-aligned by construction, so this only fires
+against a hand-built `BankView`. **Limb 2 (statistical rank):**
+`KthNeighborDistance` is a raw k-th-nearest-neighbour probe against a full view (ties are
+the caller's own exclusion set, not self-widened); `NoveltyScore` converts a distance
+into the baseline's empirical-CDF rank (ties resolve to the lowest rank), which the
+caller compares against a lambda threshold. `CalibrateNoveltyBaseline` builds that
+baseline over a caller-constructed sample view (it does not sample or stride itself),
+writing each row's own k-th-NN `RankDistance` in ascending order. PER-DEVICE
+deterministic; Dot is rejected on every entry point (`RankDistance` is undefined there).
+Caller-owned `Workspace` throughout; every function rejects malformed k/count/metric
+arguments with no partial write.
+
+## matching.h — mutual-NN correspondence + CSLS margins (v3.2)
+
+```cpp
+struct MatchPair { int32_t sourceIndexA = -1, sourceIndexB = -1; float cslsMargin = 0.0f; };
+
+Status MutualNearestMatches(
+    const BankView& sampleViewA, const int32_t* sampleSourceIndices,
+    const BankView& fullViewB,   const uint32_t* excludeBitsB,
+    const BankView& fullViewA,   const uint32_t* excludeBitsA,
+    int32_t matchK, MatchPair* outPairs, int32_t* outPairCount, Workspace&);
+```
+
+Sampled-A-verified-against-full-banks: for each row of a caller-constructed sample of
+bank A, its top-`matchK` forward candidate in the FULL live bank B, then back-verified
+against the FULL live bank A — a pair is mutual iff the candidate's own top-1 in full A
+is the original sampled row. Both retrievals run against complete banks, never a sample,
+so the sample bounds only how many A rows are CHECKED, never correctness of a reported
+pair (a design correction from an earlier two-sided-sample scheme that measured 0.9%
+recovery / 98% spurious matches at 500k rows). Every checked row gets an entry —
+`sourceIndexB = -1` and `cslsMargin = 0.0` mean honestly unmatched, not an error.
+`cslsMargin` is the paper's cross-domain similarity local scaling
+(`2*Sim(i,j) - r_B(i) - r_A(j)`), disclosed as a diagnostic on Dot/L2 banks (not the
+paper's calibrated cosine-only setting) — classification against a threshold (matched vs.
+ambiguous) is the caller's, exactly as `NoveltyScore`'s raw statistic is. `Dims` and
+`Metric` must match across all three views; `Quantization` may differ (matching runs on
+query scores over dequantized rows) — the field this library's flagship "archive vs.
+baked" use case rests on: a player's saved scratch-bank archive matched against the
+shipped reference bank. PER-DEVICE deterministic, no cross-device claim. This is the
+library's disclosed HEAVY pass — O(sample x full-B x dims) plus back-verification, linear
+in bank size, not sub-second at scale; a caller-side concern (chunking, progress, cancel),
+not part of this contract.
+
 ## scratch.h — mutable banks (v2.0, recall audit v2.3)
 
 ```cpp
@@ -441,7 +580,7 @@ class ScratchBank {              // single writer, lock-free readers
                   int32_t reportCount, uint64_t seed = kDefaultRecallSeed);          //   recall@k per channel
     Status Save(const ScratchArchive&) const;     // writer-side
     Status Load(const ScratchArchive&, const Allocator& = ...); // EXCLUSIVE
-    int32_t Count(); int32_t LiveCount(); int32_t Capacity();
+    int32_t Count() const; int32_t LiveCount() const; int32_t Capacity() const;
     static int32_t TombstoneWords(int32_t count);
 
     // v2.3 recall audit:
@@ -521,8 +660,11 @@ are a format defect, not an allocator outcome).
 **Channels on a mutable bank (v3.0):** the channel table — a partition of the
 row into named sub-ranges (`ChannelInfo` = offset + length, ascending,
 non-overlapping, on the 16-byte element grid, up to `kMaxChannels = 8`) —
-becomes a scratch-bank property set at `Create` and **fixed for the bank's
-lifetime**; `Append` validates each row against it. On a Cosine channel bank,
+becomes a scratch-bank property set at `Create`; `Append` validates each row
+against the table currently in force. **`Relabel` (v3.1)** atomically replaces
+the channel table on a live bank — count change, boundary move, promote, and
+demote are all supported — under an exclusive drain, leaving stored rows
+untouched and re-deriving Cosine sub-norms under the new table. On a Cosine channel bank,
 `Append` computes the appended row's per-channel inverse sub-norms
 per-row-standalone from the quantized bytes and folds a `capacity × channelCount`
 sub-norm arena into the same single allocation (Dot/L2 channel banks carry none —
@@ -553,7 +695,7 @@ uint64_t  AllocationCount();     // process-wide, monotonic; assert flat deltas 
 class Workspace {                // query scratch; single owner, NOT thread-safe
     explicit Workspace(const Allocator&);   // or default
     bool     Reserve(int32_t k, int32_t batchWidth);
-    uint64_t GrowthCount();      // flat once warm
+    uint64_t GrowthCount() const;      // flat once warm
 };
 ```
 

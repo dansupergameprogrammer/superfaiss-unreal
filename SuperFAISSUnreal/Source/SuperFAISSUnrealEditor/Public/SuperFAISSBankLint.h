@@ -5,8 +5,8 @@
 class USuperFAISSVectorBank;
 class USuperFAISSPrototypeAsset;
 
-// Bank health analyses (plan 18.2): near-duplicate rows, degenerate/low-variance
-// dims, and prototype-category overlap. On demand only (Forge strike-4 N1):
+// Bank health analyses: near-duplicate rows, degenerate/low-variance
+// dims, and prototype-category overlap. On demand only (N1):
 // near-duplicate detection costs one full scan per examined row, so above
 // SampleLimit rows it examines a deterministic stride sample and says so in the
 // report — it never silently runs exhaustively on a large import.

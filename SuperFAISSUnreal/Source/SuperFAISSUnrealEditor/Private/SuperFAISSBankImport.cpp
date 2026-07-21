@@ -185,7 +185,7 @@ namespace
 			}
 			TotalPossible += RefN;
 		}
-		// Zero successful probes is "not measured", never "perfect" (Poirot R-3:
+		// Zero successful probes is "not measured", never "perfect" (R-3:
 		// a bank wider than the CrossDevice ceiling failed every probe and
 		// recorded 1.0 - the honesty metric lying at the boundary it polices).
 		return TotalPossible > 0
@@ -296,7 +296,7 @@ namespace
 			TotalPossible += RefN;
 		}
 
-		// Zero successful probes is "not measured", never "perfect" (Poirot R-3).
+		// Zero successful probes is "not measured", never "perfect" (R-3).
 		return TotalPossible > 0 ? static_cast<float>(TotalHits) / TotalPossible : -1.0f;
 	}
 }

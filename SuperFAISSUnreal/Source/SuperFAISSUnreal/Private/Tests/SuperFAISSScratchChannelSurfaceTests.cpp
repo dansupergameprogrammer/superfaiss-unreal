@@ -202,7 +202,7 @@ bool FSuperFAISSScratchPerChannelRecallTest::RunTest(const FString& Parameters)
 }
 
 // -----------------------------------------------------------------------------------
-// Cell 3 — save/load restores the host channel vocabulary (Poirot S2). The core archive
+// Cell 3 — save/load restores the host channel vocabulary (S2). The core archive
 // carries the channel ranges but not the host FName names; the plugin appends a name
 // frame so a saved channel-carrying scratch bank round-trips into a FRESH bank with its
 // named-channel queries intact. A channel-less bank round-trips unchanged (the frame is a

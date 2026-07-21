@@ -188,7 +188,7 @@ bool FSuperFAISSChannelQueryTest::RunTest(const FString& Parameters)
 		}
 	}
 
-	// R-1 (Poirot deep review): a corrupted channel block is rejected at load,
+	// R-1 (deep review): a corrupted channel block is rejected at load,
 	// never crashed on or silently degraded. Mutate a valid bank's properties the
 	// way a corrupt asset would arrive, revalidate via PostLoad.
 	{

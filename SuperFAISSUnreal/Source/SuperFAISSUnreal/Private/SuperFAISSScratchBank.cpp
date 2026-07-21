@@ -1,5 +1,8 @@
 #include "SuperFAISSScratchBank.h"
 
+#include "ProfilingDebugging/CpuProfilerTrace.h"
+#include "SuperFAISSSubsystem.h" // the shared SuperFAISS trace channel (plan section 5.1)
+
 namespace
 {
 	superfaiss::Metric ToCoreMetric(ESuperFAISSBankMetric M)
@@ -41,7 +44,7 @@ namespace
 		}
 	};
 
-	// The host-side channel-name frame (Poirot S2). The core scratch archive carries the
+	// The host-side channel-name frame (S2). The core scratch archive carries the
 	// channel table's element RANGES but not the host FName vocabulary — the core never
 	// sees names — so a save/load round trip would restore the core channels with an empty
 	// host name list, and every named-channel query on the loaded bank would miss. The
@@ -244,7 +247,7 @@ bool USuperFAISSScratchBank::Relabel(const TArray<FName>& InChannelNames,
 		}
 		// Adopt the host-side vocabulary INSIDE the exclusive window, published by the
 		// same EndExclusive/TryPin seq_cst pairing that publishes the core table swap
-		// (Poirot C1). The host name list (`GetChannelIndex` reads it on the reader
+		// (C1). The host name list (`GetChannelIndex` reads it on the reader
 		// side) and the core channel table are two objects that must move as one; doing
 		// it here means no pinned reader ever observes host names skewed against the core
 		// table. A rejected relabel returns above, leaving the old names in place
@@ -364,7 +367,7 @@ bool USuperFAISSScratchBank::DrainAndRun(TFunctionRef<bool()> Op)
 {
 	// Core BeginExclusive refuses new pins (the subsystem's TryPin fails at the
 	// dispatch gate, T-044 N4) and waits the in-flight ones out with the seq_cst
-	// pairing the protocol's safety requires (Poirot F4). A false return means
+	// pairing the protocol's safety requires (F4). A false return means
 	// another exclusive operation is in progress: writer-coordination misuse.
 	if (!Bank.BeginExclusive())
 	{
@@ -435,7 +438,7 @@ USuperFAISSVectorBank* USuperFAISSScratchBank::FreezeInternal(TArray<int32>& Out
 
 		// Zero live rows is a legitimate freeze (an empty memory graduating is
 		// still a memory): produce an EMPTY valid bank, not a failure a caller
-		// cannot tell from a real one (Poirot R-5). Core Freeze rightly rejects a
+		// cannot tell from a real one (R-5). Core Freeze rightly rejects a
 		// null output buffer, so the empty case short-circuits before it.
 		if (Live == 0)
 		{
@@ -499,6 +502,8 @@ USuperFAISSVectorBank* USuperFAISSScratchBank::FreezeInternal(TArray<int32>& Out
 
 bool USuperFAISSScratchBank::SaveToBytes(TArray<uint8>& OutBytes) const
 {
+	// "bank load/serialization" (plugin plan section 5.1) — the save direction.
+	TRACE_CPUPROFILER_EVENT_SCOPE_ON_CHANNEL(TEXT("SuperFAISS.BankSerialize"), SuperFAISS);
 	OutBytes.Reset();
 	FByteWriter Writer;
 	Writer.Bytes = &OutBytes;
@@ -509,13 +514,18 @@ bool USuperFAISSScratchBank::SaveToBytes(TArray<uint8>& OutBytes) const
 	{
 		return false;
 	}
-	// Append the host-side channel-name frame the core archive cannot carry (Poirot S2).
+	// Append the host-side channel-name frame the core archive cannot carry (S2).
 	WriteChannelFrame(OutBytes, ChannelNames, ChannelOffsets, ChannelLengths);
 	return true;
 }
 
 bool USuperFAISSScratchBank::LoadFromBytes(const TArray<uint8>& Bytes)
 {
+	// "bank load/serialization" (plugin plan section 5.1) — the load direction, plus
+	// the bank load/unload Insights bookmark ("one of the four named events a
+	// developer hunts for in a timeline").
+	TRACE_CPUPROFILER_EVENT_SCOPE_ON_CHANNEL(TEXT("SuperFAISS.BankSerialize"), SuperFAISS);
+	TRACE_BOOKMARK(TEXT("SuperFAISS: scratch bank load"));
 	// Load is exclusive: drain queries; the core's reject-over-degrade keeps the
 	// current state on a bad blob.
 	const bool bLoaded = DrainAndRun([this, &Bytes]() {
@@ -529,12 +539,12 @@ bool USuperFAISSScratchBank::LoadFromBytes(const TArray<uint8>& Bytes)
 			return false;
 		}
 		// The core Load succeeded and replaced the rows; the pre-load host vocabulary is
-		// now stale, so it is cleared and repopulated from the appended frame (Poirot S2).
+		// now stale, so it is cleared and repopulated from the appended frame (S2).
 		// The core reader stopped exactly at the archive end, so anything left is the
 		// frame; a legacy (frame-less) blob leaves the loaded bank host-channel-less, and
 		// a malformed or count-mismatched frame is ignored rather than half-adopted. Done
 		// inside the exclusive window so the host names publish with the loaded core table
-		// (the Poirot C1 discipline), never observed skewed by a pinned reader.
+		// (the C1 discipline), never observed skewed by a pinned reader.
 		ChannelNames.Reset();
 		ChannelOffsets.Reset();
 		ChannelLengths.Reset();

@@ -1,4 +1,4 @@
-// In-engine SIMD ≡ scalar-mirror bit-equality (core T11 equivalent; Poirot S1).
+// In-engine SIMD ≡ scalar-mirror bit-equality (core T11 equivalent; S1).
 // This is the test that catches a compiler contracting the mirrors' float math —
 // the failure mode that would otherwise surface months later as cross-machine
 // replay divergence.

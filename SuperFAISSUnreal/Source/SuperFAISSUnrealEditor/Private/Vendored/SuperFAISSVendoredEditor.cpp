@@ -17,3 +17,9 @@
 #include "../../../ThirdParty/SuperFAISS/src/analytics.cpp"
 #include "../../../ThirdParty/SuperFAISS/src/pca.cpp"
 #include "../../../ThirdParty/SuperFAISS/src/scratch.cpp"
+
+// V3.2 Bank Inspector I, Tier 1 (plan section 25.4) — the editor module's own copy,
+// same reason as the block above: no cross-module export exists yet.
+#include "../../../ThirdParty/SuperFAISS/src/graph.cpp"
+#include "../../../ThirdParty/SuperFAISS/src/novelty.cpp"
+#include "../../../ThirdParty/SuperFAISS/src/matching.cpp"

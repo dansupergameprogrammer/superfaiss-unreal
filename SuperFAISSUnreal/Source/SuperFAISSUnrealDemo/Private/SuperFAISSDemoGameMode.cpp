@@ -455,7 +455,7 @@ void ASuperFAISSDemoGameMode::BeginPlay()
 	// launch config), load the known demo banks directly so the demo can never boot
 	// bankless. Direct LoadObject does not depend on the registry.
 	//
-	// MAINTENANCE COUPLING (Poirot O1): this list is the *emergency* path only — the
+	// MAINTENANCE COUPLING (O1): this list is the *emergency* path only — the
 	// registry path above is what makes "drop a bank in the folder and it appears"
 	// true. This hardcoded set must be kept in step with the banks baked by the
 	// SuperFAISSUnrealBake commandlet (the source of truth). If a new bank is baked

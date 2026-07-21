@@ -42,8 +42,10 @@ if your platform has a C++17 toolchain, the library compiles.
   let your tests assert zero steady-state allocation — a warm pool never allocates.
 - **Scratch banks (v2.0) are the one owning type.** `ScratchBank` allocates its
   fixed-capacity arena once through the same `Allocator` seam and never again
-  (append/remove/snapshot/query are allocation-free; `Grow` is an explicit,
-  caller-initiated reallocation). Persistence goes through the caller-owned
+  (append/remove/snapshot/query are allocation-free; `Grow` and `Relabel` are the
+  explicit, caller-initiated exceptions — `Grow` a reallocation, `Relabel` a
+  possible arena resize on a Cosine bank whose channel count or promote/demote
+  state changes). Persistence goes through the caller-owned
   `ScratchArchive` seam — your save system provides the read/write callbacks, the
   bank owns the format. The v2.3 float-retention posture sizes into the same
   single arena — budget `4 × dims` extra bytes per row when you opt in (~4.9× an
@@ -129,10 +131,10 @@ lock-free snapshot readers, exclusive `Grow`/`Freeze`/`Load` (§3, and DETERMINI
 
 A flat scan is a memory stream: cost ≈ bank bytes ÷ bandwidth, until SIMD makes it
 compute-bound. Practical desktop numbers (AVX2, one core): int8 scans at roughly
-10 GB/s-equivalent — a 4 MB bank (40k × 100d int8) in ~0.5 ms serial; chunk-parallel
-across a task graph, ~0.13 ms wall; batched, ~0.06 ms per query. int8 is the default
-for a reason: it is a 4× bandwidth cut, i.e. roughly a 4× speed and memory win, for
-~1% recall loss.
+6 GB/s-equivalent (4 MB ÷ 0.65 ms) — a 4 MB bank (40k × 100d int8) in ~0.65 ms serial;
+chunk-parallel across a task graph, ~0.13 ms wall; batched, ~0.06 ms per query. int8 is
+the default for a reason: it is a 4× bandwidth cut, i.e. roughly a 4× speed and memory
+win, for ~1% recall loss.
 
 Batching amortizes *memory traffic and per-call overhead*, not compute — on
 compute-bound hardware the per-query gain over parallel singles is modest (~2×), but a

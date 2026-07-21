@@ -21,7 +21,7 @@ answers "what's most similar to this?" exactly, in microseconds, on any thread.
 
 Measured on the shipped demo bank (40,000 words × 100 dims, int8, ~4 MB), desktop editor:
 single query **0.13 ms** (auto-parallelized across chunks — the core's serial one-core
-scan of the same bank is ~0.5 ms), batched **0.06 ms per query** — exact search,
+scan of the same bank is ~0.65 ms), batched **0.06 ms per query** — exact search,
 bit-deterministic, zero steady-state allocation.
 
 ## Quick start
@@ -301,10 +301,84 @@ Add `-Lint` for on-demand health analyses: near-duplicate rows (sampled above a
 configurable cap, never silently exhaustive), low-variance dims, prototype overlap,
 and on channel banks: channel-scoped near-duplicates, degenerate channels, and weak
 channels (rows whose channel carries almost no energy — their per-channel cosines
-are amplified quantization noise; `-ChannelEnergyFloor=` tunes the threshold). In-editor, **Tools > SuperFAISS Bank Inspector** gives live queries with
-margins and a PCA projection point cloud of any bank; selected rows become named
-prototype assets (`USuperFAISSPrototypeAsset` — also a query provider) via the
-authoring library.
+are amplified quantization noise; `-ChannelEnergyFloor=` tunes the threshold). In-editor, **Tools > SuperFAISS Bank Inspector** gives live queries with margins,
+a PCA projection point cloud of any bank, and — see below — structure/novelty/
+correspondence analysis; selected rows become named prototype assets
+(`USuperFAISSPrototypeAsset` — also a query provider) via the authoring library.
+
+## Bank Inspector — structure, novelty, and correspondence (v3.2)
+
+![The SuperFAISS Bank Inspector: View A's cluster tree and PCA scatter (an outlier row
+selected — one white dot, its amber near-neighbors, the rest of its cluster in the
+cluster's own color) beside View B's novelty verdict and evidence list and View C's
+per-row correspondence list against a second
+bank.](docs/images/BankInspector_3_2.png)
+
+Beyond live queries and the PCA scatter, the Bank Inspector (**Tools > SuperFAISS Bank
+Inspector**) answers three questions a raw query can't: *does this bank have natural
+clusters, or is it one undifferentiated blob* (View A — Structure), *is this one row
+actually new, or a near-duplicate of something already in the bank* (View B —
+Novelty), and *which rows in bank A correspond to rows in bank B* (View C —
+Correspondence — e.g. a player's saved scratch archive against the shipped reference
+bank). All three are built on the core's new `graph.h`/`novelty.h`/`matching.h`
+primitives (pure functions over a `BankView`, PER-DEVICE deterministic — layouts and
+component/match ids may differ across machines, no cross-device claim).
+
+- **Compute structure** clusters the current sample by mutual k-nearest-neighbor
+  agreement plus exact-duplicate grouping, then connected components; the result list
+  shows one entry per cluster (+ an Outliers row for anything below the configured
+  minimum size), expandable to each member's real bank id. Selecting a cluster
+  highlights every one of its points in the scatter; selecting a single row
+  highlights three things distinctly — the row itself, its k-nearest neighbors, and
+  the rest of its cluster — so a row-level click reads as three claims, not one blob.
+- **The novelty probe** (a row id or `#index` typed into the probe box) answers
+  duplicate / familiar / novel against the bank's own content: an exact-distance
+  identity check first (true 0.0 on Cosine int8, or a byte-identical float32 row, for a real
+  duplicate), then a statistical
+  rank against a calibrated k-th-neighbor baseline if the identity check doesn't
+  already resolve it. The evidence list underneath shows the probe's actual nearest
+  neighbors with scores and margins — the verdict's "why," not just its answer.
+- **Compute correspondence** needs a second bank (pick one from the second combo, or
+  open a scratch archive there — see below); it reports, per sampled row of the
+  primary bank, its matched partner in the second bank (or "unmatched"), with a CSLS
+  margin and a matched/ambiguous state. This is the disclosed HEAVY pass in the set
+  — cost scales with both banks' sizes, not sub-second at scale — the panel discloses
+  this before you run it.
+- **Open scratch archive…**, beside the normal asset picker on both the primary and
+  second-bank slots, loads a saved `USuperFAISSScratchBank` archive file directly (the
+  same format `SaveToBytes`/`LoadFromBytes` round-trip) as a transient inspection
+  source — no need to bake it to an asset first. A tombstoned (removed) row in an
+  archive is honored throughout: it never leaks into a sample, a cluster, or a
+  reported correspondence match. Every analysis pass produces the same output over
+  the same live rows whether the source is a baked asset or a loaded archive — this
+  is the field-debugging use case the archive path exists for.
+- **Analysis parameters** (the sample cap, structure's k and minimum cluster size,
+  novelty's k and lambda, correspondence's match-k and CSLS threshold) live in one
+  per-user, per-project editor settings object and persist across sessions; query
+  state (which bank is selected, probe text) stays session-scoped and resets on
+  bank change, same as the rest of the Inspector.
+
+### Profiling (v3.2)
+
+Every pass above — and the runtime query path underneath it — is wrapped in a
+dedicated, zero-cost-when-off `SuperFAISS` trace channel for Unreal Insights, plus a
+`STATGROUP_SuperFAISS` stat group (bytes streamed, effective bandwidth, chunk count,
+batch size, per-query time, queries in flight, and the zero-steady-state-allocation
+counters). Enable it live in a running editor:
+
+```
+Trace.Enable SuperFAISS
+Trace.Start
+```
+
+...run some queries or Inspector passes, then `Trace.Stop` and open the trace in
+Unreal Insights — search the Timing view for `SuperFAISS.*` to find the named spans
+(`SuperFAISS.Query`, `SuperFAISS.ScanChunk`, `SuperFAISS.MergeTopK`,
+`SuperFAISS.Inspector.StructureBuild`, and so on, one per pass/kernel stage). Or just
+watch the live numbers: `stat superfaiss` in any running instance. Instrumentation does
+not perturb results in the cases tested — the determinism suite runs trace-OFF and
+trace-ON and asserts an identical result on every case in that suite, so a profiling
+session has not been observed to change an answer.
 
 ## Guarantees
 
@@ -336,7 +410,9 @@ The stripped plugin compiles and the non-demo test groups pass unchanged.
 
 ## Tests
 
-`SuperFAISS.*` automation tests (53 in this plugin; 57 with the MCP plugin enabled)
+`SuperFAISS.*` automation tests (104 in this plugin — every registered
+`IMPLEMENT_*_AUTOMATION_TEST`, run `Session > Automation` in the editor to see the
+current count; 108 with the MCP plugin enabled)
 cover kernel correctness, SIMD/scalar mirror equality, determinism, tie-break
 stability, concurrency, asset round-trips, import rejection, quantizer recall,
 performance guards, query composition (centroid, direction, intersection, margins),
@@ -351,7 +427,12 @@ analytics closures (spread and mean/max nearest-neighbour over a live snapshot),
 cross-device pooling (payload and hit-list equality against the core path, and
 adversarial payload rejection), the prototype asset's cross-device tier and version
 gate, bank lint analyses, prototype authoring, a golden semantic query on the demo
-bank, and the Mass swarm's stability (F2). Run headless:
+bank, the Mass swarm's stability (F2), the Bank Inspector's structure/novelty/
+correspondence panels (including the archive-source path — a tombstoned row proven
+absent from every sample, cluster, baseline, and matched pair, asset-vs-archive
+output equality, and the second-bank-slot mutual-exclusion/invalidation matrix), and
+the instrumentation bar's non-perturbation guarantee (the determinism suite bit-equal
+trace-OFF vs. trace-ON) and counter fidelity. Run headless:
 
 ```
 UnrealEditor-Cmd <project> -ExecCmds="Automation RunTests SuperFAISS; Quit" -unattended -nullrhi

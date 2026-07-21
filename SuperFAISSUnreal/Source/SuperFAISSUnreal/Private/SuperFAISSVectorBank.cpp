@@ -1,5 +1,8 @@
 #include "SuperFAISSVectorBank.h"
 
+#include "ProfilingDebugging/CpuProfilerTrace.h"
+#include "SuperFAISSSubsystem.h" // the shared SuperFAISS trace channel (plan section 5.1)
+
 #include "superfaiss/superfaiss.h"
 
 namespace
@@ -114,7 +117,7 @@ bool USuperFAISSVectorBank::InitFromSource(
 	ChannelLengths.Reset();
 	ChannelRecallAt10.Reset();
 	ChannelInvNorms.Reset();
-	// Re-init drops every measured number (Poirot R-4): the importer re-measures
+	// Re-init drops every measured number (R-4): the importer re-measures
 	// on its own paths; anything it does not re-measure must read "not measured",
 	// never a previous object's truth.
 	RecallAt10 = -1.0f;
@@ -262,7 +265,7 @@ bool USuperFAISSVectorBank::InitFromBaked(
 	SourceHash = InSourceHash;
 	RecallAt10 = -1.0f;
 	RecallSeed = 0;
-	CrossDeviceRecallAt10 = -1.0f; // Poirot R-4
+	CrossDeviceRecallAt10 = -1.0f; // R-4
 	IndexBlockVersion = 0;
 	IndexBlockData.Reset();
 	RebuildChannelTable();
@@ -274,8 +277,8 @@ void USuperFAISSVectorBank::RebuildChannelTable()
 {
 	ChannelTable.Reset();
 	// A corrupted or tampered asset can carry mismatched parallel arrays; indexing
-	// Offsets/Lengths by Names.Num() would read out of bounds DURING LOAD (Poirot
-	// R-1a). Leave the table empty here; ValidateContent rejects the bank.
+	// Offsets/Lengths by Names.Num() would read out of bounds DURING LOAD
+	// (R-1a). Leave the table empty here; ValidateContent rejects the bank.
 	if (ChannelOffsets.Num() != ChannelNames.Num() ||
 		ChannelLengths.Num() != ChannelNames.Num())
 	{
@@ -306,7 +309,7 @@ FName USuperFAISSVectorBank::GetIdForIndex(int32 Index) const
 		return Ids[Index];
 	}
 	// Id-less banks: NAME_None — the index is already on the hit, and minting FNames
-	// here would intern a permanent table entry per distinct index (Poirot M1).
+	// here would intern a permanent table entry per distinct index (M1).
 	return NAME_None;
 }
 
@@ -354,7 +357,7 @@ bool USuperFAISSVectorBank::GetRowDequantized(int32 Row, TArray<float>& OutValue
 
 superfaiss::BankView USuperFAISSVectorBank::GetBankView() const
 {
-	// Shipping-safe gate (Poirot S3): check() compiles out in Shipping, where a
+	// Shipping-safe gate (S3): check() compiles out in Shipping, where a
 	// PostLoad-rejected bank (corrupted pak, schema mismatch) must still never reach
 	// the kernels. An invalid bank yields an empty view: every query returns no hits.
 	if (!ensureMsgf(bValidated, TEXT("GetBankView on invalid bank %s"), *GetPathName()))
@@ -381,6 +384,11 @@ superfaiss::BankView USuperFAISSVectorBank::GetBankView() const
 
 void USuperFAISSVectorBank::Serialize(FArchive& Ar)
 {
+	// "bank load/serialization" (plugin plan section 5.1): one span covering both
+	// directions (Ar.IsLoading()/Ar.IsSaving() — Serialize is the actual byte
+	// load/save site for the asset's payload, not PostLoad, which only validates
+	// and rebuilds derived state from bytes Serialize already read).
+	TRACE_CPUPROFILER_EVENT_SCOPE_ON_CHANNEL(TEXT("SuperFAISS.BankSerialize"), SuperFAISS);
 	Super::Serialize(Ar);
 
 	Payload.BulkSerialize(Ar);
@@ -449,7 +457,7 @@ bool USuperFAISSVectorBank::ValidateContent(FString& OutError)
 	}
 
 	// The v2 channel block validates like everything else - "a bank that fails
-	// never yields a view" was not true for it before this (Poirot R-1). The
+	// never yields a view" was not true for it before this (R-1). The
 	// parallel arrays must agree (R-1a; RebuildChannelTable already refused to
 	// build a table from mismatched arrays), the inverse-norm array must be
 	// exactly Count x ChannelCount on Cosine channel banks (R-1b; a truncated

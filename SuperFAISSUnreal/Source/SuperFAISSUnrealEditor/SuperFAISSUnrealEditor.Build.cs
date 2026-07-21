@@ -29,6 +29,15 @@ public class SuperFAISSUnrealEditor : ModuleRules
 			"SlateCore",
 			"InputCore",
 			"WorkspaceMenuStructure",
+			// USuperFAISSInspectorSettings, UDeveloperSettings (V3.2 plan section 25.3).
+			"DeveloperSettings",
+			// IPluginManager, for the slot-3 grep-target regression test's module-dir lookup.
+			"Projects",
+			// UE::Trace::ToggleChannel (V3.2 slot 5, plugin plan section 5.1/25.6): the
+			// B8-extension non-perturbation test toggles the SuperFAISS channel; needs
+			// TraceLog named explicitly to resolve at link time (see the runtime
+			// module's Build.cs for the identical note).
+			"TraceLog",
 		});
 	}
 }

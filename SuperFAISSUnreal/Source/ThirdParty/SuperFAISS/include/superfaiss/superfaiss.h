@@ -15,3 +15,9 @@
 #include "analytics.h"
 #include "pca.h"
 #include "scratch.h"
+
+// V3.2 Bank Inspector I, Tier 1.
+#include "inspector_common.h"
+#include "graph.h"
+#include "novelty.h"
+#include "matching.h"

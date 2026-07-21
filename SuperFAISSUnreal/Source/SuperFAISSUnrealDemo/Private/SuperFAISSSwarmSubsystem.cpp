@@ -20,7 +20,7 @@ namespace
 			State ^= State >> 27;
 			return State * 0x2545F4914F6CDD1Dull;
 		}
-		float NextFloat() // [-1, 1) — centered (Poirot O1)
+		float NextFloat() // [-1, 1) — centered (O1)
 		{
 			return static_cast<float>(static_cast<int64>(Next() >> 24)) /
 				static_cast<float>(1ll << 39) - 1.0f;

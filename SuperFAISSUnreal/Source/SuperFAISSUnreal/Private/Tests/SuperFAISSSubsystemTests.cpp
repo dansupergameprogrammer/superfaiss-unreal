@@ -412,7 +412,7 @@ bool FSuperFAISSSubsystemAsyncTest::RunTest(const FString& Parameters)
 
 namespace
 {
-	// P-3 (Poirot sweep): QueryAsync must run the SAME query the sync path would.
+	// P-3 (sweep): QueryAsync must run the SAME query the sync path would.
 	// Pre-fix it copied only K/ExcludeBits/bScoreAsDot, so composed args
 	// (channels, segments, bias, cross-device) silently ran plain and reported
 	// success with wrong hits.

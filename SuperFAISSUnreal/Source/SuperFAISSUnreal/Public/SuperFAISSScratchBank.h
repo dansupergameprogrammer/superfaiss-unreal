@@ -243,7 +243,7 @@ public:
 	// The N4 dispatch gate: fails while a drain-requiring operation is waiting,
 	// otherwise pins the bank for one query flight. Delegates to the core
 	// pin/drain primitive, whose seq_cst orderings close the store-buffering
-	// window on weakly-ordered ISAs (Poirot F4) and which runs under
+	// window on weakly-ordered ISAs (F4) and which runs under
 	// ThreadSanitizer in core CI - the shipped protocol is the verified one.
 	bool TryPin() { return Bank.TryPinReader(); }
 	void Unpin() { Bank.UnpinReader(); }

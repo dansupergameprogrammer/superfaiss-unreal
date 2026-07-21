@@ -61,7 +61,7 @@ USuperFAISSPrototypeAsset* USuperFAISSAuthoringLibrary::CreatePrototypeAsset(
 		return nullptr;
 	}
 
-	// A colliding name would silently rename the incumbent (Poirot M1): refuse
+	// A colliding name would silently rename the incumbent (M1): refuse
 	// instead, so re-authoring is an explicit delete-then-create.
 	const FString FullPackageName = PackagePath / AssetName;
 	if (StaticFindObject(USuperFAISSPrototypeAsset::StaticClass(), nullptr,

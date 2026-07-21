@@ -12,7 +12,7 @@ bool USuperFAISSBankRowQueryProvider::GetQueryVector_Implementation(
 		return false;
 	}
 
-	// Id semantics are strict (Poirot O2): a set-but-unresolved id fails rather
+	// Id semantics are strict (O2): a set-but-unresolved id fails rather
 	// than silently querying RowIndex.
 	int32 Row = INDEX_NONE;
 	if (!RowId.IsNone())

@@ -596,7 +596,7 @@ bool FSuperFAISSPooledCrossDeviceTest::RunTest(const FString& Parameters)
 	return true;
 }
 
-// Review S2/M1 / Japp S-2 — the pooled-payload trust boundary at the plugin
+// S-2 — the pooled-payload trust boundary at the plugin
 // surface: no field of a caller-authored (or hand-edited, or corrupted-asset)
 // FSuperFAISSCrossDeviceQuery may make scores or rankings ill-defined or silently
 // wrong. A non-finite scale poisons Dot/L2 scores with NaN; a lying self-dot

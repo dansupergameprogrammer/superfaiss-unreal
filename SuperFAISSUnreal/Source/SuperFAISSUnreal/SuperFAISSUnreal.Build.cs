@@ -10,7 +10,7 @@ public class SuperFAISSUnreal : ModuleRules
 		// The vendored SuperFAISS core forbids implicit FP contraction (its scalar/SIMD
 		// bit-equality depends on exact mul-then-add rounding). Per-module precise FP is
 		// the ONLY reliable mechanism: source pragmas do not stop clang backend fusion
-		// under fast-math (Poirot S4, proven at the compiler). Emits -ffp-contract=off
+		// under fast-math — verified at the compiler, not assumed. Emits -ffp-contract=off
 		// on clang toolchains and /fp:precise on MSVC.
 		FPSemantics = FPSemanticsMode.Precise;
 
@@ -26,6 +26,16 @@ public class SuperFAISSUnreal : ModuleRules
 			"Core",
 			"CoreUObject",
 			"Engine",
+		});
+
+		PrivateDependencyModuleNames.AddRange(new string[]
+		{
+			// UE::Trace::ToggleChannel (V3.2 slot 5, plugin plan section 5.1): Core
+			// publicly depends on TraceLog for its own trace macros, but this module
+			// links against Trace API entry points directly (the red suite's B8 non-
+			// perturbation test toggles the SuperFAISS channel), which needs TraceLog
+			// named explicitly to resolve at link time.
+			"TraceLog",
 		});
 	}
 }
