@@ -23,6 +23,23 @@ editor: single query **0.13 ms** (auto-parallelized across chunks — the core's
 one-core scan of the same bank is ~0.65 ms), batched **0.06 ms per query** — exact
 search, bit-deterministic, zero steady-state allocation.
 
+**New in 3.2:** the **Bank Inspector** — reading a bank's structure, not only
+querying it. Three header-only core modules over a caller-held view: a mutual k-NN
+neighbour graph with connected components (which rows cluster, and which sit alone);
+a two-limb novelty test that combines an exact metric-distance identity check with a
+rank against a calibrated baseline, verdicting a probe row `duplicate`, `familiar` or
+`novel`; and sampled mutual correspondence between two banks with CSLS margins (which
+rows in A answer to rows in B). An editor tab drives all three over a bank asset or a
+serialized scratch archive, with a PCA scatter beside them. Every pass is sampled and
+discloses its coverage, and these modules are **per-device** deterministic — the
+cross-device claim covers the query path, not the inspection passes, and the panel says
+so. Adds an Insights instrumentation bar (named trace scopes, stat counters, a CSV
+category, bookmarks) whose non-perturbation is asserted by test, not by claim. The
+allocation guarantee is now enforced rather than stated: every public entry point
+carries an allocation cell under a raw-allocation tracking seam, and a registry check
+fails the build when a new entry point arrives without one. Bundles the MIT core
+library at `v3.2.0`.
+
 **New in 3.1:** a runtime-mutable channel vocabulary. `Relabel` re-partitions the
 channel table on a live scratch bank — add or remove channels, change their count
 *and* boundaries, or promote a single-space bank to channels and demote it back —
@@ -113,10 +130,14 @@ so plainly. See the [plugin README](SuperFAISSUnreal/README.md).
 
 ![The shipped demo: one query against two GloVe banks, sub-millisecond async results](docs/demo.png)
 
-The editor **Bank Inspector** (Tools > SuperFAISS Bank Inspector) — live queries with
-score and margin, and a PCA projection, over any bank asset:
+The editor **Bank Inspector** (Tools > SuperFAISS Bank Inspector) reads a bank's
+structure rather than only querying it: mutual k-NN clustering, a novelty verdict
+for a probe row against a calibrated baseline, mutual correspondence between two
+banks with CSLS margins, and a PCA projection — over a bank asset or a serialized
+scratch archive. Every pass is sampled and says so, and the per-device determinism
+scope is stated in the panel itself.
 
-![Bank Inspector: a live `wizard` query over a 40k-word bank, ranked with scores and margins, beside a PCA point cloud](docs/inspector.png)
+![The Bank Inspector over a 10,418-row pose bank: ranked query results with score and margin, a novelty verdict reading "familiar" against 2,048 sampled rows, the cluster list from a mutual k-NN structure pass, correspondence against a second bank, and the PCA scatter with an outlier selected](docs/inspector.png)
 
 ## Repo layout
 
