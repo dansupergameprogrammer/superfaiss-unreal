@@ -1299,7 +1299,8 @@ void SSuperFAISSBankInspector::ComputeProjection()
 		: FString();
 	const bool bSampled = View.count < Source.GetCount();
 
-	TArray<float> Mean, Components, Scratch, Coords;
+	TArray<float> Mean, Components, Coords;
+	TArray<double> Scratch;
 	Mean.SetNumUninitialized(View.dims);
 	Components.SetNumUninitialized(2 * View.dims);
 	Scratch.SetNumUninitialized(View.dims);

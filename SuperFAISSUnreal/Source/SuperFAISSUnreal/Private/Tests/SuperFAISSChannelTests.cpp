@@ -226,6 +226,28 @@ bool FSuperFAISSChannelQueryTest::RunTest(const FString& Parameters)
 		TestFalse(TEXT("duplicate names rejected"), Bank->InitFromSource(Rows, 16, Dims,
 			ESuperFAISSBankMetric::Cosine, ESuperFAISSBankQuantization::Float32, {},
 			TEXT("x"), Error, {TEXT("a"), TEXT("a")}, {0, 16}, {16, 16}));
+
+		// F4 (D-V32-89): Offset + Length that overflows int32 must be rejected
+		// BY THIS LOOP'S OWN CHECK, with its clear per-channel error — not merely
+		// by the core's independent (already int64-safe) re-validation a few
+		// lines later. Offset alone already exceeds Dims here (0x40000000,
+		// grid-aligned for Float32); the sum wraps negative when computed in
+		// int32, so "Offset + Length > InDims" reads false and this loop's own
+		// bounds guard is defeated. Today that means InitFromSource still
+		// returns false (the core's own validation catches the fall-through
+		// malformed table), but with a generic downstream error
+		// ("content validation failed ...") instead of this loop's specific
+		// "violates the channel rules" message — proof the loop's own check
+		// never fired. A correctly int64-widened loop catches it here, first,
+		// with the specific message.
+		const bool bOverflowAccepted = Bank->InitFromSource(Rows, 16, Dims,
+			ESuperFAISSBankMetric::Cosine, ESuperFAISSBankQuantization::Float32, {},
+			TEXT("x"), Error, {TEXT("a")}, {0x40000000}, {0x40000000});
+		TestFalse(TEXT("int32-overflow offset+length rejected"), bOverflowAccepted);
+		TestTrue(FString::Printf(
+			TEXT("int32-overflow caught by this loop's own channel-rules check, not a downstream fallback: %s"),
+			*Error),
+			Error.Contains(TEXT("violates the channel rules")));
 	}
 
 	return true;

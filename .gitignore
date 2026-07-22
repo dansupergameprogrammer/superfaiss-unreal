@@ -7,3 +7,7 @@ DerivedDataCache/
 .idea/
 *.sln
 *.code-workspace
+
+# Python bytecode from the ci/ checks
+__pycache__/
+*.pyc

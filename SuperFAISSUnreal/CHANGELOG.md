@@ -7,6 +7,38 @@ release vendors.
 
 The format follows [Keep a Changelog](https://keepachangelog.com).
 
+## [3.3.0] — 2026-07-21
+
+### Changed
+- **Vendored core bumped to v3.3.0** (see `Source/ThirdParty/SuperFAISS/CHANGELOG.md` and
+  `VENDORED_VERSION.txt` for the full delta) — adds `PeekScratchArchive`/
+  `ScratchArchiveInfo` (header-peek geometry + trailer-byte-offset read for a serialized
+  scratch archive, not yet consumed by this plugin); fixes `ScratchBank::Load`'s retention
+  validation, a segmented-scan/whole-row-scan kernel-selection disagreement at several
+  `paddedDims`, an `int64` arena-size overflow in `ScratchBank::Create`/`Grow` when
+  geometry ceilings were not enforced first, and a Cosine channel bank with zero rows
+  being unrepresentable; and lets `MeanNNCrossDeviceChannel`/`MaxNNCrossDeviceChannel`
+  return `OutOfMemory`.
+- **`ComputePrincipalComponents`'s `scratch` parameter is now `double*`** (was `float*`)
+  in the vendored core. This plugin's one call site
+  (`SSuperFAISSBankInspector::ComputeProjection`, the PCA scatter-plot projection behind
+  the Bank Inspector's Structure/Novelty views) updated its scratch buffer from
+  `TArray<float>` to `TArray<double>` to match; no other behavior change.
+
+### Fixed
+- **Channel-table `Offset + Length` arithmetic widened to `int64` before every bounds
+  check**, in `USuperFAISSVectorBank::InitFromSource`,
+  `USuperFAISSVectorBank::RebuildChannelTable`, `USuperFAISSScratchBank::InitWithChannels`,
+  and `USuperFAISSScratchBank::Relabel` — all four `BlueprintCallable` entry points. The
+  caller-supplied `int32` sum could overflow before comparison, defeating the channel's own
+  bounds and ascending-order checks. A malformed table was never actually accepted or
+  stored — the vendored core's `ValidateBank` already rejects it downstream with
+  `BadFormat` — but the plugin's own channel-rules guard was inert for the overflowing
+  input, so the caller received a generic downstream failure instead of the specific
+  diagnosis, and the signed overflow was undefined behavior regardless of reachability.
+  Matches the core library's own fix for the same defect class in `ScratchBank::Create`
+  and `Grow`.
+
 ## [3.2.1] — 2026-07-21
 
 ### Fixed
