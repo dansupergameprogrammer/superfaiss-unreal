@@ -11,6 +11,8 @@ machines. This is the reference engine integration of the MIT-licensed
 [SuperFAISS](https://github.com/dansupergameprogrammer/superfaiss) core
 library (vendored — no external dependency).
 
+**Current release: [v3.3.0](https://github.com/dansupergameprogrammer/superfaiss-unreal/releases/tag/v3.3.0)**, bundling core [v3.3.0](https://github.com/dansupergameprogrammer/superfaiss/releases/tag/v3.3.0) — see [CHANGELOG.md](SuperFAISSUnreal/CHANGELOG.md), and [VENDORED_VERSION.txt](SuperFAISSUnreal/Source/ThirdParty/SuperFAISS/VENDORED_VERSION.txt) for the exact core commit. The "New in …" entries below are a per-release history, newest first; version markers elsewhere in this file record when a capability landed, not the current version.
+
 SuperFAISS is an **independent implementation** — not a fork of, derived from, or
 affiliated with Meta's FAISS; the name is nominative homage.
 
@@ -22,6 +24,37 @@ Measured on the shipped demo bank (40,000 words x 100 dims, int8, ~4 MB), deskto
 editor: single query **0.13 ms** (auto-parallelized across chunks — the core's serial
 one-core scan of the same bank is ~0.65 ms), batched **0.06 ms per query** — exact
 search, bit-deterministic, zero steady-state allocation.
+
+**New in 3.3:** vendors the MIT core library at tag `v3.3.0`, and widens the
+channel-table bounds arithmetic. The core release adds `PeekScratchArchive` — reading a
+serialized scratch archive's geometry, and the exact byte length a load will consume,
+straight out of a byte span without allocating or reading the payload, so a host that
+appends its own trailer can validate it *before* committing the load. It also validates a
+loaded scratch bank's retention region by replaying the bake on each retained row (a
+fabricated reference can no longer reach the recall audit), bounds `Create`/`Grow`
+geometry before the arena size is computed, resolves one float32 kernel-selection rule so
+the segmented and whole-row scans agree at widths that are multiples of 4 but not 8, and
+makes a zero-row Cosine channel bank representable. `Exactness::CrossDevice` was never
+affected by the kernel rule — int8 lengths are always multiples of 16 — so the
+cross-device contract is unchanged and no pinned golden moves.
+
+On the plugin side, the caller-supplied channel `Offset + Length` sum is now widened to
+`int64` before every bounds comparison, at all four Blueprint-callable entry points
+(`InitFromSource`, `RebuildChannelTable`, `InitWithChannels`, `Relabel`). Two large
+positive `int32` values could overflow before comparison, leaving the channel's own bounds
+and ascending-order checks inert. A malformed table was never actually accepted — the
+core's `ValidateBank` rejects it downstream — but the caller received a generic failure
+instead of the specific diagnosis, and the signed overflow was undefined behaviour
+regardless. One call site moved to the core's widened PCA scratch buffer
+(`ComputePrincipalComponents` now takes `double*`). Bundles the MIT core library at tag
+`v3.3.0`.
+
+**New in 3.2.1:** vendors the repaired core at tag `v3.2.1`, which fixes the core test
+suite on Linux and macOS arm64 (an unguarded reference to x86-only kernel mirrors, and a
+stack buffer overrun in an allocation cell). The core library itself is byte-identical to
+`v3.2.0`, so plugin behaviour is unchanged; the release exists so the vendored tree and
+the version it reports are the repaired ones. Bundles the MIT core library at tag
+`v3.2.1`.
 
 **New in 3.2:** the **Bank Inspector** — reading a bank's structure, not only
 querying it. Three header-only core modules over a caller-held view: a mutual k-NN
@@ -40,6 +73,15 @@ carries an allocation cell under a raw-allocation tracking seam, and a registry 
 fails the build when a new entry point arrives without one. Bundles the MIT core
 library at `v3.2.0`.
 
+**New in 3.1.2:** a release-hardening point, prompted by an external review. Fixes the
+Win64 **Shipping** game build (a missing `MassEntityQuery.h` include in the demo module's
+swarm processor — Editor PCH masked the IWYU gap); scrubs stale public contracts that
+survived 3.1 (the scratch channel table is mutable via `Relabel`, and scratch channel
+queries resolve — headers, `API.md`, and `INTEGRATION.md` now say so); documents `Relabel`
+in the core API/integration docs; corrects the core version header (it still reported
+3.0.1); narrows the plugin README's portability claim to the surfaces actually verified;
+and syncs every version surface to 3.1.2.
+
 **New in 3.1:** a runtime-mutable channel vocabulary. `Relabel` re-partitions the
 channel table on a live scratch bank — add or remove channels, change their count
 *and* boundaries, or promote a single-space bank to channels and demote it back —
@@ -52,15 +94,6 @@ recall, and the channel vocabulary surviving a save/load round trip — as do re
 MCP closures of the analytics reductions (spread and mean/max nearest-neighbour) over a
 live snapshot. Includes a segmented-kernel AVX2 fix (a length-4 channel could score a
 spurious `0` on the AVX2 float path). Bundles the MIT core library at tag `v3.1.2`.
-
-**New in 3.1.2:** a release-hardening point, prompted by an external review. Fixes the
-Win64 **Shipping** game build (a missing `MassEntityQuery.h` include in the demo module's
-swarm processor — Editor PCH masked the IWYU gap); scrubs stale public contracts that
-survived 3.1 (the scratch channel table is mutable via `Relabel`, and scratch channel
-queries resolve — headers, `API.md`, and `INTEGRATION.md` now say so); documents `Relabel`
-in the core API/integration docs; corrects the core version header (it still reported
-3.0.1); narrows the plugin README's portability claim to the surfaces actually verified;
-and syncs every version surface to 3.1.2.
 
 **New in 3.0.1:** version-header fix (the `SUPERFAISS_VERSION_*` macros now report
 3.0.1) and a zero-energy Cosine channel edge: a channel that carries no energy on a
