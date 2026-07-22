@@ -168,7 +168,10 @@ bool USuperFAISSScratchBank::InitWithChannels(int32 Capacity, int32 Dims,
 	{
 		superfaiss::ChannelInfo Info;
 		Info.offset = InChannelOffsets[C];
-		Info.length = (InChannelOffsets[C] + InChannelLengths[C] == Dims)
+		// Widen to int64 before comparing (F4, D-V32-89): Offset and Length are
+		// caller-supplied int32s, and their sum can overflow before it is compared
+		// against Dims.
+		Info.length = (static_cast<int64>(InChannelOffsets[C]) + InChannelLengths[C] == Dims)
 			? PaddedDims - InChannelOffsets[C]
 			: InChannelLengths[C];
 		Table.Add(Info);
@@ -230,7 +233,10 @@ bool USuperFAISSScratchBank::Relabel(const TArray<FName>& InChannelNames,
 	{
 		superfaiss::ChannelInfo Info;
 		Info.offset = InChannelOffsets[C];
-		Info.length = (InChannelOffsets[C] + InChannelLengths[C] == Dims)
+		// Widen to int64 before comparing (F4, D-V32-89): Offset and Length are
+		// caller-supplied int32s, and their sum can overflow before it is compared
+		// against Dims.
+		Info.length = (static_cast<int64>(InChannelOffsets[C]) + InChannelLengths[C] == Dims)
 			? PaddedDims - InChannelOffsets[C]
 			: InChannelLengths[C];
 		Table.Add(Info);

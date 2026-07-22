@@ -1,10 +1,9 @@
-SuperFAISS at core master commit df420b7 (UNTAGGED — release identity reads v3.2.0 in
-version.h; no v3.2.0 git tag exists yet). v3.1.2 carried v3.0 channel-capable scratch
-banks + channel-scoped analytics + archive v3, v3.1 runtime-mutable channel vocabulary
-(Relabel), v3.1.1 AVX2 float32 dot/L2 sub-8 segment-remainder fix, and v3.1.2's own
-doc/version-header corrections — no kernel or behavior change since v3.1.1.
+SuperFAISS at core master commit e7323f4, tagged v3.3.0. v3.1.2 carried v3.0
+channel-capable scratch banks + channel-scoped analytics + archive v3, v3.1 runtime-mutable
+channel vocabulary (Relabel), v3.1.1 AVX2 float32 dot/L2 sub-8 segment-remainder fix, and
+v3.1.2's own doc/version-header corrections — no kernel or behavior change since v3.1.1.
 
-v3.2 delta — four new Tier 1 headers for Bank Inspector I, each dependency-free,
+v3.2.0 delta — four new Tier 1 headers for Bank Inspector I, each dependency-free,
 caller-provided buffers, deterministic with pinned tie-breaks, consuming exact query
 output only (no kernel, quantization, or format change):
 - `graph.h` — `BuildKnnNeighbors`/`MutualFilter`/`BuildDuplicateGroups`/`ConnectedComponents`,
@@ -58,3 +57,71 @@ Publish-gate corrections in this sync (commit 4f4b5b6):
   column named. Added the CMake target and `build.bat` wiring; verified by a clean build
   producing and running `superfaiss_bench.exe`, reproducing ~0.65 ms on the 40k x 100
   int8 workload.
+
+v3.2.1 delta — test suite only; `include/` and `src/` are byte-identical to v3.2.0:
+- The kernel allocation cell referenced the `*ScalarAvx2` reference mirrors without an
+  architecture guard, so `tests/test_main.cpp` failed to link on macOS arm64 (the mirrors
+  are compiled out there) rather than failing a test.
+- The header-only-math allocation cell sized its decode buffer to `dims` where
+  `DequantizeRowAsQuery` writes `paddedDims` and zeroes the tail — an 8-float stack
+  overrun on a 24-dim int8 bank, aborting the suite under glibc's stack protector on Linux.
+  Confirmed with AddressSanitizer; the buffer is now sized from `constexpr PaddedDims`.
+- Coherence checks (documented signatures match their declaring header, every public
+  symbol documented, Markdown links resolve case-exactly) were added to the core repo's
+  own CI. They previously ran only in this plugin repository against the vendored copy,
+  so the core repo could publish a doc contradicting its own headers and stay green.
+
+v3.3.0 delta:
+- **`PeekScratchArchive`/`ScratchArchiveInfo`** (`scratch.h`, new) — reads a serialized
+  scratch archive's header and channel table out of a byte span and reports its geometry
+  plus `archiveBytes`, exactly the number of bytes a `Load` consumes, without allocating
+  or reading the payload. Runs the same header validation `Load` does (the two now share
+  one validator). Lets a host that appends its own trailer after the archive — this
+  plugin's channel-name frame is one — locate and validate that trailer before
+  committing the load, rather than discovering a broken trailer with the rows already
+  replaced. Not yet consumed by this plugin.
+- **`ComputePrincipalComponents`'s `scratch` parameter is now `double*`** (was `float*`,
+  `pca.h`) — source-breaking. The covariance-apply accumulator now matches the mean's
+  accumulation precision; a float accumulator rounded once per row and degraded the
+  power iteration with bank size. This plugin's one call site
+  (`SSuperFAISSBankInspector::ComputeProjection`, PCA scatter-plot projection) updated
+  its scratch buffer from `TArray<float>` to `TArray<double>` in this sync.
+- **`MeanNNCrossDeviceChannel`/`MaxNNCrossDeviceChannel` can now return `OutOfMemory`**
+  (`analytics.h`) — both now stage a pre-lift of the target's non-excluded sub-rows into
+  the caller's `Workspace` so each target's self-dot is computed once rather than once
+  per source row; a failed reservation now surfaces as `OutOfMemory` instead of being
+  unreachable. This plugin does not call either function directly.
+- **`ScratchBank::Load` now validates the retention region** (`scratch.cpp`) — a
+  retained row is by construction the post-normalization row the quantizer consumed, so
+  `Load` replays the bake on each retained row and requires it to reproduce the stored
+  row exactly. A fabricated-but-finite retained array previously loaded clean and handed
+  `MeasureScratchRecall` an invented reference. Non-finite retained values are rejected
+  the same way (`BadFormat`).
+- **Segmented-scan / whole-row-scan kernel-selection disagreement fixed**
+  (`kernels.cpp`) — `ResolveRowKernels`, which feeds the segmented scan and
+  `DecomposeRowScore`, wired the float32 AVX2 dot/L2 kernels in directly with no
+  sub-8-remainder rule, while the dispatchers `DotF32`/`L2F32` apply that rule. At
+  `paddedDims` 20, 36, 52, 100, 132 and similar the two paths disagreed in the last ulp,
+  falsifying the "no second code path exists to drift" decomposition guarantee. Fixed by
+  routing `ResolveRowKernels` through the same dispatchers. `Exactness::CrossDevice` was
+  never affected (int8 lengths are always multiples of 16); no pinned golden moves.
+- **`ScratchBank::Create`/`Grow` geometry ceilings enforced before arena size is
+  computed** (`scratch.cpp`) — `ArenaBytes` multiplies capacity by dims in signed
+  `int64`; both entry points previously accepted any positive `int32` pair, so a large
+  valid-typed request overflowed the arena computation (undefined behavior) rather than
+  being refused. Both now apply the format's own ceilings (`kMaxBankRows` rows,
+  `kMaxCrossDeviceDims` dims) before any size is computed, returning `InvalidArgument`.
+  The archive loader already applied these caps; direct construction and `Grow` did not.
+- **Bank-inspection review follow-ups** (`graph.cpp`, `analytics.cpp`, `pca.cpp`,
+  `compose.cpp`) — `MutualFilter`/`ConnectedComponents` bound caller-supplied neighbour
+  and duplicate-group values to `[0, count)` before indexing; the int8 off-grid channel
+  guard is now shared between `novelty.cpp` and the channel-analytics legs;
+  `ProjectRowsOntoComponents` bounds `componentCount` by `dims` like its sibling; scale
+  decode goes through `detail::FloatBitsToDouble` uniformly so a subnormal scale decodes
+  identically under any FTZ/DAZ mode.
+- **A Cosine channel bank with zero rows was unrepresentable** (`validate.cpp`) —
+  `ValidateBank` required the per-channel inverse sub-norm array whenever a Cosine bank
+  carried channels; those norms are one per row, so a bank with no rows requires none.
+  The rule now applies only when `count > 0` — the shape a channel-carrying scratch bank
+  graduates into once every row has been removed no longer forces that graduation to
+  drop its channels.

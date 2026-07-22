@@ -137,15 +137,21 @@ bool USuperFAISSVectorBank::InitFromSource(
 		}
 		const int32 Grid = superfaiss::kAlignment / superfaiss::ElementSize(CoreQuant);
 		TSet<FName> UniqueNames;
-		int32 PrevEnd = 0;
+		// Bound the geometry in int64 before any arithmetic runs on it (F4,
+		// D-V32-89): Offset and Length are caller-supplied int32s, and two
+		// large positive values can overflow int32 on addition. Widen End to
+		// int64 so the sum cannot wrap, and derive bEndsAtDims, the "within
+		// dims" guard, and PrevEnd from that one widened value.
+		int64 PrevEnd = 0;
 		for (int32 C = 0; C < ChannelCount; ++C)
 		{
 			const int32 Offset = InChannelOffsets[C];
 			const int32 Length = InChannelLengths[C];
-			const bool bEndsAtDims = Offset + Length == InDims;
+			const int64 End = static_cast<int64>(Offset) + Length;
+			const bool bEndsAtDims = End == InDims;
 			if (InChannelNames[C].IsNone() || Offset < 0 || Length <= 0 ||
 				Offset % Grid != 0 || (Length % Grid != 0 && !bEndsAtDims) ||
-				Offset < PrevEnd || Offset + Length > InDims)
+				Offset < PrevEnd || End > InDims)
 			{
 				OutError = FString::Printf(
 					TEXT("channel %d ('%s') violates the channel rules (grid %d, ascending, within dims)"),
@@ -153,7 +159,7 @@ bool USuperFAISSVectorBank::InitFromSource(
 				return false;
 			}
 			UniqueNames.Add(InChannelNames[C]);
-			PrevEnd = Offset + Length;
+			PrevEnd = End;
 		}
 		if (UniqueNames.Num() != ChannelCount)
 		{
@@ -289,8 +295,11 @@ void USuperFAISSVectorBank::RebuildChannelTable()
 		superfaiss::ChannelInfo Info;
 		Info.offset = ChannelOffsets[C];
 		// A channel declared to end at dims extends across the zero pad lanes so its
-		// stored range stays on the element grid (pads contribute nothing).
-		Info.length = (ChannelOffsets[C] + ChannelLengths[C] == Dims)
+		// stored range stays on the element grid (pads contribute nothing). Widen to
+		// int64 before comparing (F4, D-V32-89): these fields can carry whatever a
+		// corrupted or tampered asset stored, and int32 addition of two large values
+		// can overflow.
+		Info.length = (static_cast<int64>(ChannelOffsets[C]) + ChannelLengths[C] == Dims)
 			? PaddedDims - ChannelOffsets[C]
 			: ChannelLengths[C];
 		ChannelTable.Add(Info);
