@@ -2091,16 +2091,21 @@ bool FSuperFAISSInspectorArchiveSwapInvalidationTest::RunTest(const FString& Par
 	return true;
 }
 
-// Dim 2/8 (BuildAnalysisSample(Source, ...)'s own real, disclosed rejection): channel-
-// scoped archive analysis is not yet supported -- a real, defined "not yet" (returns
-// false), never a silent wrong slice. GREEN AT AUTHORING TIME -- this IS the scaffold's
-// real behavior, not a poison; kept as a standing regression guard.
+// Dim 2/8/11b (SF34-005 -- converted from the pre-SF34-005
+// InspectorArchiveChannelScopeRejection regression test, 2026-07-22: the outright
+// channel-scope rejection this test used to pin is GONE by this ticket's own acceptance
+// criterion, plan section 6 dim 5/11b -- "the former outright rejection is now a supported
+// path... its old rejection cell is deleted, not left dangling." Converted rather than
+// deleted outright so the fixture's real regression value survives: this is the unit-level
+// companion to the tutorial-bank oracle's TutorialArchiveChannelScopeParity (which proves
+// the golden VALUES); this test proves the STRUCTURAL contract -- a channel-scoped archive
+// sample actually resolves to the channel's own dims/renormalized rows, not the whole row.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FSuperFAISSInspectorArchiveChannelScopeRejectionTest,
-	"SuperFAISS.D.InspectorArchiveChannelScopeRejection",
+	FSuperFAISSInspectorArchiveChannelScopeSupportedTest,
+	"SuperFAISS.D.InspectorArchiveChannelScopeSupported",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
-bool FSuperFAISSInspectorArchiveChannelScopeRejectionTest::RunTest(const FString& Parameters)
+bool FSuperFAISSInspectorArchiveChannelScopeSupportedTest::RunTest(const FString& Parameters)
 {
 	// A channel-carrying ASSET (to populate the shared scope combo -- the scope selector
 	// is asset-driven regardless of which source is primary, section 25.3's design note)
@@ -2116,10 +2121,36 @@ bool FSuperFAISSInspectorArchiveChannelScopeRejectionTest::RunTest(const FString
 		return true;
 	}
 
-	TArray<uint8> Bytes;
-	if (!MakeScratchArchiveBytes(*this, SeededRows(10, 16, 0xE002), 10, 16, ESuperFAISSBankMetric::Cosine,
-		ESuperFAISSBankQuantization::Float32, {}, Bytes))
+	// The archive must carry the SAME channel table, not just channel-less rows --
+	// Source.GetChannelIndex(chanA) resolves against the ARCHIVE's own ChannelNames
+	// (FSuperFAISSInspectionSource::GetChannelIndex's Archive-kind branch), so a channel-
+	// less archive (MakeScratchArchiveBytes's plain Init()) would legitimately reject
+	// "unknown channel scope" here -- a different, correct rejection, not the one this test
+	// is about. InitWithChannels directly, mirroring SuperFAISSInspectorTrustGapTests.cpp's
+	// own channel-carrying archive fixture.
+	USuperFAISSScratchBank* ChannelScratch = NewObject<USuperFAISSScratchBank>();
+	if (!ChannelScratch->InitWithChannels(10, 16, ESuperFAISSBankMetric::Cosine,
+		ESuperFAISSBankQuantization::Float32, ChannelNames, ChannelOffsets, ChannelLengths))
 	{
+		AddError(TEXT("(setup) channel-carrying archive InitWithChannels failed"));
+		return true;
+	}
+	const TArray<float> ArchiveRows = SeededRows(10, 16, 0xE002);
+	for (int32 i = 0; i < 10; ++i)
+	{
+		TArray<float> Row;
+		Row.Append(&ArchiveRows[static_cast<int64>(i) * 16], 16);
+		int32 OutIndex = INDEX_NONE;
+		if (!ChannelScratch->Append(Row, OutIndex))
+		{
+			AddError(TEXT("(setup) channel-carrying archive row append failed"));
+			return true;
+		}
+	}
+	TArray<uint8> Bytes;
+	if (!ChannelScratch->SaveToBytes(Bytes))
+	{
+		AddError(TEXT("(setup) channel-carrying archive SaveToBytes failed"));
 		return true;
 	}
 
@@ -2134,14 +2165,23 @@ bool FSuperFAISSInspectorArchiveChannelScopeRejectionTest::RunTest(const FString
 	TArray<int32> SourceIndices;
 	const bool bOk = Inspector->BuildAnalysisSampleForTest(Inspector->GetPrimarySource(), 8,
 		Payload, Scales, View, SourceIndices);
-	TestFalse(TEXT("channel-scoped archive analysis is a real, defined rejection"), bOk);
+	TestTrue(TEXT("SF34-005: channel-scoped archive analysis is a SUPPORTED path (the former "
+		"outright rejection is genuinely replaced)"), bOk);
+	if (bOk)
+	{
+		TestEqual(TEXT("SF34-005: the sampled view's dims equal the channel's own length (8), "
+			"not the whole row's (16)"), View.dims, 8);
+		TestEqual(TEXT("SF34-005: the sample count is min(live count, SampleLimit) = min(10, 8)"),
+			View.count, 8);
+	}
 
-	// The whole-row scope, by contrast, is real (not this cell's own crux claim, but a
-	// negative control confirming the rejection is scope-specific, not blanket).
+	// The whole-row scope remains real too -- confirms the fix is additive, not a scope-
+	// specific regression on the path that already worked.
 	Inspector->SetAnalysisScopeForTest(TEXT("(whole row)"));
 	const bool bWholeRowOk = Inspector->BuildAnalysisSampleForTest(Inspector->GetPrimarySource(), 8,
 		Payload, Scales, View, SourceIndices);
-	TestTrue(TEXT("negative control: whole-row archive analysis is NOT rejected"), bWholeRowOk);
+	TestTrue(TEXT("whole-row archive analysis is still real (unaffected by the channel-scope fix)"),
+		bWholeRowOk);
 	return true;
 }
 

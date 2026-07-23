@@ -1,6 +1,12 @@
 #include "SSuperFAISSBankInspector.h"
 
 #include "AssetRegistry/AssetRegistryModule.h"
+// SF34-002: the "Open Archive..." affordance's native file-picker.
+#include "DesktopPlatformModule.h"
+#include "Interfaces/IMainFrameModule.h"
+#include "IDesktopPlatform.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "SuperFAISSInspectorSettings.h"
 #include "SuperFAISSInspectorSlowTask.h"
@@ -379,6 +385,20 @@ int32 FSuperFAISSInspectionSource::GetChannelIndex(FName Name) const
 	}
 }
 
+FName FSuperFAISSInspectionSource::GetChannelName(int32 Index) const
+{
+	switch (Kind)
+	{
+	case EKind::Asset:
+		return Asset.IsValid() && Asset->ChannelNames.IsValidIndex(Index)
+			? Asset->ChannelNames[Index] : NAME_None;
+	case EKind::Archive:
+		return ArchiveBank.IsValid() ? ArchiveBank->GetChannelName(Index) : NAME_None;
+	default:
+		return NAME_None;
+	}
+}
+
 FName FSuperFAISSInspectionSource::GetIdForIndex(int32 Index) const
 {
 	// An archive carries no id table at all (ScratchBank has no id storage) -- always
@@ -453,32 +473,70 @@ void SSuperFAISSBankInspector::Construct(const FArguments& InArgs)
 				SNew(SVerticalBox)
 				+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 6)
 				[
-					SNew(SComboBox<TSharedPtr<FString>>)
-					.OptionsSource(&BankNames)
-					.OnGenerateWidget_Lambda([Body](TSharedPtr<FString> Item)
-					{
-						return SNew(STextBlock).Font(Body).Text(FText::FromString(*Item));
-					})
-					.OnSelectionChanged_Lambda(
-						[this](TSharedPtr<FString> Item, ESelectInfo::Type)
-						{
-							SelectedBankName = Item;
-							OnBankSelected();
-						})
+					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot().FillWidth(1.0f)
 					[
-						SNew(STextBlock).Font(Body)
-						.Text_Lambda([this]()
+						SNew(SComboBox<TSharedPtr<FString>>)
+						.OptionsSource(&BankNames)
+						.OnGenerateWidget_Lambda([Body](TSharedPtr<FString> Item)
 						{
-							return FText::FromString(SelectedBankName.IsValid()
-								? *SelectedBankName : TEXT("select a bank..."));
+							return SNew(STextBlock).Font(Body).Text(FText::FromString(*Item));
 						})
+						.OnSelectionChanged_Lambda(
+							[this](TSharedPtr<FString> Item, ESelectInfo::Type)
+							{
+								SelectedBankName = Item;
+								OnBankSelected();
+							})
+						[
+							SNew(STextBlock).Font(Body)
+							.Text_Lambda([this]()
+							{
+								return FText::FromString(SelectedBankName.IsValid()
+									? *SelectedBankName : TEXT("select a bank..."));
+							})
+						]
+					]
+					// SF34-002 (T-01): the primary slot's "Open Archive..." affordance --
+					// the byte handler (OpenScratchArchiveFromBytes) has been real since the
+					// prior pass; this button, and PeekAndOpenArchive's peek-gated flow it
+					// drives, is the first VISIBLE way to reach it (roadmap T-01's own
+					// characterization: "byte handlers exist, no visible affordance").
+					+ SHorizontalBox::Slot().AutoWidth().Padding(6, 0, 0, 0)
+					[
+						SNew(SButton)
+						.ToolTipText(FText::FromString(TEXT(
+							"Open a .bin scratch archive as the primary inspection source. "
+							"Geometry is shown before commit; a failed open leaves the "
+							"current source unchanged.")))
+						.OnClicked(this, &SSuperFAISSBankInspector::OnOpenArchiveClicked, false)
+						[
+							SNew(STextBlock).Font(Body).Text(FText::FromString(TEXT("Open Archive…")))
+						]
 					]
 				]
-				// Channel table + per-channel recall + memory accounting, one line.
+				// T-07: the source header's own metadata line -- asset channel-table/
+				// memory-accounting shape (BankInfoLine's own, unchanged) OR, for an open
+				// archive, the archive metadata line SourceHeaderLine() now generalizes to.
+				+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 2)
+				[
+					SNew(STextBlock).Font(Body).AutoWrapText(true)
+					.Text_Lambda([this]() { return FText::FromString(SourceHeaderLine()); })
+				]
+				// T-11 (SF34-007): the primary slot's peek geometry (the archive's own
+				// PeekScratchArchive report, including the trailing-data disclosure) and the
+				// open/rejection status line (the specific validation failure, per
+				// PeekStatusToText / core Load's own rejection text) -- both empty until a
+				// primary archive has actually been opened once.
+				+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 2)
+				[
+					SNew(STextBlock).Font(Body).AutoWrapText(true).ColorAndOpacity(FLinearColor::Gray)
+					.Text_Lambda([this]() { return FText::FromString(GetArchivePeekGeometry()); })
+				]
 				+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 6)
 				[
 					SNew(STextBlock).Font(Body).AutoWrapText(true)
-					.Text_Lambda([this]() { return FText::FromString(BankInfoLine()); })
+					.Text_Lambda([this]() { return FText::FromString(GetArchiveOpenStatus()); })
 				]
 				// Channel weight sliders (channel banks only).
 				+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 6)
@@ -707,6 +765,22 @@ void SSuperFAISSBankInspector::Construct(const FArguments& InArgs)
 							})
 						]
 					]
+					// SF34-002 (T-01): the second-bank slot's OWN "Open Archive..." affordance
+					// -- the mirror of the primary slot's, driving
+					// OpenSecondScratchArchiveFromBytes via the SAME PeekAndOpenArchive
+					// peek-gated flow (bSecondSlot=true).
+					+ SHorizontalBox::Slot().AutoWidth().Padding(6, 0, 0, 0)
+					[
+						SNew(SButton)
+						.ToolTipText(FText::FromString(TEXT(
+							"Open a .bin scratch archive as the second-bank (Correspondence) "
+							"source. Geometry is shown before commit; a failed open leaves "
+							"the current second source unchanged.")))
+						.OnClicked(this, &SSuperFAISSBankInspector::OnOpenArchiveClicked, true)
+						[
+							SNew(STextBlock).Font(Body).Text(FText::FromString(TEXT("Open Archive…")))
+						]
+					]
 					+ SHorizontalBox::Slot().AutoWidth().Padding(6, 0, 0, 0)
 					[
 						SNew(SButton)
@@ -724,6 +798,18 @@ void SSuperFAISSBankInspector::Construct(const FArguments& InArgs)
 							.Text(FText::FromString(TEXT("Compute correspondence")))
 						]
 					]
+				]
+				// T-11 (SF34-007): the second slot's own peek geometry + open/rejection
+				// status, the mirror of the primary slot's own pair above.
+				+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 2)
+				[
+					SNew(STextBlock).Font(Body).AutoWrapText(true).ColorAndOpacity(FLinearColor::Gray)
+					.Text_Lambda([this]() { return FText::FromString(GetSecondArchivePeekGeometry()); })
+				]
+				+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 2)
+				[
+					SNew(STextBlock).Font(Body).AutoWrapText(true)
+					.Text_Lambda([this]() { return FText::FromString(GetSecondArchiveOpenStatus()); })
 				]
 				+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 2)
 				[
@@ -991,6 +1077,86 @@ bool SSuperFAISSBankInspector::OpenSecondScratchArchiveFromBytes(const TArray<ui
 	return true;
 }
 
+namespace
+{
+	// T-11 (SF34-007): the specific validation failure PeekScratchArchive's Status reports,
+	// surfaced verbatim rather than a blanket "bad format" -- the same discipline
+	// OpenScratchArchiveFromBytes's own rejection line already applies, extended to the
+	// peek's own richer status set (a truncated buffer and a malformed one are both
+	// BadFormat at this layer -- the vendored core does not itself distinguish them further
+	// -- so both read the same specific text; this is the honest limit of what the peek
+	// contract discloses, not an invented distinction).
+	FString PeekStatusToText(superfaiss::Status Status)
+	{
+		using namespace superfaiss;
+		switch (Status)
+		{
+		case Status::BadFormat:
+			return TEXT("archive: bad format (corrupt, truncated, wrong version, or not an archive)");
+		case Status::InvalidArgument:
+			return TEXT("archive: invalid (empty buffer or malformed header)");
+		case Status::OutOfMemory:
+			return TEXT("archive: header declares a geometry too large to peek");
+		default:
+			return FString::Printf(TEXT("archive: rejected (status %d)"), static_cast<int32>(Status));
+		}
+	}
+}
+
+bool SSuperFAISSBankInspector::PeekAndOpenArchive(
+	const TArray<uint8>& Bytes, const FString& DisplayName, bool bSecondSlot)
+{
+	using namespace superfaiss;
+
+	FString& OpenStatus = bSecondSlot ? SecondArchiveOpenStatus : ArchiveOpenStatus;
+	FString& PeekGeometry = bSecondSlot ? SecondArchivePeekGeometry : ArchivePeekGeometry;
+
+	// The peek: read-only, no state mutation on either branch below -- SF34-002's own
+	// acceptance ("geometry is shown before commit; a failed open preserves the current
+	// source") falls out of this ordering by construction, not a separate rollback.
+	ScratchArchiveInfo Info;
+	const Status PeekStatus = PeekScratchArchive(Bytes.GetData(), Bytes.Num(), &Info);
+	if (PeekStatus != Status::Ok)
+	{
+		OpenStatus = PeekStatusToText(PeekStatus);
+		return false;
+	}
+
+	// T-11: the geometry line, including the trailing-data disclosure (archiveBytes
+	// strictly less than the buffer's own length means real, disclosed trailing bytes
+	// exist past the archive the header declares -- PeekScratchArchiveGuardVitality's own
+	// oracle for this exact field, proven at the core boundary).
+	const bool bHasTrailingData = Info.archiveBytes < static_cast<int64>(Bytes.Num());
+	PeekGeometry = FString::Printf(
+		TEXT("%d x %d, metric %s, quant %s, %d channel(s), %lld bytes%s"),
+		Info.count, Info.dims,
+		*StaticEnum<ESuperFAISSBankMetric>()->GetNameStringByValue(static_cast<int64>(Info.metric)),
+		*StaticEnum<ESuperFAISSBankQuantization>()->GetNameStringByValue(static_cast<int64>(Info.quant)),
+		Info.channelCount, Info.archiveBytes,
+		bHasTrailingData
+			? *FString::Printf(TEXT(" (+%lld trailing bytes ignored)"),
+				static_cast<int64>(Bytes.Num()) - Info.archiveBytes)
+			: TEXT(""));
+
+	// The commit: the existing, already-proven Open(Second)ScratchArchiveFromBytes -- its
+	// own full Load validation is NOT bypassed by the peek succeeding (matching.h-style
+	// belt-and-suspenders: a peek is a preview, never a substitute for Load's own checks).
+	const bool bCommitted = bSecondSlot
+		? OpenSecondScratchArchiveFromBytes(Bytes, DisplayName)
+		: OpenScratchArchiveFromBytes(Bytes, DisplayName);
+	if (!bCommitted)
+	{
+		// The peek passed but LoadFromBytes rejected (e.g. OOM after a valid header): the
+		// source is already correctly preserved (the new bank is discarded before
+		// assignment), but PeekGeometry above still describes the rejected archive. Clear
+		// it so the display line cannot show geometry for a source that was never
+		// committed -- OpenStatus (set by the commit call) is the surface that now carries
+		// the failure.
+		PeekGeometry.Reset();
+	}
+	return bCommitted;
+}
+
 void SSuperFAISSBankInspector::OnBankSelected()
 {
 	// Slot 4b mutual exclusion (FSuperFAISSInspectionSource's class comment): picking an
@@ -1111,22 +1277,103 @@ FString SSuperFAISSBankInspector::BankInfoLine() const
 	return Line;
 }
 
-FText SSuperFAISSBankInspector::GetScatterPointLabel(int32 SampleIndex) const
+FString SSuperFAISSBankInspector::SourceHeaderLine() const
 {
-	const USuperFAISSVectorBank* Bank = GetSelectedBank();
-	FString RowLabel;
-	if (Bank != nullptr && StructureSampleSourceIndices.IsValidIndex(SampleIndex))
+	const FSuperFAISSInspectionSource Source = GetPrimarySource();
+	if (Source.Kind == FSuperFAISSInspectionSource::EKind::Asset)
 	{
-		const int32 SourceRow = StructureSampleSourceIndices[SampleIndex];
-		const FName Id = Bank->GetIdForIndex(SourceRow);
-		RowLabel = Id.IsNone() ? FString::Printf(TEXT("#%d"), SourceRow) : Id.ToString();
+		// Unchanged: the asset's own channel-table/memory-accounting shape.
+		return BankInfoLine();
 	}
-	else
+	if (Source.Kind != FSuperFAISSInspectionSource::EKind::Archive || !Source.IsValid())
+	{
+		return FString();
+	}
+	// T-07: the archive metadata line BankInfoLine() never covered (GetSelectedBank() is
+	// asset-only, always nullptr for an archive) -- the source header's own claim about an
+	// open archive: display name, published/live count (the tombstone disclosure an asset
+	// never carries, the class comment's documented asymmetry), dims, metric, quantization,
+	// channel count.
+	return FString::Printf(TEXT("%s: %d x %d (live %d), metric %s, quant %s, %d channel(s)"),
+		*Source.DisplayName(), Source.GetCount(), Source.GetDims(), Source.GetLiveCount(),
+		*StaticEnum<ESuperFAISSBankMetric>()->GetNameStringByValue(static_cast<int64>(Source.GetMetric())),
+		*StaticEnum<ESuperFAISSBankQuantization>()->GetNameStringByValue(
+			static_cast<int64>(Source.GetQuantization())),
+		Source.GetChannelCount());
+}
+
+FReply SSuperFAISSBankInspector::OnOpenArchiveClicked(bool bSecondSlot)
+{
+	IDesktopPlatform* DesktopPlatform = FDesktopPlatformModule::Get();
+	if (DesktopPlatform == nullptr)
+	{
+		return FReply::Handled();
+	}
+
+	void* ParentWindowHandle = nullptr;
+	if (FModuleManager::Get().IsModuleLoaded(TEXT("MainFrame")))
+	{
+		IMainFrameModule& MainFrameModule = FModuleManager::LoadModuleChecked<IMainFrameModule>(TEXT("MainFrame"));
+		const TSharedPtr<SWindow> ParentWindow = MainFrameModule.GetParentWindow();
+		if (ParentWindow.IsValid() && ParentWindow->GetNativeWindow().IsValid())
+		{
+			ParentWindowHandle = ParentWindow->GetNativeWindow()->GetOSWindowHandle();
+		}
+	}
+
+	TArray<FString> OutFiles;
+	const bool bPicked = DesktopPlatform->OpenFileDialog(
+		ParentWindowHandle,
+		TEXT("Open SuperFAISS scratch archive"),
+		FPaths::ProjectSavedDir(),
+		TEXT(""),
+		TEXT("SuperFAISS scratch archive (*.bin)|*.bin|All files (*.*)|*.*"),
+		EFileDialogFlags::None,
+		OutFiles);
+	// A cancelled dialog is not a rejection -- nothing to surface, the dialog's own UI
+	// already told the user nothing happened.
+	if (!bPicked || OutFiles.Num() == 0)
+	{
+		return FReply::Handled();
+	}
+
+	TArray<uint8> Bytes;
+	if (!FFileHelper::LoadFileToArray(Bytes, *OutFiles[0]))
+	{
+		(bSecondSlot ? SecondArchiveOpenStatus : ArchiveOpenStatus) = TEXT("archive: failed to read file");
+		return FReply::Handled();
+	}
+
+	PeekAndOpenArchive(Bytes, FPaths::GetCleanFilename(OutFiles[0]), bSecondSlot);
+	return FReply::Handled();
+}
+
+// SF34-004: the shared row-label resolver (declared in the header next to this function).
+// Reads GetPrimarySource() (asset OR archive), not GetSelectedBank() (asset-only) — an
+// archive-kind source's GetIdForIndex() is always NAME_None (no id table exists there, the
+// documented asymmetry), so it correctly falls through to "#<source row>", never a raw
+// sample position. Before this fix, both this function and RebuildStructureClusterList's
+// MemberLabel lambda read GetSelectedBank() directly, so an archive source (Bank == nullptr)
+// fell all the way to the "neither view has run yet" fallback and printed the SAMPLE
+// position instead of the original SOURCE index — the T-03 bug.
+FString SSuperFAISSBankInspector::ComputeStructureMemberLabel(int32 SampleIdx) const
+{
+	const FSuperFAISSInspectionSource Source = GetPrimarySource();
+	if (!Source.IsValid() || !StructureSampleSourceIndices.IsValidIndex(SampleIdx))
 	{
 		// Neither Compute projection nor Compute structure has populated the sample ->
-		// source-row map yet; fall back to the bare sample position rather than nothing.
-		RowLabel = FString::Printf(TEXT("sample #%d"), SampleIndex);
+		// source-row map yet (or no source is selected); fall back to the bare sample
+		// position rather than nothing.
+		return FString::Printf(TEXT("#%d"), SampleIdx);
 	}
+	const int32 SourceRow = StructureSampleSourceIndices[SampleIdx];
+	const FName Id = Source.GetIdForIndex(SourceRow);
+	return Id.IsNone() ? FString::Printf(TEXT("#%d"), SourceRow) : Id.ToString();
+}
+
+FText SSuperFAISSBankInspector::GetScatterPointLabel(int32 SampleIndex) const
+{
+	FString RowLabel = ComputeStructureMemberLabel(SampleIndex);
 
 	FString ClusterLabel;
 	if (StructureComponentIdBySampleIndex.IsValidIndex(SampleIndex))
@@ -1161,12 +1408,95 @@ const FSuperFAISSStructureCluster* SSuperFAISSBankInspector::FindStructureCluste
 	return nullptr;
 }
 
+// SF34-003 (Coverage Model dim 4/8/10): the two source-generalized query primitives RunQuery
+// and ProbeNovelty both share. USuperFAISSSubsystem's MakeCentroidQuery/QuerySync are
+// asset-typed with no drop-in archive equivalent for centroid construction (the prior pass's
+// own routing comment, SuperFAISSInspectorPanelTests.cpp: "ProbeNovelty()'s own archive wiring
+// is explicitly OUT OF SCOPE this round... routed onward"). These two functions ARE that
+// routing's landing point: Asset-kind delegates unchanged to the existing subsystem calls (zero
+// behavior change on the already-shipped, already-tested asset path); Archive-kind uses
+// QueryScratch (real, shipped for V3.0 relabeling) for the query dispatch, and
+// DequantizeRowAsQuery for the centroid -- exact for a single-row centroid, and every call site
+// in this class only ever centroids ONE row ({Row}, never a multi-row pool), so no averaging
+// step is actually missing, only the asset-typed indirection MakeCentroidQuery wraps around it.
+bool SSuperFAISSBankInspector::MakeCentroidQueryForSource(const FSuperFAISSInspectionSource& Source,
+	int32 RowIndex, TArray<float>& OutQuery) const
+{
+	using namespace superfaiss;
+	if (Source.Kind == FSuperFAISSInspectionSource::EKind::Asset)
+	{
+		USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+		return Subsystem != nullptr &&
+			Subsystem->MakeCentroidQuery(Source.Asset.Get(), {RowIndex}, OutQuery);
+	}
+	if (Source.Kind == FSuperFAISSInspectionSource::EKind::Archive)
+	{
+		const BankView Full = Source.GetBankView();
+		if (RowIndex < 0 || RowIndex >= Full.count)
+		{
+			return false;
+		}
+		TArray<float> Padded;
+		Padded.SetNumUninitialized(Full.paddedDims);
+		DequantizeRowAsQuery(Full, RowIndex, Padded.GetData());
+		OutQuery.SetNumUninitialized(Full.dims);
+		FMemory::Memcpy(OutQuery.GetData(), Padded.GetData(), Full.dims * sizeof(float));
+		if (Full.metric == Metric::Cosine)
+		{
+			// Align with the asset branch: Subsystem->MakeCentroidQuery's own Cosine leg
+			// (compose.cpp's MakeCentroid) L2-normalizes the centroid before returning it.
+			// A raw dequantized row is not guaranteed unit-norm, so normalize here too --
+			// functionally invariant against every reachable consumer today (Query()/
+			// KthNeighborDistance() both normalize or are magnitude-invariant on the
+			// Cosine paths that call this function), but removes the latent divergence.
+			double SumSq = 0.0;
+			for (int32 d = 0; d < Full.dims; ++d)
+			{
+				SumSq += static_cast<double>(OutQuery[d]) * OutQuery[d];
+			}
+			const double Norm = FMath::Sqrt(SumSq);
+			if (Norm > 0.0)
+			{
+				const float InvNorm = static_cast<float>(1.0 / Norm);
+				for (int32 d = 0; d < Full.dims; ++d)
+				{
+					OutQuery[d] *= InvNorm;
+				}
+			}
+		}
+		return true;
+	}
+	return false;
+}
+
+bool SSuperFAISSBankInspector::QuerySource(const FSuperFAISSInspectionSource& Source,
+	TConstArrayView<float> UnpaddedQuery, const FSuperFAISSQueryArgs& Args,
+	TArray<FSuperFAISSHit>& OutHits) const
+{
+	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
+	if (Subsystem == nullptr)
+	{
+		return false;
+	}
+	if (Source.Kind == FSuperFAISSInspectionSource::EKind::Asset)
+	{
+		return Subsystem->QuerySync(Source.Asset.Get(), UnpaddedQuery, Args, OutHits);
+	}
+	if (Source.Kind == FSuperFAISSInspectionSource::EKind::Archive)
+	{
+		return Subsystem->QueryScratch(Source.ArchiveBank.Get(), UnpaddedQuery, Args, OutHits);
+	}
+	return false;
+}
+
 void SSuperFAISSBankInspector::RunQuery(const FString& Text)
 {
 	ResultLines.Reset();
-	USuperFAISSVectorBank* Bank = GetSelectedBank();
+	// SF34-003: source-generalized (asset OR archive) via MakeCentroidQueryForSource/
+	// QuerySource, defined just above.
+	const FSuperFAISSInspectionSource Source = GetPrimarySource();
 	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
-	if (Bank == nullptr || !Bank->IsValid() || Subsystem == nullptr)
+	if (!Source.IsValid() || Subsystem == nullptr)
 	{
 		ResultLines.Add(MakeShared<FString>(TEXT("no valid bank selected")));
 	}
@@ -1180,11 +1510,11 @@ void SSuperFAISSBankInspector::RunQuery(const FString& Text)
 		}
 		else
 		{
-			Row = Bank->GetIndexForId(FName(*Trimmed));
+			Row = Source.GetIndexForId(FName(*Trimmed));
 		}
 		TArray<float> Query;
-		if (Row < 0 || Row >= Bank->Count ||
-			!Subsystem->MakeCentroidQuery(Bank, {Row}, Query))
+		if (Row < 0 || Row >= Source.GetCount() ||
+			!MakeCentroidQueryForSource(Source, Row, Query))
 		{
 			ResultLines.Add(MakeShared<FString>(
 				FString::Printf(TEXT("row not found: %s"), *Trimmed)));
@@ -1195,17 +1525,17 @@ void SSuperFAISSBankInspector::RunQuery(const FString& Text)
 			Args.K = 12;
 			// Channel banks query by name with the slider weights — the same list
 			// DecomposeHit explains below.
-			const bool bChannels = Bank->GetChannelCount() > 0 &&
-				ChannelWeights.Num() == Bank->GetChannelCount();
+			const int32 ChannelCount = Source.GetChannelCount();
+			const bool bChannels = ChannelCount > 0 && ChannelWeights.Num() == ChannelCount;
 			if (bChannels)
 			{
-				for (int32 C = 0; C < Bank->GetChannelCount(); ++C)
+				for (int32 C = 0; C < ChannelCount; ++C)
 				{
-					Args.Channels.Add({Bank->ChannelNames[C], ChannelWeights[C]});
+					Args.Channels.Add({Source.GetChannelName(C), ChannelWeights[C]});
 				}
 			}
 			TArray<FSuperFAISSHit> Hits;
-			if (!Subsystem->QuerySync(Bank, Query, Args, Hits))
+			if (!QuerySource(Source, Query, Args, Hits))
 			{
 				ResultLines.Add(MakeShared<FString>(TEXT("query failed")));
 			}
@@ -1217,10 +1547,16 @@ void SSuperFAISSBankInspector::RunQuery(const FString& Text)
 					                : *Hit.Id.ToString(),
 					Hit.Score, Hit.Margin);
 
-				// Decomposition bars: contributions sum exactly to the score.
+				// Decomposition bars: contributions sum exactly to the score. Asset-kind
+				// only -- DecomposeHit has no scratch-bank equivalent (the SAME asymmetry
+				// MakeCentroidQuery/QuerySync already carry, per this ticket's routing
+				// comment); an archive source's query still returns a real score/margin
+				// per hit, just without the per-channel breakdown -- a real, disclosed
+				// degrade, never a silent wrong answer.
 				TArray<float> Contributions;
 				float Total = 0.0f;
-				if (bChannels && Subsystem->DecomposeHit(Bank, Query, Args.Channels,
+				if (bChannels && Source.Kind == FSuperFAISSInspectionSource::EKind::Asset &&
+					Subsystem->DecomposeHit(Source.Asset.Get(), Query, Args.Channels,
 						Hit.Index, Contributions, Total))
 				{
 					float MaxAbs = 0.0f;
@@ -1236,7 +1572,7 @@ void SSuperFAISSBankInspector::RunQuery(const FString& Text)
 						const float Weight = Args.Channels[C].Weight;
 						FString Cosine;
 						if (Weight != 0.0f &&
-							Bank->Metric == ESuperFAISSBankMetric::Cosine)
+							Source.GetMetric() == ESuperFAISSBankMetric::Cosine)
 						{
 							const float Raw = Contributions[C] / Weight;
 							const float Clamped = FMath::Clamp(Raw, -1.0f, 1.0f);
@@ -1381,16 +1717,11 @@ void SSuperFAISSBankInspector::RebuildStructureClusterList()
 	StructureListRoots.Reset();
 	HighlightedSampleIndices.Reset();
 
-	const USuperFAISSVectorBank* Bank = GetSelectedBank();
-	const auto MemberLabel = [this, Bank](int32 SampleIdx) -> FString
+	// SF34-004: MemberLabel is now the shared ComputeStructureMemberLabel (source-
+	// generalized, asset OR archive) — see that function's comment for the bug this fixed.
+	const auto MemberLabel = [this](int32 SampleIdx) -> FString
 	{
-		if (Bank == nullptr || !StructureSampleSourceIndices.IsValidIndex(SampleIdx))
-		{
-			return FString::Printf(TEXT("#%d"), SampleIdx);
-		}
-		const int32 SourceRow = StructureSampleSourceIndices[SampleIdx];
-		const FName Id = Bank->GetIdForIndex(SourceRow);
-		return Id.IsNone() ? FString::Printf(TEXT("#%d"), SourceRow) : Id.ToString();
+		return ComputeStructureMemberLabel(SampleIdx);
 	};
 	const auto MakeLeaf = [&MemberLabel](int32 SampleIdx) -> TSharedPtr<FSuperFAISSStructureListItem>
 	{
@@ -1703,12 +2034,13 @@ bool SSuperFAISSBankInspector::BuildAnalysisSample(const USuperFAISSVectorBank& 
 }
 
 // ---------------------------------------------------------------------------
-// The abstraction's own crux. See the header's doc comment on this overload for the
-// full disclosure: real delegation on the
-// Asset-kind path (bit-identical to the overload above); a real, disclosed rejection for
-// a channel-scoped Archive-kind source (not yet supported); and, on the "(whole row)"
-// Archive-kind path, the space law enforced for real -- tombstoned rows dropped before
-// striding, over the live-row list rather than the published range.
+// The abstraction's own crux. See the header's doc comment on this overload for the full
+// disclosure: real delegation on the Asset-kind path (bit-identical to the overload
+// above); SF34-005: an Archive-kind source, channel-scoped or "(whole row)", now runs the
+// SAME channel-slice/renormalize/zero-energy-exclude shape the asset overload does
+// (Full.channels[] in place of Bank.ChannelOffsets/ChannelLengths), over the live-row list
+// rather than the published range -- the space law's tombstone discharge composes with
+// channel scoping rather than being an alternative to it.
 // ---------------------------------------------------------------------------
 
 bool SSuperFAISSBankInspector::BuildAnalysisSample(const FSuperFAISSInspectionSource& Source, int32 SampleLimit,
@@ -1737,12 +2069,6 @@ bool SSuperFAISSBankInspector::BuildAnalysisSample(const FSuperFAISSInspectionSo
 	{
 		return false;
 	}
-	// Real, disclosed rejection (not a silent wrong slice, see the header comment):
-	// channel-scoped archive analysis is not yet supported this round.
-	if (SelectedProjectionScope.IsValid() && *SelectedProjectionScope != TEXT("(whole row)"))
-	{
-		return false;
-	}
 
 	const BankView Full = Source.GetBankView();
 	if (Full.count <= 0)
@@ -1750,8 +2076,43 @@ bool SSuperFAISSBankInspector::BuildAnalysisSample(const FSuperFAISSInspectionSo
 		return false;
 	}
 
+	// SF34-005: the former outright channel-scope rejection is gone (dim-11b guard
+	// vitality -- the rejection is genuinely REPLACED, not left inert beside this). Channel
+	// resolution/renormalization mirrors the asset overload's own bChannelScoped/
+	// bRenormalizeSlice logic exactly (Full.channels[Channel] instead of
+	// Bank.ChannelOffsets/ChannelLengths -- the same segment table QueryScratch resolves
+	// named channels against), so asset/archive parity is structural, not coincidental.
+	int32 ScopeOffset = 0;
+	int32 ScopeDims = Full.dims;
+	const bool bChannelScoped =
+		SelectedProjectionScope.IsValid() && *SelectedProjectionScope != TEXT("(whole row)");
+	if (bChannelScoped)
+	{
+		const int32 Channel = Source.GetChannelIndex(FName(**SelectedProjectionScope));
+		if (Channel == INDEX_NONE)
+		{
+			return false;
+		}
+		ScopeOffset = Full.channels[Channel].offset;
+		ScopeDims = Full.channels[Channel].length;
+	}
+	// Same reasoning as the asset overload: a channel slice of a whole-row-unit Cosine row
+	// is not itself unit-norm, so every sliced row is renormalized to unit norm over the
+	// slice. Whole-row scope, L2, and Dot are untouched.
+	const bool bRenormalizeSlice = bChannelScoped && Full.metric == Metric::Cosine;
+
+	// M1 precondition (Finding 6, mirrored from the asset overload): a full-view identity
+	// build (bSkipTombstonedRows == false) must never compact away below Full.count rows,
+	// or the caller's excludeBits (aligned to native index space) land on the wrong row.
+	if (!bSkipTombstonedRows && SampleLimit < Full.count)
+	{
+		return false;
+	}
+
 	const int32 ElemBytes = ElementSize(Full.quant);
-	const int64 CopyBytes = static_cast<int64>(Full.dims) * ElemBytes;
+	const int32 ScopePd = PaddedDims(ScopeDims, Full.quant);
+	const int64 ScopeRowBytes = static_cast<int64>(ScopePd) * ElemBytes;
+	const int64 CopyBytes = static_cast<int64>(ScopeDims) * ElemBytes;
 	const int64 FullRowBytes = RowBytes(Full);
 
 	// The space law's TWO placements — see the header's doc
@@ -1790,17 +2151,17 @@ bool SSuperFAISSBankInspector::BuildAnalysisSample(const FSuperFAISSInspectionSo
 		}
 	}
 
-	// The SAME endpoint-inclusive even-sampling arithmetic as the overload above,
-	// applied over the LIVE-row list instead of the raw published range.
+	// The SAME endpoint-inclusive even-sampling arithmetic as the asset overload, applied
+	// over the LIVE-row list instead of the raw published range.
 	const int32 LiveCount = LiveIndices.Num();
 	const int32 SampleCount = FMath::Min(LiveCount, FMath::Max(1, SampleLimit));
-	OutSourceIndices.Reset();
-	OutSourceIndices.Reserve(SampleCount);
+	TArray<int32> Candidates;
+	Candidates.Reserve(SampleCount);
 	if (SampleCount <= 1 || LiveCount <= 1)
 	{
 		for (int32 i = 0; i < SampleCount; ++i)
 		{
-			OutSourceIndices.Add(LiveIndices[i]);
+			Candidates.Add(LiveIndices[i]);
 		}
 	}
 	else
@@ -1810,35 +2171,124 @@ bool SSuperFAISSBankInspector::BuildAnalysisSample(const FSuperFAISSInspectionSo
 		{
 			const int64 Numer = static_cast<int64>(i) * (LiveCount - 1);
 			const int32 LivePos = static_cast<int32>((Numer + Denom - 1) / Denom);
-			OutSourceIndices.Add(LiveIndices[LivePos]);
+			Candidates.Add(LiveIndices[LivePos]);
 		}
 	}
 
-	OutPayload.SetNumZeroed(OutSourceIndices.Num() * static_cast<int64>(Full.paddedDims) * ElemBytes);
+	// The per-candidate copy/renormalize/zero-energy loop, byte-for-byte the asset
+	// overload's own (SrcIdx/CandidatePos bookkeeping identical) -- generality-across-
+	// source-kinds (Coverage Model dim 8) is structural: one shared shape, two data
+	// sources, not two independently-written loops that could quietly drift apart.
+	OutPayload.SetNumZeroed(Candidates.Num() * ScopeRowBytes);
 	OutScales.Reset();
-	for (int32 S = 0; S < OutSourceIndices.Num(); ++S)
+	OutSourceIndices.Reset();
+	OutSourceIndices.Reserve(Candidates.Num());
+	if (OutZeroEnergyExcludeBits != nullptr)
 	{
-		FMemory::Memcpy(OutPayload.GetData() + S * static_cast<int64>(Full.paddedDims) * ElemBytes,
-			static_cast<const uint8*>(Full.rows) + OutSourceIndices[S] * FullRowBytes, CopyBytes);
-		if (Full.quant == Quantization::Int8)
+		OutZeroEnergyExcludeBits->Reset();
+		if (!bSkipTombstonedRows)
 		{
-			OutScales.Add(Full.scales[OutSourceIndices[S]]);
+			OutZeroEnergyExcludeBits->SetNumZeroed((Candidates.Num() + 31) / 32);
 		}
 	}
+	int32 ZeroEnergyExcludedCount = 0;
+	int32 Kept = 0;
+	for (int32 CandidatePos = 0; CandidatePos < Candidates.Num(); ++CandidatePos)
+	{
+		const int32 SrcIdx = Candidates[CandidatePos];
+		const uint8* SlicePtr = static_cast<const uint8*>(Full.rows) + SrcIdx * FullRowBytes +
+			static_cast<int64>(ScopeOffset) * ElemBytes;
+
+		bool bZeroEnergy = false;
+		if (bRenormalizeSlice && Full.quant == Quantization::Int8)
+		{
+			// DAZ-safe scale decode (bake.cpp's ComputeChannelInverseNorms convention):
+			// a plain (double)scale can see a subnormal scale flushed to 0 under one
+			// thread's DAZ state and preserved under another's.
+			const double Scale = detail::FloatBitsToDouble(Full.scales[SrcIdx]);
+			const int8_t* SliceInt8 = reinterpret_cast<const int8_t*>(SlicePtr);
+			double Norm = 0.0;
+			for (int32 j = 0; j < ScopeDims; ++j)
+			{
+				const double V = Scale * SliceInt8[j];
+				Norm += V * V;
+			}
+			if (Norm <= 0.0)
+			{
+				bZeroEnergy = true;
+			}
+			else
+			{
+				const double InvNorm = 1.0 / FMath::Sqrt(Norm);
+				FMemory::Memcpy(OutPayload.GetData() + Kept * ScopeRowBytes, SlicePtr, CopyBytes);
+				OutScales.Add(static_cast<float>(Scale * InvNorm));
+			}
+		}
+		else if (bRenormalizeSlice) // Float32
+		{
+			const float* SliceFloat = reinterpret_cast<const float*>(SlicePtr);
+			double Norm = 0.0;
+			for (int32 j = 0; j < ScopeDims; ++j)
+			{
+				Norm += static_cast<double>(SliceFloat[j]) * SliceFloat[j];
+			}
+			if (Norm <= 0.0)
+			{
+				bZeroEnergy = true;
+			}
+			else
+			{
+				const float InvNorm = static_cast<float>(1.0 / FMath::Sqrt(Norm));
+				float* DestFloat = reinterpret_cast<float*>(OutPayload.GetData() + Kept * ScopeRowBytes);
+				for (int32 j = 0; j < ScopeDims; ++j)
+				{
+					DestFloat[j] = SliceFloat[j] * InvNorm;
+				}
+			}
+		}
+		else
+		{
+			FMemory::Memcpy(OutPayload.GetData() + Kept * ScopeRowBytes, SlicePtr, CopyBytes);
+			if (Full.quant == Quantization::Int8)
+			{
+				OutScales.Add(Full.scales[SrcIdx]);
+			}
+		}
+
+		if (bZeroEnergy)
+		{
+			++ZeroEnergyExcludedCount;
+			if (bSkipTombstonedRows)
+			{
+				continue; // drop: no index-identity requirement on a sample build
+			}
+			if (Full.quant == Quantization::Int8)
+			{
+				OutScales.Add(0.0f);
+			}
+			if (OutZeroEnergyExcludeBits != nullptr)
+			{
+				(*OutZeroEnergyExcludeBits)[CandidatePos / 32] |= (1u << (CandidatePos % 32));
+			}
+		}
+
+		OutSourceIndices.Add(SrcIdx);
+		++Kept;
+	}
+	OutPayload.SetNum(Kept * ScopeRowBytes, EAllowShrinking::No);
 
 	OutView = Full;
 	OutView.rows = OutPayload.GetData();
 	OutView.scales = OutScales.Num() ? OutScales.GetData() : nullptr;
-	OutView.count = OutSourceIndices.Num();
-	// An Archive-kind source rejects a channel scope outright above, so it never reaches
-	// a zero-energy Cosine slice to exclude.
+	OutView.count = Kept;
+	OutView.dims = ScopeDims;
+	OutView.paddedDims = ScopePd;
+	OutView.channels = nullptr;
+	OutView.channelCount = 0;
+	OutView.channelInvNorms = nullptr;
 	if (OutZeroEnergyExcludedCount != nullptr)
 	{
-		*OutZeroEnergyExcludedCount = 0;
-	}
-	if (OutZeroEnergyExcludeBits != nullptr)
-	{
-		OutZeroEnergyExcludeBits->Reset();
+		*OutZeroEnergyExcludedCount = ZeroEnergyExcludedCount;
 	}
 	return true;
 }
@@ -2036,15 +2486,21 @@ void SSuperFAISSBankInspector::ProbeNovelty(const FString& Text)
 	NoveltyEvidenceLines.Reset();
 	NoveltyResult = FSuperFAISSNoveltyResult();
 
-	USuperFAISSVectorBank* Bank = GetSelectedBank();
+	// SF34-003: source-generalized (asset OR archive), not GetSelectedBank() (asset-only) --
+	// the fix for "an opened archive with no asset selected reports 'no valid bank selected'
+	// regardless of the archive's content" (roadmap T-02), via MakeCentroidQueryForSource/
+	// QuerySource (defined above RunQuery).
+	const FSuperFAISSInspectionSource Source = GetPrimarySource();
 	USuperFAISSSubsystem* Subsystem = GEngine->GetEngineSubsystem<USuperFAISSSubsystem>();
-	if (Bank == nullptr || !Bank->IsValid() || Subsystem == nullptr)
+	if (!Source.IsValid() || Subsystem == nullptr)
 	{
 		NoveltyStatus = TEXT("no valid bank selected");
 		return;
 	}
 
-	// Row lookup: identical parsing to RunQuery (row id or #index).
+	// Row lookup: identical parsing to RunQuery (row id or #index). Source.GetIndexForId is
+	// always INDEX_NONE for an archive (no id table, the documented asymmetry) -- "#index"
+	// addressing still works, matching GetIdForIndex's own disclosed degrade.
 	const FString Trimmed = Text.TrimStartAndEnd();
 	int32 Row = INDEX_NONE;
 	if (Trimmed.StartsWith(TEXT("#")))
@@ -2053,10 +2509,10 @@ void SSuperFAISSBankInspector::ProbeNovelty(const FString& Text)
 	}
 	else
 	{
-		Row = Bank->GetIndexForId(FName(*Trimmed));
+		Row = Source.GetIndexForId(FName(*Trimmed));
 	}
 	TArray<float> RawQuery;
-	if (Row < 0 || Row >= Bank->Count || !Subsystem->MakeCentroidQuery(Bank, {Row}, RawQuery))
+	if (Row < 0 || Row >= Source.GetCount() || !MakeCentroidQueryForSource(Source, Row, RawQuery))
 	{
 		NoveltyStatus = FString::Printf(TEXT("row not found: %s"), *Trimmed);
 		return;
@@ -2065,14 +2521,14 @@ void SSuperFAISSBankInspector::ProbeNovelty(const FString& Text)
 	NoveltyResult.bValid = true;
 	NoveltyStatus.Reset();
 
-	if (Bank->Metric == ESuperFAISSBankMetric::Dot)
+	if (Source.GetMetric() == ESuperFAISSBankMetric::Dot)
 	{
 		NoveltyResult.Verdict = ESuperFAISSNoveltyVerdict::Unavailable;
 		NoveltyResult.UnavailableStatus = DotUnavailableStatus();
 		return;
 	}
 
-	const BankView Full = Bank->GetBankView();
+	const BankView Full = Source.GetBankView();
 
 	// The limb-1 exact-distance probe is decoded via the SAME primitive the kernels
 	// themselves use (DequantizeRowAsQuery, inspector_common.h), not
@@ -2090,7 +2546,7 @@ void SSuperFAISSBankInspector::ProbeNovelty(const FString& Text)
 	int32 Channel = INDEX_NONE;
 	if (SelectedProjectionScope.IsValid() && *SelectedProjectionScope != TEXT("(whole row)"))
 	{
-		Channel = Bank->GetChannelIndex(FName(**SelectedProjectionScope));
+		Channel = Source.GetChannelIndex(FName(**SelectedProjectionScope));
 		if (Channel == INDEX_NONE)
 		{
 			NoveltyStatus = TEXT("unknown channel scope");
@@ -2102,7 +2558,7 @@ void SSuperFAISSBankInspector::ProbeNovelty(const FString& Text)
 	// Self-exclusion bitmask over the FULL bank (V32-G7) — reused for the limb-1
 	// nearest-row search and the evidence list.
 	TArray<uint32> ExcludeSelf;
-	ExcludeSelf.SetNumZeroed(FMath::DivideAndRoundUp(Bank->Count, 32));
+	ExcludeSelf.SetNumZeroed(FMath::DivideAndRoundUp(Source.GetCount(), 32));
 	ExcludeSelf[Row / 32] |= (1u << (Row % 32));
 
 	// Limb 1 (identity): the nearest OTHER row's own exact metric
@@ -2115,10 +2571,10 @@ void SSuperFAISSBankInspector::ProbeNovelty(const FString& Text)
 		NearestArgs.ExcludeBits = ExcludeSelf;
 		if (Channel != INDEX_NONE)
 		{
-			NearestArgs.Channels.Add({Bank->ChannelNames[Channel], 1.0f});
+			NearestArgs.Channels.Add({Source.GetChannelName(Channel), 1.0f});
 		}
 		TArray<FSuperFAISSHit> NearestHit;
-		if (Subsystem->QuerySync(Bank, RawQuery, NearestArgs, NearestHit) && NearestHit.Num() > 0)
+		if (QuerySource(Source, RawQuery, NearestArgs, NearestHit) && NearestHit.Num() > 0)
 		{
 			float ExactDistance = 0.0f;
 			Workspace NearestWs;
@@ -2163,8 +2619,8 @@ void SSuperFAISSBankInspector::ProbeNovelty(const FString& Text)
 		// a status string -- SampledCount/TotalCount already use the struct, not
 		// NoveltyStatus, for exactly this kind of disclosure.
 		int32 ZeroEnergyExcludedNovelty = 0;
-		if (!BuildAnalysisSample(*Bank, SampleLimit, Payload, Scales, SampledView, SampledSourceIndices,
-				&ZeroEnergyExcludedNovelty))
+		if (!BuildAnalysisSample(Source, SampleLimit, Payload, Scales, SampledView, SampledSourceIndices,
+				/*bSkipTombstonedRows*/ true, &ZeroEnergyExcludedNovelty))
 		{
 			NoveltyStatus = TEXT("unknown channel scope");
 			NoveltyResult = FSuperFAISSNoveltyResult();
@@ -2247,10 +2703,13 @@ void SSuperFAISSBankInspector::ProbeNovelty(const FString& Text)
 		}
 		else
 		{
+			// Source-generalized channel offset: Full.channels[] (the BankView the source
+			// abstraction already publishes), not Bank->ChannelOffsets -- the same segment
+			// table QueryScratch itself resolves named channels against for an archive.
 			FMemory::Memcpy(ScopedQuery.GetData(),
-				RawQuery.GetData() + Bank->ChannelOffsets[Channel], SampledView.dims * sizeof(float));
+				RawQuery.GetData() + Full.channels[Channel].offset, SampledView.dims * sizeof(float));
 		}
-		if (Bank->Metric == ESuperFAISSBankMetric::Cosine)
+		if (Source.GetMetric() == ESuperFAISSBankMetric::Cosine)
 		{
 			// Normalize the probe to unit L2 norm at this
 			// call site, never inside KthNeighborDistance itself — that function rides
@@ -2303,7 +2762,7 @@ void SSuperFAISSBankInspector::ProbeNovelty(const FString& Text)
 			Score >= Lambda ? ESuperFAISSNoveltyVerdict::Novel : ESuperFAISSNoveltyVerdict::Familiar;
 		NoveltyResult.bLowConfidence = SampledView.count < NoveltyLowConfidenceFloor;
 		NoveltyResult.SampledCount = SampledView.count;
-		NoveltyResult.TotalCount = Bank->Count;
+		NoveltyResult.TotalCount = Source.GetCount();
 		NoveltyResult.ZeroEnergyExcludedCount = ZeroEnergyExcludedNovelty;
 	}
 
@@ -2316,10 +2775,10 @@ void SSuperFAISSBankInspector::ProbeNovelty(const FString& Text)
 		EvidenceArgs.ExcludeBits = ExcludeSelf;
 		if (Channel != INDEX_NONE)
 		{
-			EvidenceArgs.Channels.Add({Bank->ChannelNames[Channel], 1.0f});
+			EvidenceArgs.Channels.Add({Source.GetChannelName(Channel), 1.0f});
 		}
 		TArray<FSuperFAISSHit> EvidenceHits;
-		if (Subsystem->QuerySync(Bank, RawQuery, EvidenceArgs, EvidenceHits))
+		if (QuerySource(Source, RawQuery, EvidenceArgs, EvidenceHits))
 		{
 			for (const FSuperFAISSHit& Hit : EvidenceHits)
 			{

@@ -410,9 +410,9 @@ The stripped plugin compiles and the non-demo test groups pass unchanged.
 
 ## Tests
 
-`SuperFAISS.*` automation tests (104 in this plugin — every registered
+`SuperFAISS.*` automation tests (113 in this plugin — every registered
 `IMPLEMENT_*_AUTOMATION_TEST`, run `Session > Automation` in the editor to see the
-current count; 108 with the MCP plugin enabled)
+current count; 117 with the MCP plugin enabled)
 cover kernel correctness, SIMD/scalar mirror equality, determinism, tie-break
 stability, concurrency, asset round-trips, import rejection, quantizer recall,
 performance guards, query composition (centroid, direction, intersection, margins),

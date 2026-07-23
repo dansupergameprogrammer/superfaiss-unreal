@@ -104,6 +104,13 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Similarity|Scratch")
 	int32 GetChannelIndex(FName Name) const { return ChannelNames.IndexOfByKey(Name); }
 
+	// Channel name by index, or NAME_None — the mirror of GetChannelIndex, mirroring the
+	// baked bank's own by-index channel-name access (USuperFAISSVectorBank::ChannelNames is
+	// a public array there; this bank's ChannelNames is private, so a channel-weighted
+	// caller generalized across both source kinds (SF34-003) needs an accessor here too).
+	UFUNCTION(BlueprintPure, Category = "Similarity|Scratch")
+	FName GetChannelName(int32 Index) const { return ChannelNames.IsValidIndex(Index) ? ChannelNames[Index] : NAME_None; }
+
 	// Mutable channel vocabulary (V3.1 slot 4, T-099): atomically re-partition the
 	// channel table on a LIVE bank — add/remove channels, change count AND boundaries,
 	// or promote (channel-less -> channels) / demote (channels -> single-space, an

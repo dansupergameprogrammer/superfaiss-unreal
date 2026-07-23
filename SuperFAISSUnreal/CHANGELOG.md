@@ -7,6 +7,43 @@ release vendors.
 
 The format follows [Keep a Changelog](https://keepachangelog.com).
 
+## [3.3.1] — 2026-07-22
+
+Correctness release. The Bank Inspector now delivers the archive-inspection workflow the
+3.2/3.3 UI described but did not fully reach — no new search or analysis primitive; every
+change closes a gap between a claim the plugin made and what the reachable UI actually did.
+The vendored core is unchanged from 3.3.0 (same `VENDORED_VERSION.txt`).
+
+### Added
+- **Visible "Open Archive…" actions on both the primary and second-bank slots.** A
+  serialized scratch archive can be opened, replaced, and closed from the widget. The
+  vendored core's `PeekScratchArchive` runs first, so the archive's geometry (rows, dims,
+  metric, quantization, and the exact `archiveBytes` a load consumes) and any
+  trailing-data or validation failure are shown *before* the load commits; a failed open
+  leaves the current source untouched.
+- **Novelty and channel-scoped analysis now run over archive sources**, not asset banks
+  only, with the same tombstone exclusion and named-channel slicing the asset path applies.
+- **Archive metadata in the shared source header** — live/published rows, metric,
+  quantization, dimensions, channels, and filename — read from the inspection source
+  rather than only a selected asset.
+- **A CI capability-to-test matrix**, so a claim in the README, changelog, or a tooltip
+  that no reachable UI delivers now fails the build rather than a human read.
+
+### Changed
+- **The correspondence classification threshold now ships a calibrated default** (`0.375`,
+  previously a `0.0f` placeholder) with a written fixture-population basis. (Non-finite
+  configuration already resolved to defined behavior; unchanged.)
+
+### Fixed
+- **Archive row identity now uses the original published source index in the Structure
+  view's tree and PCA-scatter tooltip** — previously it fell back to the sample position
+  when no asset was selected, so a pruned archive's rows now stay addressable by the
+  identity the archive published. (The Correspondence view's match list already reported
+  source indices directly from the core.)
+- **Plugin claims reconciled with the reachable UI**, backed by a new CI
+  capability-to-test matrix that asserts each advertised inspection capability has a
+  reachable path and a test.
+
 ## [3.3.0] — 2026-07-21
 
 ### Changed
@@ -100,123 +137,3 @@ The format follows [Keep a Changelog](https://keepachangelog.com).
   their zeroed defaults. The rendered text previously printed them anyway
   (`duplicate — novelty 0.0000 vs 0 of 0 sampled rows`); it now renders the plain
   verdict word for this case.
-
-## [3.1.2] — 2026-07-18
-
-### Fixed
-- A release-hardening point, prompted by an external review. Fixes the Win64 **Shipping**
-  game build (a missing `MassEntityQuery.h` include in the demo module's swarm processor —
-  the Editor PCH masked the IWYU gap); scrubs stale public contracts that survived 3.1 (the
-  scratch channel table is mutable via `Relabel`, and scratch channel queries resolve —
-  headers, `API.md` and `INTEGRATION.md` now say so); documents `Relabel` in the core
-  API/integration docs; corrects the core version header, which still reported 3.0.1; and
-  narrows the plugin README's portability claim to the surfaces actually verified.
-
-## [3.1] — 2026-07-18
-
-### Added
-- **A runtime-mutable channel vocabulary.** `Relabel` re-partitions the channel table on a
-  live scratch bank — add or remove channels, change their count *and* boundaries, or
-  promote a single-space bank to channels and demote it back — without a rebuild. The rows
-  are unchanged; only the partition moves. It is exclusive like `Grow`/`Load` (it drains
-  in-flight queries) and reject-over-degrade (a malformed table leaves the bank exactly as
-  it was), and a relabeled bank scores identically to a fresh bank created under the new
-  table over the same rows.
-- The Blueprint channel-scratch surface completes alongside it — named-channel scratch
-  queries, per-channel scratch recall, and the channel vocabulary surviving a save/load
-  round trip — as do read-only MCP closures of the analytics reductions (spread and
-  mean/max nearest-neighbour) over a live snapshot.
-
-### Fixed
-- A segmented-kernel AVX2 defect: a length-4 channel could score a spurious `0` on the
-  AVX2 float path.
-
-## [3.0.1] — 2026-07-13
-
-### Fixed
-- The `SUPERFAISS_VERSION_*` macros reported the wrong version; they now report 3.0.1.
-- A zero-energy Cosine channel edge: a channel carrying no energy on a valid
-  (whole-row-normalized) row now floors to a defined `0` in the NN-divergence reductions
-  rather than being rejected, and the per-channel recall audit excludes such a sampled row
-  instead of aborting.
-
-## [3.0] — 2026-07-13
-
-### Added
-- **Channel-capable scratch banks and channel-scoped analytics.** Channels — the named
-  sub-space partition baked banks have carried since 2.0 — extend to the mutable half.
-  `InitWithChannels` fixes a channel table on a scratch bank at construction; a
-  named-channel scratch query ranks a snapshot by a weighted combination of channels and
-  agrees **bit-for-bit** with its baked twin; channel-aware `Freeze` graduates the bank to a
-  schema-2 channel bank; and the per-channel recall audit reports recall@k per channel.
-- Every 2.5 analytics operator gains a channel-scoped form, on Blueprint and read-only MCP.
-  The cost is append-time only (the Cosine per-channel sub-norm), never on the query path.
-
-## [2.5] — 2026-07-12
-
-### Added
-- **Bank analytics** — cross-device-deterministic reductions over int8 banks: a set-to-set
-  centroid distance, directed nearest-neighbour set divergence (mean, and the order-free max
-  that is the Hausdorff component), within-bank dispersion, and the shared query-vs-query
-  pair score they rest on. All are bit-identical across machines by the same
-  integer-accumulation proof as the query path, on the Blueprint subsystem and as read-only
-  MCP tools.
-- An offline per-device probe-direction projection report.
-- The editor **Bank Inspector** (Tools > SuperFAISS Bank Inspector) shows a live PCA
-  projection beside its ranked-query view.
-
-### Changed
-- The result-direction convention (a `Dot` bank returns a similarity, not a distance) and the
-  cosine limb's determinism condition are now stated in the docs.
-
-## [2.4] — 2026-07-11
-
-### Added
-- **Integer-domain pooling.** `MakeCentroidQueryCrossDevice` pools int8 rows into a
-  *quantized* cross-device query — order-free integer accumulation, no float mean — so pooled
-  queries honestly participate in cross-device-exact results. `QueryPooledCrossDevice`
-  executes exactly those bytes, and the editor bakes the same operator's product into
-  cross-device-tier prototype assets, with a baked anchor byte-equal to a runtime pool over
-  identical rows, behind a required asset version bump.
-- Pooled recall is measured beside the operator and stated with its conditions.
-
-## [2.3] — 2026-07-11
-
-### Added
-- **Scratch-bank recall audit.** An opt-in float-retention posture on scratch banks — never
-  the default, and the memory cost is stated plainly — plus `MeasureRecall`, reporting the
-  bank's own cross-device recall with a seed, a generation stamp and a stale mark. Any later
-  append, remove or load marks the report stale, never silently current.
-- `DescribeScratchBank` (MCP) reports it read-only.
-
-## [2.2] — 2026-07-04
-
-### Added
-- **Cross-device bit-exactness.** An opt-in query mode for int8 banks returning bit-identical
-  scores and hit order on any machine at any SIMD width — the contract lockstep/rollback
-  multiplayer and networked motion matching require. The claim runs as a CI test against
-  committed fixtures, it measures faster than the default int8 scan, and the importer reports
-  the mode's recall beside standard recall on every bank asset.
-
-## [2.1] — 2026-07-04
-
-### Added
-- **Per-row score bias, in-scan and exact.** Sparse (index, bias) pairs for motion matching's
-  continuing-pose reward (effectively free) and a dense per-row view for memory salience
-  (+3.5% f32 / +1.9% int8, measured). Finite-only; exclusion beats bias; rewards are negative
-  on L2.
-
-## [2.0] — 2026-07-04
-
-### Added
-- **Named channels.** Rank by a weighted combination of vector sub-spaces, with exact
-  per-channel decomposition of every hit and true per-channel cosines. Channels are a
-  semantics feature, not a speed feature: a channel query costs approximately one full scan.
-- **Scratch banks.** Mutable runtime banks — append, remove, query, freeze, save — for NPC
-  memory and session-accumulated embeddings.
-
----
-
-Releases `v1.0`–`v1.2` and the `v2.2.1`–`v2.2.3` patches are tagged in this repository but
-predate this changelog and were never described on a public surface; their content is in the
-git history for those tags.
