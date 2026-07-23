@@ -1,23 +1,35 @@
 #!/usr/bin/env python3
 """Coherence check 2 — version identity.
 
-Five sources of truth must agree on one version number:
-  1. the vendored core's include/superfaiss/version.h macros
-  2. the vendored core's CHANGELOG.md top entry
-  3. the plugin's .uplugin VersionName
-  4. the plugin's own CHANGELOG.md top entry
-  5. the git tag on HEAD (when one exists)
+Two version lines must each be internally consistent, and the plugin must not
+lag the core it vendors:
 
-By default a tag on HEAD is required to agree; pass --allow-untagged for a
-pre-release run (a PR or a commit before the release tag has been cut) where
-the first four sources are still checked but an absent tag is not itself a
-failure. A tag that DOES exist and disagrees is always a failure either way.
+  Plugin line (must all agree with each other):
+    - the plugin's .uplugin VersionName
+    - the plugin's own CHANGELOG.md top entry
+    - the git tag on HEAD (when one exists)
+  Core line (must all agree with each other):
+    - the vendored core's include/superfaiss/version.h macros
+    - the vendored core's CHANGELOG.md top entry
+
+  And: plugin version >= core version. The plugin tracks the vendored core but
+  is NOT identical to it — a plugin-only release (e.g. an editor/inspector fix
+  over an unchanged library) advances the plugin ahead of the core it vendors.
+  The one thing forbidden is the plugin falling BEHIND the core, which would
+  mean shipping a newer core under an older plugin version number.
+
+By default a tag on HEAD is required to agree with the plugin line; pass
+--allow-untagged for a pre-release run (a PR, or a commit before the release
+tag is cut) where the other sources are still checked but an absent tag is not
+itself a failure. A tag that DOES exist and disagrees with the plugin line is
+always a failure.
 
 Usage:
     check_version_identity.py --plugin-root <path> [--allow-untagged]
 
-Exit codes: 0 = every present source agrees; 1 = disagreement, OR fewer than
-four sources were readable (a check that can pass without reading its
+Exit codes: 0 = each line is internally consistent and plugin >= core;
+1 = an internal disagreement, plugin behind core, OR fewer than four of the
+non-tag sources were readable (a check that can pass without reading its
 sources is not a check).
 """
 from __future__ import annotations
@@ -78,6 +90,22 @@ def read_head_tag(repo_root: Path) -> str | None:
     return None
 
 
+def parse_version(v: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in v.split("."))
+
+
+def one_value(group: dict[str, str | None], label: str) -> str | None:
+    """Return the single agreed value of a group, or None (and print) on disagreement."""
+    values = {v for v in group.values() if v is not None}
+    if len(values) > 1:
+        print(f"FAIL: version-identity check — {label} sources disagree:")
+        for name, v in group.items():
+            if v is not None:
+                print(f"  - {name}: {v}")
+        return None
+    return next(iter(values)) if values else None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--plugin-root", required=True, type=Path)
@@ -86,42 +114,49 @@ def main() -> int:
 
     vendored = args.plugin_root / "Source" / "ThirdParty" / "SuperFAISS"
 
-    sources: dict[str, str | None] = {
-        "core version.h": read_version_h(vendored / "include" / "superfaiss" / "version.h"),
-        "core CHANGELOG.md top entry": read_changelog_top(vendored / "CHANGELOG.md"),
+    plugin_sources: dict[str, str | None] = {
         "plugin .uplugin VersionName": read_uplugin_version(args.plugin_root / "SuperFAISSUnreal.uplugin"),
         "plugin CHANGELOG.md top entry": read_changelog_top(args.plugin_root / "CHANGELOG.md"),
     }
+    core_sources: dict[str, str | None] = {
+        "core version.h": read_version_h(vendored / "include" / "superfaiss" / "version.h"),
+        "core CHANGELOG.md top entry": read_changelog_top(vendored / "CHANGELOG.md"),
+    }
 
-    unreadable = [name for name, v in sources.items() if v is None]
-    readable = {name: v for name, v in sources.items() if v is not None}
-
-    if len(readable) < 4:
+    named = {**plugin_sources, **core_sources}
+    unreadable = [name for name, v in named.items() if v is None]
+    if sum(1 for v in named.values() if v is not None) < 4:
         print("FAIL: version-identity check could not read all four required sources — "
               "this is a failure, not a pass:")
         for name in unreadable:
             print(f"  - unreadable: {name}")
         return 1
 
+    # The git tag, when present, joins the plugin line.
     tag = read_head_tag(args.plugin_root)
     if tag is not None:
-        sources["git tag on HEAD"] = tag
+        plugin_sources["git tag on HEAD"] = tag
     elif not args.allow_untagged:
         print("FAIL: version-identity check found no version-shaped git tag on HEAD "
               "(pass --allow-untagged for a pre-release run).")
         return 1
 
-    values = {v for v in sources.values() if v is not None}
-    if len(values) > 1:
-        print(f"FAIL: version-identity check — sources disagree:")
-        for name, v in sources.items():
-            print(f"  - {name}: {v}")
+    plugin_ver = one_value(plugin_sources, "plugin")
+    core_ver = one_value(core_sources, "core")
+    if plugin_ver is None or core_ver is None:
         return 1
 
-    agreed = next(iter(values))
-    print(f"OK: version-identity check — all {len(sources)} source(s) agree on {agreed}.")
-    for name, v in sources.items():
-        print(f"  - {name}: {v}")
+    if parse_version(plugin_ver) < parse_version(core_ver):
+        print(f"FAIL: version-identity check — plugin {plugin_ver} is BEHIND the vendored "
+              f"core {core_ver}. The plugin may track ahead of the core it vendors, never lag it.")
+        return 1
+
+    rel = "==" if plugin_ver == core_ver else ">"
+    print(f"OK: version-identity check — plugin {plugin_ver} {rel} core {core_ver}; "
+          "each version line is internally consistent.")
+    for name, v in {**plugin_sources, **core_sources}.items():
+        if v is not None:
+            print(f"  - {name}: {v}")
     return 0
 
 
