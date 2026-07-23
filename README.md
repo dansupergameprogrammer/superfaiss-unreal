@@ -11,7 +11,7 @@ machines. This is the reference engine integration of the MIT-licensed
 [SuperFAISS](https://github.com/dansupergameprogrammer/superfaiss) core
 library (vendored — no external dependency).
 
-**Current release: [v3.3.0](https://github.com/dansupergameprogrammer/superfaiss-unreal/releases/tag/v3.3.0)**, bundling core [v3.3.0](https://github.com/dansupergameprogrammer/superfaiss/releases/tag/v3.3.0) — see [CHANGELOG.md](SuperFAISSUnreal/CHANGELOG.md), and [VENDORED_VERSION.txt](SuperFAISSUnreal/Source/ThirdParty/SuperFAISS/VENDORED_VERSION.txt) for the exact core commit. Version markers in this file record when a capability landed, not the current version.
+**Current release: [v3.3.0](SuperFAISSUnreal/CHANGELOG.md)** (this repository has not yet cut a `v3.3.0` tag — see [CHANGELOG.md](SuperFAISSUnreal/CHANGELOG.md) for the release notes), bundling core [v3.3.0](https://github.com/dansupergameprogrammer/superfaiss/releases/tag/v3.3.0) — see also [VENDORED_VERSION.txt](SuperFAISSUnreal/Source/ThirdParty/SuperFAISS/VENDORED_VERSION.txt) for the exact core commit. Version markers in this file record when a capability landed, not the current version.
 
 SuperFAISS is an **independent implementation** — not a fork of, derived from, or
 affiliated with Meta's FAISS; the name is nominative homage.
