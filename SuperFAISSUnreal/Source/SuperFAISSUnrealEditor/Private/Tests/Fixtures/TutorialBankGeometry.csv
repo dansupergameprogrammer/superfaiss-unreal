@@ -1,0 +1,61 @@
+# SuperFAISS For Unreal 3.3.1 -- tutorial-bank geometry sidecar (SF34-030/031 data half,
+# S-INSP-3.3.1 Gate 1a). Hand-authored, checked-in text. NOT read by any production code
+# path -- consumed only by the test-side bake helper in
+# SuperFAISSTutorialBankFixture.h/.cpp (Plugins/SuperFAISSUnreal/Source/SuperFAISSUnrealEditor/
+# Private/Tests/), which turns each row's two symbolic direction tags into the actual float
+# vector baked into a USuperFAISSVectorBank (the "asset" source) and a
+# USuperFAISSScratchBank archive (the "archive" source, with row 15 tombstoned to produce
+# the pruned-archive fixture).
+#
+# Geometry rule (stated here so the golden values in the test-design artifact can be
+# reproduced independently of the bake code): 8 dims, two 4-dim channels "chanA" (dims
+# 0-3) and "chanB" (dims 4-7). Each row names one of 4 basis directions per channel
+# (0..3); the row's chanA sub-vector is 10.0 on basis element ChanADir and 0 elsewhere,
+# its chanB sub-vector is 10.0 on basis element ChanBDir and 0 elsewhere. Metric=Cosine
+# (whole-row and channel-scoped), Quantization=Float32 (exact -- no quantization noise
+# in the oracle). Because both channels carry equal magnitude (10.0) and are mutually
+# orthogonal dimension ranges, the whole-row cosine similarity between two rows reduces
+# to a closed form every reader can re-derive by hand:
+#   cosine(row_i, row_j) = ( [ChanADir_i == ChanADir_j] + [ChanBDir_i == ChanBDir_j] ) / 2
+# i.e. exactly 0.0 (no channel direction shared), 0.5 (exactly one channel's direction
+# shared), or 1.0 (both channels' directions shared -- an exact duplicate). This is the
+# entire derivation basis for every golden value in the test-design artifact; no other
+# arithmetic is needed to re-verify a cell by hand.
+#
+# Columns: Bank,Index,ChanADir,ChanBDir,Role
+# Bank: "Primary" (the main tutorial bank, 22 rows, indices 0-21) or "Secondary" (the
+#   correspondence-partner bank, 6 rows, indices 0-5).
+# Index: the row's native, published source index within its own bank (0-based).
+# ChanADir/ChanBDir: the basis direction (0-3) in {chanA, chanB} the row's nonzero energy
+#   sits on.
+# Role: a human-readable tag, informational only, not parsed for correctness -- the
+#   grouping the test-design artifact's derivations refer to by name.
+Bank,Index,ChanADir,ChanBDir,Role
+Primary,0,0,0,X1
+Primary,1,0,0,X2
+Primary,2,0,0,X3
+Primary,3,0,0,X4
+Primary,4,1,1,Y1
+Primary,5,1,1,Y2
+Primary,6,1,1,Y3
+Primary,7,2,0,Z1
+Primary,8,2,0,Z2
+Primary,9,2,0,Z3
+Primary,10,3,2,ISO-A
+Primary,11,0,1,MIX-A
+Primary,12,1,2,MIX-B
+Primary,13,3,3,ISO-B
+Primary,14,3,3,ISO-B-dup
+Primary,15,0,0,X5-TOMBSTONE-TARGET
+Primary,16,0,2,MIX-C
+Primary,17,2,3,MIX-D
+Primary,18,1,3,MIX-E
+Primary,19,3,0,MIX-F
+Primary,20,0,3,MIX-G
+Primary,21,3,1,MIX-H
+Secondary,0,3,2,copy-of-Primary10-ISO-A
+Secondary,1,0,1,copy-of-Primary11-MIX-A
+Secondary,2,1,2,copy-of-Primary12-MIX-B
+Secondary,3,3,3,copy-of-Primary13-ISO-B
+Secondary,4,0,2,copy-of-Primary16-MIX-C
+Secondary,5,2,3,copy-of-Primary17-MIX-D

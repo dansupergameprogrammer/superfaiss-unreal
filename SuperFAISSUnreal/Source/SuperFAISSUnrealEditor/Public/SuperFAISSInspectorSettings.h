@@ -20,20 +20,28 @@
 // trust-boundary contract, audit G-1) is real, enforced clamping — CLOSED GREEN as of
 // slot 4 (GetClampedMatchK, the last stub, was implemented this round).
 //
-// CslsMarginThreshold (slot 4): declared with NO clamp accessor and NO plan-pinned default
-// — section 25.5 states this explicitly: "CslsMarginThreshold calibrated at build against
-// the demo bank and pinned then (a placeholder default is not shipped)". Pinning the real
-// number is a build-time CALIBRATION task (the Budget_MACs precedent: a measured
-// constant a build task hands to the code, never a value the code derives or a red
-// test asserts a specific number for) — a build task, not a red-suite cell.
-// The field carries 0.0f only so the class compiles; that literal is NOT a claimed
-// default and no cell in this round's suite depends on its value (see the test-design
-// artifact's deferral note). It has no clamp accessor either: unlike SampleLimit/
-// StructureK/MinComponentSize/NoveltyK (feed array/buffer sizing — a hostile value is a
-// memory-safety trust boundary, audit G-1) and NoveltyLambda (a documented [0,1] range),
-// CslsMarginThreshold feeds only a float comparison (the matched/ambiguous classification)
-// with no documented range and no sizing exposure — a NaN/Inf value here is well-defined
-// C++ behavior (a comparison against NaN is simply always false), never UB, so audit G-1's
+// CslsMarginThreshold (SF34-006, plugin 3.3.1): pinned to the build-time CALIBRATION this
+// class comment always said it needed (the Budget_MACs precedent: a measured constant a
+// build task hands to the code, never a value the code derives or a red test asserts a
+// specific number for) — no longer a placeholder. Population and basis, D-INSP-20
+// (`Claude/Curie/superfaiss-3.3.1-test-design-2026-07-22.md` section 1): the hand-authored
+// tutorial-bank correspondence set at MatchK=2 produces exactly two clusters — five clean
+// singleton pairs at margin 0.5, and one near-duplicate collision (the deliberate
+// ISO-B/ISO-B-dup fixture pair) at margin 0.25, correctly flagged lower-confidence by the
+// margin's own definition. Any threshold strictly inside (0.25, 0.5] separates the two
+// clusters correctly; 0.375 (the cluster midpoint) is pinned as the shipped default. This is
+// a tutorial-population calibration, not a re-derivation at the shipped production MatchK
+// (10) — the test-design's own scope note: the tutorial fixture's Secondary bank has only 6
+// rows, so MatchK cannot exceed 6 there, and a margin distribution is a function of MatchK.
+// Revisit when a real correspondence population large enough to calibrate at MatchK=10
+// exists (R-2, plan section 8).
+// No clamp accessor exists for this field, and none is added by this pin: unlike
+// SampleLimit/StructureK/MinComponentSize/NoveltyK (feed array/buffer sizing — a hostile
+// value is a memory-safety trust boundary, audit G-1) and NoveltyLambda (a documented [0,1]
+// range), CslsMarginThreshold feeds only a float comparison (the matched/ambiguous
+// classification) with no sizing exposure — a NaN/Inf value here is well-defined C++
+// behavior (a comparison against NaN is simply always false, so a hostile threshold falls
+// every otherwise-matched pair to Ambiguous, never Matched, never UB), so audit G-1's
 // "never UB" trust-boundary reason does not reach this field the way it reaches the others.
 UCLASS(config = EditorPerProjectUserSettings, defaultconfig,
 	meta = (DisplayName = "SuperFAISS Bank Inspector"))
@@ -74,10 +82,12 @@ public:
 	int32 MatchK = 10;
 
 	// View C (Correspondence): the CSLS-margin classification threshold (matched vs.
-	// ambiguous, section 25.4). NOT a plan-pinned default — see the class comment above
-	// and the test-design artifact's deferral note; 0.0f here compiles the field only.
+	// ambiguous, section 25.4). SF34-006 pin, 2026-07-22: 0.375, calibrated against the
+	// tutorial-bank correspondence population (D-INSP-20) — see the class comment above for
+	// the full basis. Valid anywhere in (0.25, 0.5] for that population; 0.375 is the
+	// cluster midpoint.
 	UPROPERTY(config, EditAnywhere, Category = "Correspondence")
-	float CslsMarginThreshold = 0.0f;
+	float CslsMarginThreshold = 0.375f;
 
 	// The hard cap on SampleLimit (section 25.3: "the hard cap (8192) remains reachable as
 	// a deliberate deeper look"). Not user-editable; the ceiling GetClampedSampleLimit
@@ -94,8 +104,9 @@ public:
 	int32 GetClampedNoveltyK() const;
 	float GetClampedNoveltyLambda() const;
 	// MatchK feeds the same array/workspace-sizing trust boundary as the other k-shaped
-	// fields (StructureK, NoveltyK): floored at 1, no documented ceiling. No accessor
-	// exists for CslsMarginThreshold — see the class comment above.
+	// fields (StructureK, NoveltyK): floored at 1, no documented ceiling. No clamp accessor
+	// exists for CslsMarginThreshold — see the class comment above (a NaN/Inf comparison is
+	// already well-defined, never UB).
 	int32 GetClampedMatchK() const;
 
 	// The dims-aware sub-second default sample cap:

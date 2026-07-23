@@ -38,6 +38,11 @@ public class SuperFAISSUnrealEditor : ModuleRules
 			// TraceLog named explicitly to resolve at link time (see the runtime
 			// module's Build.cs for the identical note).
 			"TraceLog",
+			// SF34-002: the "Open Archive..." affordance's native file-picker
+			// (IDesktopPlatform::OpenFileDialog) and its parent-window resolution
+			// (IMainFrameModule::GetParentWindow) for the modal dialog.
+			"DesktopPlatform",
+			"MainFrame",
 		});
 	}
 }

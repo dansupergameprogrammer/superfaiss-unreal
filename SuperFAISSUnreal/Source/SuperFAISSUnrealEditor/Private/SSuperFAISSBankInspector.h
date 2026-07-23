@@ -17,6 +17,10 @@
 // is, including every automation test's SNew(...) call) need the complete type in EVERY
 // translation unit that includes this header, not only this widget's own .cpp.
 #include "SuperFAISSScratchBank.h"
+// SF34-003: MakeCentroidQueryForSource/QuerySource (below) declare FSuperFAISSQueryArgs/
+// FSuperFAISSHit parameters directly (not just TArray<>& by reference to an already-known
+// type) -- a real include, the same reasoning as the two above.
+#include "SuperFAISSSubsystem.h"
 
 // V3.2 plan section 25.9 dim 10 (Panel FEAT, audit G-6): one component of the sample the
 // Structure pass ran on. `MemberSampleIndices` are indices into the SAME sampled view
@@ -179,6 +183,13 @@ struct FSuperFAISSInspectionSource
 	ESuperFAISSBankQuantization GetQuantization() const;
 	int32 GetChannelCount() const;
 	int32 GetChannelIndex(FName Name) const;
+	// SF34-003: the channel-name-by-index mirror of GetChannelIndex, generalizing
+	// Bank->ChannelNames[Index] (asset-only, used throughout RunQuery/ProbeNovelty for
+	// channel-weighted queries) to either source kind. Both USuperFAISSVectorBank and
+	// USuperFAISSScratchBank carry a public ChannelNames array; this switches on Kind the
+	// same way every other accessor here does. NAME_None on an out-of-range Index or an
+	// invalid/None-kind source.
+	FName GetChannelName(int32 Index) const;
 	FName GetIdForIndex(int32 Index) const;
 	int32 GetIndexForId(FName Id) const;
 	// The source-space BankView (rows/scales point directly at the asset's OR the scratch
@@ -294,6 +305,24 @@ public:
 	bool OpenSecondScratchArchiveFromBytes(const TArray<uint8>& Bytes, const FString& DisplayName);
 	const FString& GetArchiveOpenStatus() const { return ArchiveOpenStatus; }
 	const FString& GetSecondArchiveOpenStatus() const { return SecondArchiveOpenStatus; }
+	// T-11 (SF34-007): the peeked geometry line for the slot's current archive (empty if
+	// the slot has never had a successful peek). See ArchivePeekGeometry's own comment.
+	const FString& GetArchivePeekGeometry() const { return ArchivePeekGeometry; }
+	const FString& GetSecondArchivePeekGeometry() const { return SecondArchivePeekGeometry; }
+
+	// SF34-002: the peek-gated open/replace/close control flow the "Open Archive..."
+	// button drives -- issues the PeekScratchArchive call for the geometry + archiveBytes
+	// that gate the commit (this ticket's own scope; see the header comment above
+	// OpenScratchArchiveFromBytes for why the commit itself is unchanged). Peek runs FIRST,
+	// read-only: on a peek rejection (truncated/malformed/trailing-data-that-still-fails,
+	// etc.) the specific failure is surfaced via GetArchiveOpenStatus()/
+	// GetSecondArchiveOpenStatus() and NEITHER Open(Second)ScratchArchiveFromBytes nor any
+	// state mutation ever runs -- the existing source is preserved by construction, not by a
+	// separate rollback path. On a successful peek, the geometry is published (T-11) and
+	// THEN the real commit runs through the existing, already-proven Open(Second)
+	// ScratchArchiveFromBytes (which performs its own full Load validation; a peek passing
+	// does not bypass it). Returns the commit's own result (false on a peek rejection too).
+	bool PeekAndOpenArchive(const TArray<uint8>& Bytes, const FString& DisplayName, bool bSecondSlot);
 
 	// The resolved current inspection source per slot (test + future UI binding
 	// surface): Archive-kind when that slot's "Open scratch archive..." has succeeded
@@ -379,6 +408,17 @@ public:
 		return BuildAnalysisSample(Source, SampleLimit, OutPayload, OutScales, OutView, OutSourceIndices,
 			bSkipTombstonedRows, OutZeroEnergyExcludedCount, OutZeroEnergyExcludeBits);
 	}
+
+	// Test seam (SF34-004, test-design section 5's routed gap): ComputeStructureMemberLabel
+	// is private (it is display-string plumbing, not part of the public analysis contract),
+	// so this is the only way an automation test can pin the actual RENDERED row label —
+	// the same string RebuildStructureClusterList's member rows and GetScatterPointLabel's
+	// row-label prefix both use — for a given sample position. A thin pass-through, the
+	// same shape as BuildAnalysisSampleForTest above.
+	FString GetStructureMemberLabelForTest(int32 SampleIndex) const
+	{
+		return ComputeStructureMemberLabel(SampleIndex);
+	}
 #endif
 
 private:
@@ -388,6 +428,34 @@ private:
 	void RunQuery(const FString& Text);
 	void ComputeProjection();
 	FString BankInfoLine() const;
+	// T-07 (SF34-007): the source header's own metadata line, generalized to either
+	// inspection source -- BankInfoLine() unchanged for an Asset-kind source (its own
+	// channel-table/memory-accounting shape is asset-specific and stays as-is); a NEW
+	// archive metadata line (count/live count/dims/metric/quantization/channel count/
+	// display name) for an Archive-kind source, which BankInfoLine() never covered
+	// (GetSelectedBank()-only, always empty for an archive). Empty for no source selected.
+	FString SourceHeaderLine() const;
+	// SF34-002: the "Open Archive..." button's click handler, shared by both slots (the
+	// bool selects which). Opens a native file-picker, reads the chosen file, and runs it
+	// through PeekAndOpenArchive -- the peek-gated commit this ticket's acceptance
+	// criterion names. A cancelled dialog or an unreadable file is a silent no-op (no
+	// dialog result to surface as a line-item status; the file dialog's own UI already
+	// communicated cancellation to the user).
+	FReply OnOpenArchiveClicked(bool bSecondSlot);
+
+	// SF34-003: the two source-generalized query primitives RunQuery/ProbeNovelty share.
+	// USuperFAISSSubsystem's MakeCentroidQuery/QuerySync are asset-typed with no drop-in
+	// archive equivalent for centroid construction (the prior pass's own routing comment,
+	// SuperFAISSInspectorPanelTests.cpp) -- these two functions supply that equivalent by
+	// branching on Source.Kind: Asset delegates to the existing, unchanged subsystem calls;
+	// Archive uses QueryScratch (already real, added for V3.0 relabeling) for the query, and
+	// DequantizeRowAsQuery for the centroid -- exact for a single-row centroid (RowIndices
+	// is always {Row}, never a multi-row pool, at every call site in this class), so no
+	// averaging step is missing, only the asset-typed indirection.
+	bool MakeCentroidQueryForSource(const FSuperFAISSInspectionSource& Source, int32 RowIndex,
+		TArray<float>& OutQuery) const;
+	bool QuerySource(const FSuperFAISSInspectionSource& Source, TConstArrayView<float> UnpaddedQuery,
+		const FSuperFAISSQueryArgs& Args, TArray<FSuperFAISSHit>& OutHits) const;
 
 	// View C (Correspondence), section 25.3 E-D1-1..4: the second bank slot — a second
 	// SComboBox over the SAME asset-registry list as the primary, held as
@@ -427,6 +495,14 @@ private:
 	bool CheckSecondBankCompatible(const FSuperFAISSInspectionSource& A,
 		const FSuperFAISSInspectionSource& B, FString& OutReason) const;
 
+	// SF34-004: the single row-label resolver shared by GetScatterPointLabel (tooltip) and
+	// RebuildStructureClusterList (the member-list tree) — resolves a sample position to its
+	// ORIGINAL SOURCE INDEX via GetPrimarySource() (asset OR archive), not GetSelectedBank()
+	// (asset-only). An archive-kind source therefore renders "#<source row>" (its
+	// GetIdForIndex() is always NAME_None, the documented asymmetry), never a raw sample
+	// position — the T-03 bug (roadmap SF34-004) was exactly this function reading
+	// GetSelectedBank() and falling back to the sample position whenever Bank was null.
+	FString ComputeStructureMemberLabel(int32 SampleIdx) const;
 	// Scatter hover tooltip: the real bank id (or #index) of the sample position under the
 	// cursor, plus its cluster membership if Structure has been computed (its component id
 	// + size, or "Outlier", or nothing if Structure hasn't run yet). Passed into
@@ -528,11 +604,10 @@ private:
 	// SAME endpoint-inclusive even-sampling construction, generalized to either
 	// inspection source. For an Asset-kind source this delegates unchanged to the
 	// overload above (bit-identical, no behavior change on the already-proven asset
-	// path). For an Archive-kind source: channel-scoped archive analysis is a real,
-	// disclosed, defined rejection (returns false when a non-"(whole row)" scope is
-	// selected -- routed onward alongside the live channel-weighted query pane's own
-	// identical asset-only posture, section 25.3; a genuine unit-space obstacle, not a
-	// preference).
+	// path). For an Archive-kind source (SF34-005): channel-scoped archive analysis is a
+	// SUPPORTED path, running the same channel-slice/renormalize/zero-energy-exclude shape
+	// the asset overload does (Full.channels[] in place of Bank.ChannelOffsets/
+	// ChannelLengths) -- the former outright rejection is gone, not left inert beside this.
 	//
 	// bSkipTombstonedRows selects WHICH of section 25.3's two space-law placements this
 	// call is for -- they are mutually exclusive, never both applied to the same view:
@@ -555,9 +630,9 @@ private:
 	// disclosure, forwarded unchanged, with bCompactZeroEnergy DERIVED from
 	// bSkipTombstonedRows -- the two flags select the SAME axis (sample vs. full-view
 	// identity) by construction, since every call site that passes bSkipTombstonedRows as
-	// one of the two literal values also means it as the other. The
-	// Archive-kind path rejects a channel scope outright, so it never has a zero-energy
-	// row to exclude and leaves both outputs at 0/empty.
+	// one of the two literal values also means it as the other. The Archive-kind path
+	// (SF34-005) now populates both outputs for real on a channel-scoped Cosine slice,
+	// exactly like the asset overload -- no longer a fixed 0/empty pair.
 	bool BuildAnalysisSample(const FSuperFAISSInspectionSource& Source, int32 SampleLimit,
 		TArray<uint8, TAlignedHeapAllocator<16>>& OutPayload, TArray<float>& OutScales,
 		superfaiss::BankView& OutView, TArray<int32>& OutSourceIndices,
@@ -579,6 +654,14 @@ private:
 	// itself, section 25.9's archive rejection matrix), and its second-slot mirror.
 	FString ArchiveOpenStatus;
 	FString SecondArchiveOpenStatus;
+	// T-11 (SF34-007): the geometry PeekScratchArchive reported for the most recently
+	// opened archive on this slot -- "geometry is shown before commit" (SF34-002's own
+	// acceptance criterion). Set on a successful peek (whether or not the subsequent commit
+	// also succeeds); left untouched by a rejected peek (ArchiveOpenStatus alone carries
+	// that failure, so a stale geometry line from a PRIOR successful open is not overwritten
+	// by a later failed attempt -- it still describes the source actually in effect).
+	FString ArchivePeekGeometry;
+	FString SecondArchivePeekGeometry;
 
 	// View C (Correspondence) second-bank slot (section 25.3 E-D1-1): the SAME
 	// asset-registry-enumeration pattern as the primary picker, held separately —
