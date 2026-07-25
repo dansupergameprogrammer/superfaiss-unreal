@@ -71,8 +71,10 @@ is in [CHANGELOG.md](SuperFAISSUnreal/CHANGELOG.md).
   salience (+3.5% f32 / +1.9% int8, measured). Finite-only; exclusion beats bias.
 - **Cross-device bit-exactness (v2.2).** An opt-in int8 query mode returning bit-identical
   scores and hit order on any machine at any SIMD width — the contract lockstep/rollback
-  multiplayer and networked motion matching require. It runs as a CI test against committed
-  fixtures, and measures *faster* than the default int8 scan.
+  multiplayer and networked motion matching require. The core library's CI asserts a pinned
+  hash over committed fixtures on every push; the plugin's own automation suite verifies the
+  UE-compiled core reproduces it, checked locally before each release. Measures *faster*
+  than the default int8 scan.
 - **Recall you can audit (v2.3).** An opt-in float-retention posture on scratch banks —
   never the default, and the memory cost is stated plainly — plus `MeasureRecall`, which
   reports the bank's own cross-device recall with a seed, a generation stamp and a stale

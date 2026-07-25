@@ -203,7 +203,10 @@ An opt-in query mode promising **bit-identical scores and hit order across
 different machines** — x86 and ARM, Windows/Linux/macOS, any SIMD width — the
 property lockstep and rollback multiplayer, networked motion matching, and
 server-side validation actually require. The contract is not aspirational
-prose: it runs as a CI test, a pinned cross-device hash asserted on every push.
+prose: the core library's CI asserts a pinned cross-device hash on every push;
+the plugin's own automation suite verifies the UE-compiled core reproduces
+that pin, checked locally before each release (this plugin's CI is
+manual-dispatch only against a self-hosted runner — see `plugin-build.yml`).
 
 ```cpp
 FSuperFAISSQueryArgs Args;
