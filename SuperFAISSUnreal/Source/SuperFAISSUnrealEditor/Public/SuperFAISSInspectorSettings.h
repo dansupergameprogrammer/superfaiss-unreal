@@ -23,8 +23,7 @@
 // CslsMarginThreshold (SF34-006, plugin 3.3.1): pinned to the build-time CALIBRATION this
 // class comment always said it needed (the Budget_MACs precedent: a measured constant a
 // build task hands to the code, never a value the code derives or a red test asserts a
-// specific number for) — no longer a placeholder. Population and basis, D-INSP-20
-// (`Claude/Curie/superfaiss-3.3.1-test-design-2026-07-22.md` section 1): the hand-authored
+// specific number for) — no longer a placeholder. Population and basis: the hand-authored
 // tutorial-bank correspondence set at MatchK=2 produces exactly two clusters — five clean
 // singleton pairs at margin 0.5, and one near-duplicate collision (the deliberate
 // ISO-B/ISO-B-dup fixture pair) at margin 0.25, correctly flagged lower-confidence by the
@@ -81,13 +80,30 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Correspondence")
 	int32 MatchK = 10;
 
+	// Plan §10.3: the compiled default, independent of any local ini override -- exists
+	// so a test can assert THIS constant directly and catch a regression regardless of
+	// what a developer's local EditorPerProjectUserSettings.ini currently holds (the
+	// CDO's CslsMarginThreshold is config-loaded and coincides with this value only on a
+	// clean checkout). Read by `SuperFAISS.D.CslsMarginThresholdLiteralPin` and by the
+	// second-slot correspondence parity cell, in addition to its own field initializer
+	// below. The calibration interval this value must stay inside is pinned at compile
+	// time, not in this comment -- see the static_assert immediately below.
+	static constexpr float kDefaultCslsMarginThreshold = 0.375f;
+	static_assert(kDefaultCslsMarginThreshold > 0.25f && kDefaultCslsMarginThreshold <= 0.5f,
+		"kDefaultCslsMarginThreshold must stay inside the tutorial-bank calibration "
+		"interval (0.25, 0.5] documented above; a value outside it invalidates the "
+		"SF34-006 calibration basis.");
+
 	// View C (Correspondence): the CSLS-margin classification threshold (matched vs.
 	// ambiguous, section 25.4). SF34-006 pin, 2026-07-22: 0.375, calibrated against the
 	// tutorial-bank correspondence population (D-INSP-20) — see the class comment above for
 	// the full basis. Valid anywhere in (0.25, 0.5] for that population; 0.375 is the
-	// cluster midpoint.
+	// cluster midpoint. This calibration ran at MatchK=2 (the tutorial Secondary bank has
+	// only 6 rows), not the shipped default MatchK=10 above — the margin distribution is a
+	// function of MatchK, so 0.375 is systematically more permissive at MatchK=10 than at
+	// the population it was calibrated against.
 	UPROPERTY(config, EditAnywhere, Category = "Correspondence")
-	float CslsMarginThreshold = 0.375f;
+	float CslsMarginThreshold = kDefaultCslsMarginThreshold;
 
 	// The hard cap on SampleLimit (section 25.3: "the hard cap (8192) remains reachable as
 	// a deliberate deeper look"). Not user-editable; the ceiling GetClampedSampleLimit

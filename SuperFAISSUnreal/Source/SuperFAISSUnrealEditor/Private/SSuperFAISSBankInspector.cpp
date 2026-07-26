@@ -3,6 +3,7 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 // SF34-002: the "Open Archive..." affordance's native file-picker.
 #include "DesktopPlatformModule.h"
+#include "HAL/PlatformProcess.h"
 #include "Interfaces/IMainFrameModule.h"
 #include "IDesktopPlatform.h"
 #include "Misc/FileHelper.h"
@@ -16,6 +17,7 @@
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SComboBox.h"
 #include "Widgets/Input/SEditableTextBox.h"
+#include "Widgets/Input/SHyperlink.h"
 #include "Widgets/Input/SSlider.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SBox.h"
@@ -784,6 +786,14 @@ void SSuperFAISSBankInspector::Construct(const FArguments& InArgs)
 					+ SHorizontalBox::Slot().AutoWidth().Padding(6, 0, 0, 0)
 					[
 						SNew(SButton)
+						// T-06/T-815: the HEAVY-pass cost disclosure, shown BEFORE the pass
+						// runs -- the changelog's own claim. Empty (no tooltip) until both
+						// slots resolve a source, matching GetPendingCorrespondenceDisclosure()'s
+						// own empty-when-not-ready contract.
+						.ToolTipText_Lambda([this]()
+						{
+							return FText::FromString(GetPendingCorrespondenceDisclosure());
+						})
 						.OnClicked_Lambda([this]()
 						{
 							ComputeCorrespondence();
@@ -815,6 +825,22 @@ void SSuperFAISSBankInspector::Construct(const FArguments& InArgs)
 				[
 					SNew(STextBlock).Font(Body).AutoWrapText(true)
 					.Text_Lambda([this]() { return FText::FromString(CorrespondenceStatus); })
+				]
+				// T-10 (SF34-007), plan §10.2: the doc-URL half of SF34-007's acceptance --
+				// the tooltip clause (CslsMarginThreshold's tooltip) landed already; this is
+				// the link to the prose that explains the calibration in full.
+				+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 6)
+				[
+					SNew(SHyperlink)
+					.Text(FText::FromString(TEXT("Documentation")))
+					.ToolTipText(FText::FromString(TEXT(
+						"Open the Bank Inspector documentation section covering structure, "
+						"novelty, and correspondence, including the correspondence margin "
+						"threshold's calibration.")))
+					.OnNavigate_Lambda([]()
+					{
+						FPlatformProcess::LaunchURL(SSuperFAISSBankInspector::CorrespondenceDocumentationUrl, nullptr, nullptr);
+					})
 				]
 				+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 6)
 				[
@@ -933,9 +959,9 @@ USuperFAISSVectorBank* SSuperFAISSBankInspector::GetSelectedSecondBank() const
 void SSuperFAISSBankInspector::OnSecondBankSelected()
 {
 	// Slot 4b mutual exclusion (FSuperFAISSInspectionSource's class comment): picking an
-	// asset from the second-bank combo supersedes any open second archive.
-	SecondArchiveBank.Reset();
-	SecondArchiveDisplayName.Reset();
+	// asset from the second-bank combo supersedes any open second archive -- the second
+	// slot's own copy of the same FSuperFAISSArchiveSlotState::Reset().
+	SecondArchive.Reset();
 	InvalidateAnalysisCaches();
 }
 
@@ -994,11 +1020,11 @@ bool SSuperFAISSBankInspector::CheckSecondBankCompatible(const FSuperFAISSInspec
 FSuperFAISSInspectionSource SSuperFAISSBankInspector::GetPrimarySource() const
 {
 	FSuperFAISSInspectionSource Source;
-	if (PrimaryArchiveBank.IsValid())
+	if (PrimaryArchive.Bank.IsValid())
 	{
 		Source.Kind = FSuperFAISSInspectionSource::EKind::Archive;
-		Source.ArchiveBank = PrimaryArchiveBank;
-		Source.ArchiveDisplayName = PrimaryArchiveDisplayName;
+		Source.ArchiveBank = PrimaryArchive.Bank;
+		Source.ArchiveDisplayName = PrimaryArchive.DisplayName;
 		return Source;
 	}
 	if (USuperFAISSVectorBank* Bank = GetSelectedBank())
@@ -1012,11 +1038,11 @@ FSuperFAISSInspectionSource SSuperFAISSBankInspector::GetPrimarySource() const
 FSuperFAISSInspectionSource SSuperFAISSBankInspector::GetSecondSource() const
 {
 	FSuperFAISSInspectionSource Source;
-	if (SecondArchiveBank.IsValid())
+	if (SecondArchive.Bank.IsValid())
 	{
 		Source.Kind = FSuperFAISSInspectionSource::EKind::Archive;
-		Source.ArchiveBank = SecondArchiveBank;
-		Source.ArchiveDisplayName = SecondArchiveDisplayName;
+		Source.ArchiveBank = SecondArchive.Bank;
+		Source.ArchiveDisplayName = SecondArchive.DisplayName;
 		return Source;
 	}
 	if (USuperFAISSVectorBank* Bank = GetSelectedSecondBank())
@@ -1035,47 +1061,6 @@ FSuperFAISSInspectionSource SSuperFAISSBankInspector::GetSecondSource() const
 // CheckSecondBankCompatible/RefreshSecondBankList. The crux work this leaves
 // deliberately unbuilt lives downstream, in BuildAnalysisSample(Source, ...).
 // ---------------------------------------------------------------------------
-
-bool SSuperFAISSBankInspector::OpenScratchArchiveFromBytes(const TArray<uint8>& Bytes, const FString& DisplayName)
-{
-	USuperFAISSScratchBank* Loaded = NewObject<USuperFAISSScratchBank>();
-	if (!Loaded->LoadFromBytes(Bytes))
-	{
-		// Core Load's own reject-over-degrade contract, surfaced (the dim-2 idiom): every
-		// existing source (an asset, or a previously-open archive) is left EXACTLY as it
-		// was -- nothing below this line runs on the failure path.
-		ArchiveOpenStatus = TEXT("archive: bad format (corrupt, truncated, wrong version, or not an archive)");
-		return false;
-	}
-	PrimaryArchiveBank = TStrongObjectPtr<USuperFAISSScratchBank>(Loaded);
-	PrimaryArchiveDisplayName = DisplayName;
-	// Mutual exclusion (FSuperFAISSInspectionSource's class comment): an opened archive
-	// supersedes the asset-registry combo selection.
-	SelectedBankName.Reset();
-	ArchiveOpenStatus.Reset();
-	// The NEW archive-swap leg of the reset matrix (audit F3): opening an archive is a
-	// selection-change event exactly like OnBankSelected()'s own trigger, so it fires the
-	// SAME one-rule cache clear -- archive #1's exclusion/tombstone state and live-row
-	// sample never survive into archive #2's passes.
-	InvalidateAnalysisCaches();
-	return true;
-}
-
-bool SSuperFAISSBankInspector::OpenSecondScratchArchiveFromBytes(const TArray<uint8>& Bytes, const FString& DisplayName)
-{
-	USuperFAISSScratchBank* Loaded = NewObject<USuperFAISSScratchBank>();
-	if (!Loaded->LoadFromBytes(Bytes))
-	{
-		SecondArchiveOpenStatus = TEXT("archive: bad format (corrupt, truncated, wrong version, or not an archive)");
-		return false;
-	}
-	SecondArchiveBank = TStrongObjectPtr<USuperFAISSScratchBank>(Loaded);
-	SecondArchiveDisplayName = DisplayName;
-	SelectedSecondBankName.Reset();
-	SecondArchiveOpenStatus.Reset();
-	InvalidateAnalysisCaches();
-	return true;
-}
 
 namespace
 {
@@ -1101,6 +1086,169 @@ namespace
 			return FString::Printf(TEXT("archive: rejected (status %d)"), static_cast<int32>(Status));
 		}
 	}
+
+	// T-11 (SF34-007, gap-closure round 2): the geometry-line formatter, shared by every
+	// entry point that opens an archive from raw bytes. Previously this string was built
+	// ONLY inside PeekAndOpenArchive (the file-dialog flow), so the direct byte API --
+	// OpenScratchArchiveFromBytes/OpenSecondScratchArchiveFromBytes, the only entry point any
+	// automation test can drive, since no automation test can operate a modal file dialog --
+	// left ArchivePeekGeometry/SecondArchivePeekGeometry permanently empty. Extracting the
+	// format string here lets both entry points produce the identical disclosure.
+	//
+	// Fix (2026-07-25, ArchivePeekGeometryDisclosure): USuperFAISSScratchBank::SaveToBytes
+	// always appends a host-side channel-name frame AFTER the core archive (the core format
+	// cannot carry the host FName vocabulary) -- so Info.archiveBytes < TotalBytes is the
+	// NORMAL case for EVERY bank SaveToBytes produces (WriteChannelFrame writes its count
+	// unconditionally, channel-less banks included), not evidence of
+	// trailing data. The rule this function now applies: trailing data is what remains
+	// after the core archive AND after a well-formed channel frame that agrees with the
+	// header's own channel count. USuperFAISSScratchBank::MeasureChannelFrameBytes parses
+	// the frame starting right after the core archive with the same tolerant reader
+	// LoadFromBytes itself uses AND requires the parsed name count to equal
+	// Info.channelCount, the same agreement LoadFromBytes itself requires before adopting a
+	// frame (without that check, an archive with no host frame -- a
+	// legacy blob, or trailing bytes that merely happen to parse -- is silently credited as
+	// a frame and its bytes hidden from the disclosure). A frame that does not parse, or
+	// whose count disagrees, consumes 0 bytes here, so it is not folded into "trailing
+	// data" either -- it is simply not recognized as a frame, and the byte count after the
+	// archive is reported as-is. Data must span at least Info.archiveBytes bytes (true for
+	// anything PeekScratchArchive accepted).
+	FString FormatArchivePeekGeometry(const superfaiss::ScratchArchiveInfo& Info, const uint8* Data, int64 TotalBytes)
+	{
+		const int64 FrameBytes = (Info.archiveBytes >= 0 && Info.archiveBytes <= TotalBytes)
+			? USuperFAISSScratchBank::MeasureChannelFrameBytes(Data + Info.archiveBytes, TotalBytes - Info.archiveBytes, Info.channelCount)
+			: 0;
+		const int64 AccountedBytes = Info.archiveBytes + FrameBytes;
+		const bool bHasTrailingData = AccountedBytes < TotalBytes;
+		return FString::Printf(
+			TEXT("%d x %d, metric %s, quant %s, %d channel(s), %lld bytes%s"),
+			Info.count, Info.dims,
+			*StaticEnum<ESuperFAISSBankMetric>()->GetNameStringByValue(static_cast<int64>(Info.metric)),
+			*StaticEnum<ESuperFAISSBankQuantization>()->GetNameStringByValue(static_cast<int64>(Info.quant)),
+			Info.channelCount, Info.archiveBytes,
+			bHasTrailingData
+				? *FString::Printf(TEXT(" (+%lld trailing bytes ignored)"), TotalBytes - AccountedBytes)
+				: TEXT(""));
+	}
+}
+
+bool SSuperFAISSBankInspector::OpenScratchArchiveFromBytes(const TArray<uint8>& Bytes, const FString& DisplayName)
+{
+	// T-1100 (an outside code review's finding 1): captured BEFORE this call's own commit
+	// below overwrites PrimaryArchive.Bank, so it answers "was the source that populated the
+	// CURRENT channel combo itself a primary archive?" -- the one case section 25.3's
+	// asset-driven design does not cover (see the guard below).
+	const bool bPreviousPrimaryWasArchive = PrimaryArchive.Bank.IsValid();
+	// Captured before ResyncChannelSlidersToPrimarySource() below overwrites
+	// ChannelSliderNames -- this is the projection-SCOPE guard's own precondition
+	// ("nothing has populated the combo yet"), snapshotted here because the channel-
+	// slider resync below is now unconditional and would otherwise erase the signal.
+	const bool bComboWasEmptyBeforeOpen = ChannelSliderNames.Num() == 0;
+	USuperFAISSScratchBank* Loaded = NewObject<USuperFAISSScratchBank>();
+	if (!Loaded->LoadFromBytes(Bytes))
+	{
+		// Core Load's own reject-over-degrade contract, surfaced (the dim-2 idiom): every
+		// existing source (an asset, or a previously-open archive) is left EXACTLY as it
+		// was -- nothing below this line runs on the failure path.
+		PrimaryArchive.OpenStatus = TEXT("archive: bad format (corrupt, truncated, wrong version, or not an archive)");
+		return false;
+	}
+	PrimaryArchive.Bank = TStrongObjectPtr<USuperFAISSScratchBank>(Loaded);
+	PrimaryArchive.DisplayName = DisplayName;
+	// Mutual exclusion (FSuperFAISSInspectionSource's class comment): an opened archive
+	// supersedes the asset-registry combo selection.
+	SelectedBankName.Reset();
+	PrimaryArchive.OpenStatus.Reset();
+	// The NEW archive-swap leg of the reset matrix (audit F3): opening an archive is a
+	// selection-change event exactly like OnBankSelected()'s own trigger, so it fires the
+	// SAME one-rule cache clear -- archive #1's exclusion/tombstone state and live-row
+	// sample never survive into archive #2's passes.
+	InvalidateAnalysisCaches();
+	// P1 fix: the projection RESULT is unconditionally stale after any source swap (it
+	// describes rows sampled from whatever bank was primary before), so it is dropped the
+	// same way OnBankSelected() drops it. Previously this entry point reset only the
+	// display name, open status, peek geometry, and analysis caches, leaving a prior
+	// source's projection points on screen against the new archive.
+	ProjectedPoints.Reset();
+	ProjectionStatus.Reset();
+	// The channel-WEIGHT sliders resync to the primary source unconditionally, on every
+	// primary-source change (D-INSP-27; a confirmation review's finding 2, T-1121):
+	// ChannelSliderNames[C] == GetPrimarySource().GetChannelName(C) must hold at query time
+	// for every sequence of source changes, because RunQuery's Args.Channels.Add binds each
+	// slider's weight to Source.GetChannelName(C) purely by array position C -- it never resolves a
+	// channel weight by name. A guarded resync here (skipping when an asset populated the
+	// combo) left the asset's stale channel names on screen while RunQuery weighted the
+	// archive's own, different channels by position: a well-formed query under a false label.
+	// D-INSP-27 additionally rules that no weight survives a source change by name either --
+	// every slider resets to its 1.0 default, asset or archive, every time.
+	ResyncChannelSlidersToPrimarySource();
+
+	// The projection-SCOPE combo -- a SEPARATE piece of state from the channel-weight
+	// sliders above -- resyncs only when the combo was empty, or when the source that
+	// populated it was ITSELF a primary archive. The rule this implements: an asset
+	// selection is asset-driven by design (section 25.3's design note, pinned by
+	// SuperFAISS.D.InspectorArchiveChannelScopeSupported and
+	// SuperFAISS.D.ClaimsVsCodeCapabilityMatrix) -- the FIRST primary-archive open after an
+	// asset selection must NOT overwrite the asset's selected scope, even though the archive
+	// becomes the primary source analysis actually runs against (the projection SCOPE, and
+	// only the scope, resolves against it by NAME via GetChannelIndex -- GetChannelIndex's
+	// three call sites all resolve SelectedProjectionScope; RunQuery never calls it, which is
+	// why the weight sliders above cannot lean on the same by-name resolution). A SECOND (or
+	// later) primary-archive open -- superseding a combo that a PRIOR archive, not an asset,
+	// populated -- is not covered by that design at all, so it resyncs the scope too.
+	if (bComboWasEmptyBeforeOpen || bPreviousPrimaryWasArchive)
+	{
+		ResetProjectionScope();
+	}
+	// T-11 (SF34-007): populate the geometry disclosure directly from the bytes just
+	// committed, so this entry point discloses the same fields PeekAndOpenArchive's
+	// file-dialog flow does, independent of which path the caller used to get here.
+	{
+		using namespace superfaiss;
+		ScratchArchiveInfo Info;
+		if (PeekScratchArchive(Bytes.GetData(), Bytes.Num(), &Info) == Status::Ok)
+		{
+			PrimaryArchive.PeekGeometry = FormatArchivePeekGeometry(Info, Bytes.GetData(), static_cast<int64>(Bytes.Num()));
+		}
+		else
+		{
+			// The prior value belongs to whatever bytes were peeked last, not to the bank
+			// this call just committed -- retaining it would show geometry for a source
+			// no longer live.
+			PrimaryArchive.PeekGeometry.Reset();
+		}
+	}
+	return true;
+}
+
+bool SSuperFAISSBankInspector::OpenSecondScratchArchiveFromBytes(const TArray<uint8>& Bytes, const FString& DisplayName)
+{
+	USuperFAISSScratchBank* Loaded = NewObject<USuperFAISSScratchBank>();
+	if (!Loaded->LoadFromBytes(Bytes))
+	{
+		SecondArchive.OpenStatus = TEXT("archive: bad format (corrupt, truncated, wrong version, or not an archive)");
+		return false;
+	}
+	SecondArchive.Bank = TStrongObjectPtr<USuperFAISSScratchBank>(Loaded);
+	SecondArchive.DisplayName = DisplayName;
+	SelectedSecondBankName.Reset();
+	SecondArchive.OpenStatus.Reset();
+	InvalidateAnalysisCaches();
+	// T-11 (SF34-007): the second slot's own copy of the same disclosure, independently.
+	{
+		using namespace superfaiss;
+		ScratchArchiveInfo Info;
+		if (PeekScratchArchive(Bytes.GetData(), Bytes.Num(), &Info) == Status::Ok)
+		{
+			SecondArchive.PeekGeometry = FormatArchivePeekGeometry(Info, Bytes.GetData(), static_cast<int64>(Bytes.Num()));
+		}
+		else
+		{
+			// Mirrors the primary slot's own reset above.
+			SecondArchive.PeekGeometry.Reset();
+		}
+	}
+	return true;
 }
 
 bool SSuperFAISSBankInspector::PeekAndOpenArchive(
@@ -1108,8 +1256,8 @@ bool SSuperFAISSBankInspector::PeekAndOpenArchive(
 {
 	using namespace superfaiss;
 
-	FString& OpenStatus = bSecondSlot ? SecondArchiveOpenStatus : ArchiveOpenStatus;
-	FString& PeekGeometry = bSecondSlot ? SecondArchivePeekGeometry : ArchivePeekGeometry;
+	FString& OpenStatus = bSecondSlot ? SecondArchive.OpenStatus : PrimaryArchive.OpenStatus;
+	FString& PeekGeometry = bSecondSlot ? SecondArchive.PeekGeometry : PrimaryArchive.PeekGeometry;
 
 	// The peek: read-only, no state mutation on either branch below -- SF34-002's own
 	// acceptance ("geometry is shown before commit; a failed open preserves the current
@@ -1122,21 +1270,15 @@ bool SSuperFAISSBankInspector::PeekAndOpenArchive(
 		return false;
 	}
 
-	// T-11: the geometry line, including the trailing-data disclosure (archiveBytes
-	// strictly less than the buffer's own length means real, disclosed trailing bytes
-	// exist past the archive the header declares -- PeekScratchArchiveGuardVitality's own
-	// oracle for this exact field, proven at the core boundary).
-	const bool bHasTrailingData = Info.archiveBytes < static_cast<int64>(Bytes.Num());
-	PeekGeometry = FString::Printf(
-		TEXT("%d x %d, metric %s, quant %s, %d channel(s), %lld bytes%s"),
-		Info.count, Info.dims,
-		*StaticEnum<ESuperFAISSBankMetric>()->GetNameStringByValue(static_cast<int64>(Info.metric)),
-		*StaticEnum<ESuperFAISSBankQuantization>()->GetNameStringByValue(static_cast<int64>(Info.quant)),
-		Info.channelCount, Info.archiveBytes,
-		bHasTrailingData
-			? *FString::Printf(TEXT(" (+%lld trailing bytes ignored)"),
-				static_cast<int64>(Bytes.Num()) - Info.archiveBytes)
-			: TEXT(""));
+	// T-11: the geometry line, including the trailing-data disclosure. Real trailing data
+	// is whatever remains after the core archive (archiveBytes -- PeekScratchArchiveGuard-
+	// Vitality's own oracle for that field, proven at the core boundary) AND after a
+	// well-formed appended channel-name frame (SaveToBytes always appends one; see
+	// FormatArchivePeekGeometry's own comment). The commit call below recomputes and
+	// reassigns the identical string via FormatArchivePeekGeometry once it succeeds;
+	// setting it here first is what makes the geometry genuinely available before the
+	// commit runs, per SF34-002's own ordering claim.
+	PeekGeometry = FormatArchivePeekGeometry(Info, Bytes.GetData(), static_cast<int64>(Bytes.Num()));
 
 	// The commit: the existing, already-proven Open(Second)ScratchArchiveFromBytes -- its
 	// own full Load validation is NOT bypassed by the peek succeeding (matching.h-style
@@ -1161,29 +1303,74 @@ void SSuperFAISSBankInspector::OnBankSelected()
 {
 	// Slot 4b mutual exclusion (FSuperFAISSInspectionSource's class comment): picking an
 	// asset from the primary combo supersedes any open primary archive.
-	PrimaryArchiveBank.Reset();
-	PrimaryArchiveDisplayName.Reset();
+	// FSuperFAISSArchiveSlotState::Reset() clears the bank, the display name, the peek
+	// geometry, AND the open status together -- a rejected-open error line no longer
+	// survives being superseded by a fresh asset selection, and no field added to the
+	// slot state later can be left out of this reset by omission.
+	PrimaryArchive.Reset();
 	ProjectedPoints.Reset();
 	ProjectionStatus.Reset();
 	// Section 25.3 "Cache lifetime is per-widget-session, invalidated on selection
 	// change": Structure/Novelty follow the same reset the projection already gets.
 	InvalidateAnalysisCaches();
 
-	// Channel state follows the selection: one unit-weight slider per channel;
-	// projection scopes are the whole row plus each named channel.
-	ChannelWeights.Reset();
-	ChannelSliderNames.Reset();
+	// Channel state follows the selection -- P1 fix: RepopulateChannelState() resets
+	// both halves unconditionally. OpenScratchArchiveFromBytes() reaches the same two
+	// underlying resets on the archive-open path, but calls them separately with its
+	// own conditional guard on the projection-scope half -- see RepopulateChannelState()'s
+	// own header comment.
+	RepopulateChannelState();
+}
+
+void SSuperFAISSBankInspector::RepopulateChannelState()
+{
+	// Full reset, called unconditionally by OnBankSelected(): both pieces of
+	// source-dependent combo state reset together. OpenScratchArchiveFromBytes() calls the
+	// two halves separately instead, because its projection-scope reset is conditional and
+	// its channel-slider reset is not -- see each function's own header comment.
+	ResetProjectionScope();
+	ResyncChannelSlidersToPrimarySource();
+}
+
+void SSuperFAISSBankInspector::ResetProjectionScope()
+{
+	// Projection scopes are the whole row plus each named channel of the primary source.
+	// Reads the primary source through GetPrimarySource() (asset OR archive) so an opened
+	// archive's channels populate exactly like an asset's -- GetSelectedBank() alone would
+	// silently resolve to nothing for an archive source.
 	ProjectionScopes.Reset();
 	ProjectionScopes.Add(MakeShared<FString>(TEXT("(whole row)")));
 	SelectedProjectionScope = ProjectionScopes[0];
-	if (const USuperFAISSVectorBank* Bank = GetSelectedBank())
+	const FSuperFAISSInspectionSource Source = GetPrimarySource();
+	const int32 ChannelCount = Source.GetChannelCount();
+	for (int32 C = 0; C < ChannelCount; ++C)
 	{
-		for (const FName& Channel : Bank->ChannelNames)
-		{
-			ChannelSliderNames.Add(MakeShared<FString>(Channel.ToString()));
-			ChannelWeights.Add(1.0f);
-			ProjectionScopes.Add(MakeShared<FString>(Channel.ToString()));
-		}
+		ProjectionScopes.Add(MakeShared<FString>(Source.GetChannelName(C).ToString()));
+	}
+}
+
+void SSuperFAISSBankInspector::ResyncChannelSlidersToPrimarySource()
+{
+	// D-INSP-27: every channel-weight slider resets to its 1.0 default on every
+	// primary-source change, asset or archive alike -- no by-name carryover. A prior
+	// carryover here (T-1100) silently persisted a user's slider position across an
+	// asset/archive swap that shares a channel name, contradicting V32-G2
+	// (`SuperFAISS_V2_Plan.md:2163`) and the shipped `SuperFAISSInspectorSettings.h`
+	// Project Settings tooltip, both of which already stated reset-on-select.
+	//
+	// This also keeps ChannelSliderNames in lockstep with the primary source's own
+	// channel table on every source change: RunQuery's
+	// Args.Channels.Add({Source.GetChannelName(C), ChannelWeights[C]}) binds it purely by array
+	// position C, so the invariant a slider's rendered label must satisfy is
+	// ChannelSliderNames[C] == GetPrimarySource().GetChannelName(C), unconditionally.
+	ChannelWeights.Reset();
+	ChannelSliderNames.Reset();
+	const FSuperFAISSInspectionSource Source = GetPrimarySource();
+	const int32 ChannelCount = Source.GetChannelCount();
+	for (int32 C = 0; C < ChannelCount; ++C)
+	{
+		ChannelSliderNames.Add(MakeShared<FString>(Source.GetChannelName(C).ToString()));
+		ChannelWeights.Add(1.0f);
 	}
 	RebuildChannelSliders();
 }
@@ -1340,7 +1527,7 @@ FReply SSuperFAISSBankInspector::OnOpenArchiveClicked(bool bSecondSlot)
 	TArray<uint8> Bytes;
 	if (!FFileHelper::LoadFileToArray(Bytes, *OutFiles[0]))
 	{
-		(bSecondSlot ? SecondArchiveOpenStatus : ArchiveOpenStatus) = TEXT("archive: failed to read file");
+		(bSecondSlot ? SecondArchive.OpenStatus : PrimaryArchive.OpenStatus) = TEXT("archive: failed to read file");
 		return FReply::Handled();
 	}
 
@@ -2817,6 +3004,27 @@ void SSuperFAISSBankInspector::ProbeNovelty(const FString& Text)
 // itself define the B-side term).
 // ---------------------------------------------------------------------------
 
+// T-06/T-815: the pre-run cost disclosure. Read-only -- calls neither mutates state nor
+// triggers a compute, and it is meaningful to call before ComputeCorrespondence() has ever
+// run (that is the entire point: the changelog's claim is a BEFORE-it-runs disclosure, not
+// a post-run status suffix). Empty when either slot has no resolved source; otherwise names
+// the HEAVY pass and both sides' live counts, unconditional on dims/metric compatibility --
+// compatibility is checked only when the pass actually runs, this disclosure is about cost.
+FString SSuperFAISSBankInspector::GetPendingCorrespondenceDisclosure() const
+{
+	const FSuperFAISSInspectionSource PrimarySource = GetPrimarySource();
+	const FSuperFAISSInspectionSource SecondSource = GetSecondSource();
+	if (PrimarySource.Kind == FSuperFAISSInspectionSource::EKind::None
+		|| SecondSource.Kind == FSuperFAISSInspectionSource::EKind::None)
+	{
+		return FString();
+	}
+
+	return FString::Printf(
+		TEXT("HEAVY pass -- cost scales with both banks' sizes (%d live x %d live)"),
+		PrimarySource.GetLiveCount(), SecondSource.GetLiveCount());
+}
+
 void SSuperFAISSBankInspector::ComputeCorrespondence()
 {
 	using namespace superfaiss;
@@ -3017,6 +3225,11 @@ void SSuperFAISSBankInspector::ComputeCorrespondence()
 	const int32 MatchableA = PrimarySource.GetCount() - CountExcludedBits(ExcludeBitsFullA);
 	const int32 UnmatchedB = MatchableB - MatchedBIndices.Num();
 	const bool bMixedQuantization = PrimarySource.GetQuantization() != SecondSource.GetQuantization();
+	// This status line is a POST-run result and is pinned exactly by
+	// InspectorCorrespondenceLiveCountDenominators and
+	// InspectorCorrespondenceZeroEnergyDenominators. T-06's HEAVY-pass disclosure does not
+	// belong here: the [3.2.0] claim is "disclosed... before it runs", so it lands on the
+	// pre-run cost surface. See T-815.
 	CorrespondenceStatus = FString::Printf(
 		TEXT("%d of %d A-rows checked, %d unmatched (A), %d unmatched (B)%s"),
 		RawPairCount, MatchableA, UnmatchedA, UnmatchedB,
@@ -3049,6 +3262,14 @@ const TCHAR* SSuperFAISSBankInspector::DotUnavailableStatus()
 	// Section 25.5 View B, verbatim.
 	return TEXT("novelty verdict unavailable on Dot banks (dot product is not a dissimilarity)");
 }
+
+// T-10 (SF34-007), plan §10.2. Anchor verified against the published branch: the heading
+// "Bank Inspector -- structure, novelty, and correspondence (v3.2)" lives in
+// SuperFAISSUnreal/README.md on the publish repo's main branch, and GitHub's own
+// heading-to-slug rule (lowercase; strip characters outside [a-z0-9 -]; spaces to hyphens)
+// produces this exact fragment. Owner note: see the header declaration's comment.
+const TCHAR* const SSuperFAISSBankInspector::CorrespondenceDocumentationUrl =
+	TEXT("https://github.com/dansupergameprogrammer/superfaiss-unreal/blob/main/SuperFAISSUnreal/README.md#bank-inspector--structure-novelty-and-correspondence-v32");
 
 FString SSuperFAISSBankInspector::BuildNoveltyVerdictText() const
 {
@@ -3139,6 +3360,21 @@ void SSuperFAISSBankInspector::SetAnalysisScopeForTest(const FString& ScopeName)
 			InvalidateAnalysisCaches();
 			return;
 		}
+	}
+}
+
+void SSuperFAISSBankInspector::SetChannelWeightForTest(int32 ChannelIndex, float Weight)
+{
+	// Mirrors RebuildChannelSliders()'s OnValueChanged_Lambda exactly (the slider's own
+	// write site, SSuperFAISSBankInspector.cpp): the same IsValidIndex bounds guard, the same
+	// direct assignment into ChannelWeights -- RunQuery reads ChannelWeights[C] with no
+	// knowledge of which writer set it. This is true of the index guard and the assignment
+	// only: the SSlider itself clamps to [0, 2] (.MinValue(0.0f).MaxValue(2.0f)), and this seam
+	// does not, so a test that drives a Weight outside that range reaches a ChannelWeights
+	// value no user's slider drag can produce.
+	if (ChannelWeights.IsValidIndex(ChannelIndex))
+	{
+		ChannelWeights[ChannelIndex] = Weight;
 	}
 }
 #endif // WITH_DEV_AUTOMATION_TESTS

@@ -203,7 +203,10 @@ An opt-in query mode promising **bit-identical scores and hit order across
 different machines** — x86 and ARM, Windows/Linux/macOS, any SIMD width — the
 property lockstep and rollback multiplayer, networked motion matching, and
 server-side validation actually require. The contract is not aspirational
-prose: it runs as a CI test, a pinned cross-device hash asserted on every push.
+prose: the core library's CI asserts a pinned cross-device hash on every push;
+the plugin's own automation suite verifies the UE-compiled core reproduces
+that pin, checked locally before each release (this plugin's CI is
+manual-dispatch only against a self-hosted runner — see `plugin-build.yml`).
 
 ```cpp
 FSuperFAISSQueryArgs Args;
@@ -344,6 +347,18 @@ component/match ids may differ across machines, no cross-device claim).
   margin and a matched/ambiguous state. This is the disclosed HEAVY pass in the set
   — cost scales with both banks' sizes, not sub-second at scale — the panel discloses
   this before you run it.
+- **The CSLS margin threshold's calibration** (the classification split between
+  matched and ambiguous) defaults to `0.375`, calibrated against the hand-authored
+  tutorial-bank correspondence population: five clean singleton pairs at margin 0.5
+  and one deliberate near-duplicate collision (the ISO-B/ISO-B-dup fixture pair) at
+  margin 0.25, at `MatchK=2` — the tutorial fixture's Secondary bank has only 6 rows,
+  so `MatchK` cannot exceed 6 there. Any threshold strictly inside `(0.25, 0.5]`
+  separates that population correctly; `0.375` is the cluster midpoint. This is a
+  tutorial-population calibration, not a re-derivation at the shipped production
+  `MatchK` (10) — the margin distribution is a function of `MatchK`, so `0.375` is
+  systematically more permissive at `MatchK=10` than at the population it was
+  calibrated against. Revisit when a correspondence population large enough to
+  calibrate at `MatchK=10` exists.
 - **Open scratch archive…**, beside the normal asset picker on both the primary and
   second-bank slots, loads a saved `USuperFAISSScratchBank` archive file directly (the
   same format `SaveToBytes`/`LoadFromBytes` round-trip) as a transient inspection
@@ -355,8 +370,9 @@ component/match ids may differ across machines, no cross-device claim).
 - **Analysis parameters** (the sample cap, structure's k and minimum cluster size,
   novelty's k and lambda, correspondence's match-k and CSLS threshold) live in one
   per-user, per-project editor settings object and persist across sessions; query
-  state (which bank is selected, probe text) stays session-scoped and resets on
-  bank change, same as the rest of the Inspector.
+  state (which bank is selected, probe text, channel weights) stays session-scoped
+  and resets on any primary-source change — an asset selection or an archive open —
+  same as the rest of the Inspector.
 
 ### Profiling (v3.2)
 
@@ -410,9 +426,11 @@ The stripped plugin compiles and the non-demo test groups pass unchanged.
 
 ## Tests
 
-`SuperFAISS.*` automation tests (113 in this plugin — every registered
+`SuperFAISS.*` automation tests (131 in this plugin — every registered
 `IMPLEMENT_*_AUTOMATION_TEST`, run `Session > Automation` in the editor to see the
-current count; 117 with the MCP plugin enabled)
+current count; 135 with the MCP plugin enabled — `SuperFAISS.D.ReadmeTestCountAssertion`
+checks both of these numbers against the registered-test count at runtime and fails the
+build if they drift)
 cover kernel correctness, SIMD/scalar mirror equality, determinism, tie-break
 stability, concurrency, asset round-trips, import rejection, quantizer recall,
 performance guards, query composition (centroid, direction, intersection, margins),

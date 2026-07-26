@@ -8,15 +8,17 @@
 // channel's own sub-range, computed from the raw pre-append floats and grounded in
 // the definition of cosine similarity — not a recode of the scratch/core scoring path.
 //
-// Red today, for two independent reasons the kickoff names:
-//   (1) USuperFAISSScratchBank::InitWithChannels is a stub that always returns false
-//       (SuperFAISSScratchBank.cpp) — every test below that depends on a channel-
-//       carrying bank existing fails at that first TestTrue.
-//   (2) USuperFAISSSubsystem::QueryScratch hard-rejects any query with
-//       Args.Channels.Num() > 0 (SuperFAISSSubsystem.cpp:521-523), independently of
-//       whether the bank has a channel table — so even a hypothetically-successful
-//       InitWithChannels could not be queried by name today.
-// Green work (T-099 slot 5) is expected to make both reasons go away together.
+// Was red at authoring time, for two independent reasons the kickoff named, both now
+// closed by T-099 slot 5's build:
+//   (1) USuperFAISSScratchBank::InitWithChannels is a real implementation (validates the
+//       Names/Offsets/Lengths tables, rejects a length mismatch or a duplicate name
+//       before allocating, then builds the core-facing channel table) — every test below
+//       that depends on a channel-carrying bank existing now passes its first TestTrue.
+//   (2) USuperFAISSSubsystem::QueryScratch resolves a named-channel query against the
+//       bank's own channel table (the former blanket rejection is gone); the query
+//       telemetry this file's kickoff cited a line range for lives in
+//       GetLastQueryBytesStreamed, not in any channel check.
+// All seven SuperFAISS.A.ScratchChannel* cells below are green.
 
 #include "Misc/AutomationTest.h"
 
@@ -78,9 +80,8 @@ namespace
 // query aligned with row 0's "identity" subvector must score exactly 1.0 (true
 // per-channel cosine) against row 0 and ~0 against the rest, regardless of the other,
 // unqueried "appearance" channel's content (segmented query reads only the requested
-// range). Also covers GetChannelCount/GetChannelIndex (implemented against the new
-// members, but only actually populated once InitWithChannels stores them — so these
-// assertions are red today too, on an empty ChannelNames array).
+// range). Also covers GetChannelCount/GetChannelIndex, populated by InitWithChannels
+// storing the table below — both are exercised against a non-empty ChannelNames array.
 // -----------------------------------------------------------------------------------
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FSuperFAISSScratchChannelInitQueryTest,

@@ -24,13 +24,18 @@ tag is cut) where the other sources are still checked but an absent tag is not
 itself a failure. A tag that DOES exist and disagrees with the plugin line is
 always a failure.
 
+Multiple distinct version-shaped tags on HEAD are always a failure, in both
+modes: an absent tag and a contradictory pair are different things, and
+--allow-untagged forgives only the former. Picking one of several tags by an
+accident of `git tag --points-at` ordering is not a check.
+
 Usage:
     check_version_identity.py --plugin-root <path> [--allow-untagged]
 
 Exit codes: 0 = each line is internally consistent and plugin >= core;
-1 = an internal disagreement, plugin behind core, OR fewer than four of the
-non-tag sources were readable (a check that can pass without reading its
-sources is not a check).
+1 = an internal disagreement, plugin behind core, multiple distinct version
+tags on HEAD, OR fewer than four of the non-tag sources were readable (a
+check that can pass without reading its sources is not a check).
 """
 from __future__ import annotations
 
@@ -73,21 +78,31 @@ def read_uplugin_version(path: Path) -> str | None:
     return data.get("VersionName")
 
 
-def read_head_tag(repo_root: Path) -> str | None:
+def read_head_tag(repo_root: Path) -> tuple[str | None, list[str]]:
+    """Returns (the single agreed tag or None, every distinct version-shaped tag found).
+
+    `git tag --points-at HEAD` can return more than one tag (a re-tag, a mistaken tag, a
+    moved tag). Returning only the first match would silently pick one by an accident of
+    the command's own ordering; the second element lets the caller detect a conflict
+    (more than one distinct version-shaped tag) and fail on it explicitly instead.
+    """
     try:
         out = subprocess.run(
             ["git", "-C", str(repo_root), "tag", "--points-at", "HEAD"],
             capture_output=True, text=True, check=True,
         ).stdout.strip()
     except subprocess.CalledProcessError:
-        return None
+        return None, []
     if not out:
-        return None
-    for line in out.splitlines():
-        line = line.strip()
-        if re.match(r"^v?\d+\.\d+\.\d+$", line):
-            return line.lstrip("v")
-    return None
+        return None, []
+    distinct = sorted({
+        line.strip().lstrip("v")
+        for line in out.splitlines()
+        if re.match(r"^v?\d+\.\d+\.\d+$", line.strip())
+    })
+    if not distinct:
+        return None, []
+    return distinct[0], distinct
 
 
 def parse_version(v: str) -> tuple[int, ...]:
@@ -132,8 +147,15 @@ def main() -> int:
             print(f"  - unreadable: {name}")
         return 1
 
-    # The git tag, when present, joins the plugin line.
-    tag = read_head_tag(args.plugin_root)
+    # The git tag, when present, joins the plugin line. Multiple distinct version-shaped
+    # tags on HEAD are always a failure -- in both modes, since --allow-untagged forgives
+    # an ABSENT tag, not a CONTRADICTORY pair, and those are different things.
+    tag, all_tags = read_head_tag(args.plugin_root)
+    if len(all_tags) > 1:
+        print("FAIL: version-identity check found multiple distinct version-shaped git "
+              f"tags on HEAD: {', '.join(all_tags)}. HEAD must carry at most one version "
+              "tag; picking one by tag-list ordering is not a check.")
+        return 1
     if tag is not None:
         plugin_sources["git tag on HEAD"] = tag
     elif not args.allow_untagged:

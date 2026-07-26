@@ -84,16 +84,13 @@ namespace
 // The one 3.2-new M5 cell (section 25.9): each of the three named Inspector passes,
 // run trace-OFF and trace-ON on the same inputs, produces bit-identical output state.
 // Two distinct claims, matching SuperFAISS.B.InstrumentationNonPerturbation's shape:
-//   1. The channel exists and toggles — RED-UNIMPLEMENTED today (the SuperFAISS trace
-//      channel is not registered until the runtime-module half of this slot lands;
-//      UE::Trace::ToggleChannel returns false for an unknown channel name).
+//   1. The channel exists and toggles — green: the SuperFAISS trace channel is defined
+//      by the runtime module (UE_TRACE_CHANNEL_DEFINE in SuperFAISSSubsystem.cpp) and
+//      is a process-wide registry, so UE::Trace::ToggleChannel finds it here too.
 //   2. Trace-OFF and trace-ON produce identical Structure/Novelty/Correspondence
-//      state — GREEN AT AUTHORING TIME as a direct consequence of claim 1's scaffold
-//      state (an unregistered channel's toggle is a no-op, so "trace-ON" runs
-//      identically to "trace-OFF" today; there is nothing yet that could perturb a
-//      pass). Standing regression guard: once the three named scopes are wired in
-//      (riding the already-instrumented runtime query path underneath), this
-//      assertion becomes the load-bearing B8-extension proof for the editor module.
+//      state — also green, and now load-bearing rather than a scaffold-state vacuity:
+//      the three named passes are wired to the already-instrumented runtime query path,
+//      so this is a real non-perturbation proof for the editor module.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FSuperFAISSInspectorInstrumentationNonPerturbationTest,
 	"SuperFAISS.D.InspectorInstrumentationNonPerturbation",
@@ -101,7 +98,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FSuperFAISSInspectorInstrumentationNonPerturbationTest::RunTest(const FString& Parameters)
 {
-	// Claim 1: the channel exists and toggles ON. Red today; shared with the runtime
+	// Claim 1: the channel exists and toggles ON. Green; shared with the runtime
 	// module's cell, checked again here because THIS module must also see it exist
 	// (it is a process-wide registry, but the claim belongs to whichever module
 	// exercises the passes it gates).

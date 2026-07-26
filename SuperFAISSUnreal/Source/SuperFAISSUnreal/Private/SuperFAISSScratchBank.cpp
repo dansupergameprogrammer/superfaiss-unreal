@@ -27,18 +27,35 @@ namespace
 		}
 	};
 
+	// Raw pointer + length rather than a TArray reference: MeasureChannelFrameBytes (below)
+	// parses a frame view starting mid-buffer (right after the core archive's own bytes),
+	// which a TArray-backed reader cannot express without a copy. LoadFromBytes, the only
+	// other caller, is unaffected -- it already has GetData()/Num() at the call site.
 	struct FByteReader
 	{
-		const TArray<uint8>* Bytes = nullptr;
+		const uint8* Data = nullptr;
+		int64 Len = 0;
 		int64 Pos = 0;
-		static bool Read(void* User, void* Data, size_t N)
+		static bool Read(void* User, void* OutData, size_t N)
 		{
 			auto* Self = static_cast<FByteReader*>(User);
-			if (Self->Pos + static_cast<int64>(N) > Self->Bytes->Num())
+			// P2 fix: a null Data pointer, or a non-positive/negative Len, describes no
+			// readable span at all. Without this guard, Data == nullptr with Len >= N
+			// (e.g. a caller-constructed FByteReader over an invalid span) passes the
+			// bounds check below unchanged and Memcpy reads from a null pointer --
+			// reachable from MeasureChannelFrameBytes, which is public API on
+			// USuperFAISSScratchBank. Checked ahead of the bounds arithmetic so a
+			// negative Pos (never produced internally, but not otherwise ruled out for a
+			// hand-built reader) cannot underflow it either.
+			if (Self->Data == nullptr || Self->Len <= 0 || Self->Pos < 0)
 			{
 				return false;
 			}
-			FMemory::Memcpy(Data, Self->Bytes->GetData() + Self->Pos, N);
+			if (Self->Pos + static_cast<int64>(N) > Self->Len)
+			{
+				return false;
+			}
+			FMemory::Memcpy(OutData, Self->Data + Self->Pos, N);
 			Self->Pos += static_cast<int64>(N);
 			return true;
 		}
@@ -536,7 +553,8 @@ bool USuperFAISSScratchBank::LoadFromBytes(const TArray<uint8>& Bytes)
 	// current state on a bad blob.
 	const bool bLoaded = DrainAndRun([this, &Bytes]() {
 		FByteReader Reader;
-		Reader.Bytes = &Bytes;
+		Reader.Data = Bytes.GetData();
+		Reader.Len = Bytes.Num();
 		superfaiss::ScratchArchive Archive;
 		Archive.read = &FByteReader::Read;
 		Archive.user = &Reader;
@@ -580,4 +598,40 @@ bool USuperFAISSScratchBank::LoadFromBytes(const TArray<uint8>& Bytes)
 		LastRecallReport = FSuperFAISSScratchRecallReport{};
 	}
 	return bLoaded;
+}
+
+int64 USuperFAISSScratchBank::MeasureChannelFrameBytes(const uint8* Data, int64 Len, int32 ExpectedChannelCount)
+{
+	// P2 fix: the documented contract ("0 if... Data/Len describe no frame at all") is
+	// enforced explicitly at this public entry point, not left to fall out of
+	// FByteReader::Read's own guard alone -- a null/non-positive span is rejected before
+	// a reader is even constructed over it.
+	if (Data == nullptr || Len <= 0)
+	{
+		return 0;
+	}
+	// Same tolerant parse LoadFromBytes uses on its own trailer (ReadChannelFrame degrades
+	// to "no frame" on any short or malformed read rather than guessing a length): a frame
+	// that does not parse contributes zero bytes here, so it is NOT silently folded into
+	// "genuine trailing data" either -- the caller decides what an unparseable remainder
+	// means (see the archive-peek disclosure this seam exists for).
+	FByteReader Reader;
+	Reader.Data = Data;
+	Reader.Len = Len;
+	TArray<FName> Names;
+	TArray<int32> Offsets;
+	TArray<int32> Lengths;
+	if (!ReadChannelFrame(Reader, Names, Offsets, Lengths))
+	{
+		return 0;
+	}
+	// The count-agreement check LoadFromBytes applies to this same parse: a frame is
+	// credited only when its declared name count matches the header the core already
+	// published. Without this, four zero bytes -- the most ordinary padding there is --
+	// parse as a well-formed zero-channel frame and are silently absorbed.
+	if (Names.Num() != ExpectedChannelCount)
+	{
+		return 0;
+	}
+	return Reader.Pos;
 }

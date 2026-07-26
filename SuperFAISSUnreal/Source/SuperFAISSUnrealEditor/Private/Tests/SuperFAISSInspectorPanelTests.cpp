@@ -1302,11 +1302,11 @@ bool FSuperFAISSInspectorNoveltyResetOnScopeMetricChangeTest::RunTest(const FStr
 
 // Re-gate F7: the evidence query is recomputed per probe, never cached — probing row A,
 // then row B, then row A again must produce the SAME evidence for row A both times, not
-// a stale copy contaminated by row B's intervening probe. GREEN AT AUTHORING TIME — the
-// scaffold's ProbeNovelty poison never populates NoveltyEvidenceLines at all (see the
-// self-exclusion cell's own note), so "nothing cached" is vacuously true of a stub that
-// caches nothing. Kept as a standing regression guard against a FUTURE caching bug,
-// exactly like the concurrency grep-target cell below.
+// a stale copy contaminated by row B's intervening probe. ProbeNovelty() is fully
+// implemented and populates NoveltyEvidenceLines on every call, with no cache between
+// calls, so this cell exercises the real recomputation path, not a vacuous scaffold.
+// Kept as a standing regression guard against a FUTURE caching bug, exactly like the
+// concurrency grep-target cell below.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FSuperFAISSInspectorNoveltyEvidenceRecomputedTest,
 	"SuperFAISS.D.InspectorNoveltyEvidenceRecomputed",
@@ -1537,8 +1537,9 @@ bool FSuperFAISSInspectorCorrespondenceMixedQuantizationDisclosureTest::RunTest(
 // no-persistent-cache posture -- noted, not celled, exactly Novelty-baseline's F1
 // precedent shape in reverse). Primary re-select and scope change are GREEN AT
 // AUTHORING TIME (InvalidateAnalysisCaches() already really resets MatchPairResults,
-// extending its already-shipped slot-3 body). The second-bank-change leg is
-// red-unimplemented: OnSecondBankSelected() is a no-op stub this round.
+// extending its already-shipped slot-3 body). The second-bank-change leg is also green:
+// OnSecondBankSelected() resets SecondArchive and calls InvalidateAnalysisCaches(), the
+// same reset the other three legs exercise.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FSuperFAISSInspectorCorrespondenceInvalidationMatrixTest,
 	"SuperFAISS.D.InspectorCorrespondenceInvalidationMatrix",
@@ -2107,9 +2108,9 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FSuperFAISSInspectorArchiveChannelScopeSupportedTest::RunTest(const FString& Parameters)
 {
-	// A channel-carrying ASSET (to populate the shared scope combo -- the scope selector
-	// is asset-driven regardless of which source is primary, section 25.3's design note)
-	// alongside the archive under test.
+	// A channel-carrying ASSET (to populate the shared scope combo -- the combo is populated
+	// by whichever source first offers channels, section 25.3's design note; here the asset
+	// selection runs first) alongside the archive under test.
 	const TArray<FName> ChannelNames = {TEXT("chanA"), TEXT("chanB")};
 	const TArray<int32> ChannelOffsets = {0, 8};
 	const TArray<int32> ChannelLengths = {8, 8};
@@ -2189,9 +2190,10 @@ bool FSuperFAISSInspectorArchiveChannelScopeSupportedTest::RunTest(const FString
 // archive (live 0) routes to the dim-2 rejection; a one-live-row archive (published >
 // 1, only one row survives) admits exactly one sample; a published count at cap with
 // live count far below it exercises the live-stride arithmetic (the sample must be
-// drawn from the LIVE rows only, not the published range). All three legs are
-// red-unimplemented: BuildAnalysisSample(Source, ...)'s scaffold has no live-count
-// awareness at all (it strides over the PUBLISHED range unconditionally).
+// drawn from the LIVE rows only, not the published range). All three legs are green:
+// BuildAnalysisSample(Source, ...) builds a live-only, ascending index list before
+// striding whenever bSkipTombstonedRows is set (the default), and refuses outright
+// when every published row is tombstoned (the live-0 class).
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FSuperFAISSInspectorArchiveLiveCountClassesTest,
 	"SuperFAISS.D.InspectorArchiveLiveCountClasses",
