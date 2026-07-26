@@ -245,6 +245,22 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Similarity|Scratch")
 	bool LoadFromBytes(const TArray<uint8>& Bytes);
 
+	// The host-side channel-name frame's own length, in bytes, starting at Data (T-11
+	// gap-closure follow-up). Parses the frame with the exact same tolerant reader
+	// LoadFromBytes itself uses and returns the number of bytes it consumed if the frame
+	// is well-formed AND its parsed name count equals ExpectedChannelCount, 0 otherwise
+	// (truncated, corrupt, Data/Len describe no frame at all, or the count disagrees with
+	// the header the core already published) -- never a guess. The count-agreement check
+	// mirrors the only other caller of this parse, LoadFromBytes, which adopts a frame only
+	// when Names.Num() == Bank.GetChannelCount(); without it, any byte sequence that merely
+	// parses (four zero bytes is a zero-channel frame) is credited as a frame and hides
+	// genuine trailing data behind it. This is the seam
+	// that lets a caller outside this module (the editor's archive-peek disclosure,
+	// specifically) tell the appended channel frame SaveToBytes always writes apart from
+	// genuine trailing data past it, without duplicating the frame parse. Static and
+	// header-only-callable: it reads Data/Len, it does not touch any bank instance.
+	static int64 MeasureChannelFrameBytes(const uint8* Data, int64 Len, int32 ExpectedChannelCount);
+
 	// --- C++ query-pin seam (used by USuperFAISSSubsystem::QueryScratch) ---
 
 	// The N4 dispatch gate: fails while a drain-requiring operation is waiting,

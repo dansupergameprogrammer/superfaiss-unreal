@@ -1,6 +1,6 @@
 // S-INSP-3.3.1 Gate 1b: the red suite for SF34-002 (archive file-picker control flow) and
-// SF34-007 (claims-vs-code reconciliation), realizing the plan's Coverage Model
-// (Claude/Plans/SuperFAISSUnreal_3.3.1_Plan.md section 6) dims 2, 5, 7, 11c. These tickets are
+// SF34-007 (claims-vs-code reconciliation), realizing the plan's Coverage Model (plan
+// section 6) dims 2, 5, 7, 11c. These tickets are
 // NOT oracle-gated (section 3's oracle-gated set is {SF34-003,004,005,006}) -- their
 // acceptance is control-flow and guard-vitality, not a geometry-derived numeric answer, so no
 // tutorial-bank fixture is needed here.
@@ -206,7 +206,7 @@ bool FSuperFAISSPeekScratchArchiveGuardVitalityTest::RunTest(const FString& Para
 // T-07/T-10/T-11's three NEW DISPLAY SURFACES (the archive metadata header line, the complete
 // tooltip + doc URL) are NOT included below -- see the test-design artifact's routed
 // Coverage-Model gap: the plan states their INTENT but not the exact rendered string/format a
-// red assertion needs, and inventing one would couple the suite to Curie's own guess rather
+// red assertion needs, and inventing one would couple the suite to the test author's own guess rather
 // than the design's. T-11 (peek geometry + trailing-data status before load) is covered here
 // at the level currently assertable: the underlying PeekScratchArchive contract (proven above)
 // plus the archive open/reject/preserve contract (proven above) are the two facts the display
@@ -261,8 +261,9 @@ bool FSuperFAISSClaimsVsCodeCapabilityMatrixTest::RunTest(const FString& Paramet
 		const TArray<int32> ChannelLengths = {4, 4};
 
 		// A channel-carrying ASSET first: the projection-scope combo (ProjectionScopes /
-		// SetAnalysisScopeForTest's match set) is asset-driven regardless of which source
-		// ends up primary (section 25.3's design note) -- opening the archive alone, with
+		// SetAnalysisScopeForTest's match set) is populated by whichever source first offers
+		// channels, and stays put across the single archive open that follows (section 25.3's
+		// design note); here the asset selection runs first -- opening the archive alone, with
 		// no asset ever selected, leaves ProjectionScopes at only "(whole row)", so
 		// SetAnalysisScopeForTest("chanA") below would silently no-op and this cell would
 		// vacuously pass at whole-row scope without ever reaching the chanA path it claims

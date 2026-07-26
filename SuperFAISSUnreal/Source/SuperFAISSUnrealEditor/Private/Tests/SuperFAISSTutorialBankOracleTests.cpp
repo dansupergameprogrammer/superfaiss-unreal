@@ -1,7 +1,7 @@
 // S-INSP-3.3.1 (SuperFAISS For Unreal 3.3.1, the correctness release). Gate 1a/1b: the
 // independent oracle (hand-authored tutorial-bank geometry, Fixtures/TutorialBankGeometry.csv
 // + SuperFAISSTutorialBankFixture.h) and the red suite it gates, realizing the plan's
-// Coverage Model (Claude/Plans/SuperFAISSUnreal_3.3.1_Plan.md section 6) dims 4, 6, 8, 10, 11
+// Coverage Model (plan section 6) dims 4, 6, 8, 10, 11
 // for the oracle-gated ticket set {SF34-003, SF34-004, SF34-005, SF34-006}. Every expected
 // value below is derived from the sidecar's own geometry rule (cosine = ([ChanADir match] +
 // [ChanBDir match]) / 2), NOT from reading SSuperFAISSBankInspector.cpp -- the independent-
@@ -10,7 +10,7 @@
 // Novelty, sample-position-not-source-index archive labels, outright archive-channel-scope
 // rejection); SF34-006 is red because CslsMarginThreshold has no plan-pinned default.
 //
-// See Claude/Curie/superfaiss-3.3.1-test-design-2026-07-22.md for the full per-cell
+// See the test-design record for the full per-cell
 // derivation, the routed Coverage-Model gap (no test seam exists for the rendered
 // tree/tooltip label string a pruned archive's row draws — SSuperFAISSBankInspector.h's
 // RebuildStructureClusterList/GetScatterPointLabel are private with no public accessor), and
@@ -71,13 +71,13 @@ namespace
 }
 
 // ===========================================================================
-// SF34-005 (Coverage Model dim 4/8/11b) -- channel-scoped archive sampling. TODAY:
-// BuildAnalysisSample(Source, ...) rejects a non-"(whole row)" scope outright for an
-// Archive-kind source (SSuperFAISSBankInspector.cpp:1743, inside the source-kind overload
-// beginning at 1714) -- the acceptance criterion is that this becomes a SUPPORTED path with
-// asset/archive answer-equivalence, not merely "does not crash". This is also the guard-
-// vitality cell (dim 11b): the FORMER outright rejection must be genuinely replaced (the test
-// asserts the call SUCCEEDS today-red, not merely that some rejection string changed).
+// SF34-005 (Coverage Model dim 4/8/11b) -- channel-scoped archive sampling. CLOSED:
+// BuildAnalysisSample(Source, ...) (the FSuperFAISSInspectionSource-taking overload in
+// SSuperFAISSBankInspector.cpp) used to reject a non-"(whole row)" scope outright for an
+// Archive-kind source; it is now a SUPPORTED path with asset/archive answer-equivalence, not
+// merely "does not crash". This is also the guard-vitality cell (dim 11b): the FORMER outright
+// rejection is genuinely replaced (the test asserts the call SUCCEEDS, not merely that some
+// rejection string changed).
 //
 // Oracle: Primary row 11 (tag MIX-A, ChanADir=0, ChanBDir=1) chanA-scoped -- the sidecar's own
 // closed-form rule means the chanA-scoped, renormalized-to-unit-norm slice of ANY row is
@@ -168,11 +168,9 @@ bool FSuperFAISSTutorialArchiveChannelScopeParityTest::RunTest(const FString& Pa
 	};
 	CheckHits(AssetHits, AssetHitCount, AssetSourceIndices, ExpectedChanA0, TEXT("asset"));
 
-	// The archive side: SAME geometry, opened via the real production seam. RED TODAY:
-	// BuildAnalysisSample(Source, ...) rejects a channel scope outright for an Archive-kind
-	// source (the current SelectedProjectionScope test at line 1743) -- this call is expected
-	// to fail on shipped 3.3.0 and to succeed, with the SAME golden answer as the asset leg
-	// above, once SF34-005 lands.
+	// The archive side: SAME geometry, opened via the real production seam. SF34-005 is closed:
+	// BuildAnalysisSample(Source, ...) supports a channel scope for an Archive-kind source, and
+	// this call succeeds with the SAME golden answer as the asset leg above.
 	if (!OpenTutorialArchive(*this, Inspector.Get(), TEXT("Primary"), {}, /*bSecondSlot*/ false))
 	{
 		return true;
@@ -233,8 +231,9 @@ bool FSuperFAISSTutorialArchiveChannelScopePrunedParityTest::RunTest(const FStri
 	TSharedRef<SSuperFAISSBankInspector> Inspector = SNew(SSuperFAISSBankInspector);
 	// A channel-carrying ASSET first, exactly the sibling (unpruned) test's own setup: the
 	// projection-scope combo (ProjectionScopes/SetAnalysisScopeForTest's match set) is
-	// asset-driven regardless of which source ends up primary (section 25.3's design note)
-	// -- opening the archive alone, with no asset ever selected, leaves ProjectionScopes
+	// populated by whichever source first offers channels, and stays put across the single
+	// archive open that follows (section 25.3's design note); here the asset selection runs
+	// first -- opening the archive alone, with no asset ever selected, leaves ProjectionScopes
 	// empty, so SetAnalysisScopeForTest("chanA") below would silently no-op and the sample
 	// would build at whole-row (16-dim) scope instead of chanA (4-dim), which is exactly
 	// what a 4-float query buffer's own ValidateQuery finiteness scan over 16 dims reads as
@@ -307,15 +306,16 @@ bool FSuperFAISSTutorialArchiveChannelScopePrunedParityTest::RunTest(const FStri
 
 // ===========================================================================
 // SF34-004 (Coverage Model dim 4/10, the routed test-seam gap -- test-design section 5) --
-// archive row labels must show the original SOURCE index, never the SAMPLE position. TODAY:
-// RebuildStructureClusterList's MemberLabel lambda and GetScatterPointLabel both read
-// GetSelectedBank() (asset-only) rather than the source-generalized GetPrimarySource(); on an
-// Archive-kind source GetSelectedBank() is nullptr, so both fall through to formatting the raw
-// SAMPLE POSITION as "#<pos>" instead of resolving StructureSampleSourceIndices[pos] through
-// the source and printing "#<source row>". A tombstoned prefix makes the two numbers provably
-// different (the SEAM this test needs -- GetStructureMemberLabelForTest, added this round per
-// the test-design's routing to Brunel -- is a WITH_DEV_AUTOMATION_TESTS-gated pass-through to
-// the private ComputeStructureMemberLabel(), mirroring BuildAnalysisSampleForTest exactly).
+// archive row labels must show the original SOURCE index, never the SAMPLE position. CLOSED:
+// RebuildStructureClusterList's MemberLabel lambda and GetScatterPointLabel both now share
+// ComputeStructureMemberLabel, which is source-generalized (GetPrimarySource(), asset OR
+// archive). Before this fix, both read GetSelectedBank() (asset-only), which is nullptr for an
+// Archive-kind source, so both fell through to formatting the raw SAMPLE POSITION as "#<pos>"
+// instead of resolving StructureSampleSourceIndices[pos] through the source and printing
+// "#<source row>". A tombstoned prefix makes the two numbers provably different (the SEAM this
+// test needs -- GetStructureMemberLabelForTest -- is a WITH_DEV_AUTOMATION_TESTS-gated
+// pass-through to the private ComputeStructureMemberLabel(), mirroring BuildAnalysisSampleForTest
+// exactly).
 //
 // Oracle: Primary row 15 (an extra X-cluster duplicate) is tombstoned. Native source row 16 is
 // therefore the first live row AFTER the tombstoned one, so its SAMPLE position (one fewer than
@@ -362,10 +362,11 @@ bool FSuperFAISSTutorialArchiveMemberLabelSourceIndexTest::RunTest(const FString
 }
 
 // ===========================================================================
-// SF34-003 (Coverage Model dim 4/8/10) -- Novelty on either source. TODAY: ProbeNovelty()
-// reads GetSelectedBank() (SSuperFAISSBankInspector.cpp:2039), which is Asset-only -- an
-// opened archive with NO asset selected makes GetSelectedBank() return nullptr, so the probe
-// falls straight through to "no valid bank selected" regardless of the archive's content.
+// SF34-003 (Coverage Model dim 4/8/10) -- Novelty on either source. CLOSED: ProbeNovelty()
+// is source-generalized (GetPrimarySource(), asset OR archive) in SSuperFAISSBankInspector.cpp;
+// an opened archive with NO asset selected used to make the prior asset-only GetSelectedBank()
+// read return nullptr, falling straight through to "no valid bank selected" regardless of the
+// archive's content. This cell pins the fix.
 // Oracle: Primary row 0 (X1, an exact duplicate exists at rows 1,2,3,15) must classify
 // Duplicate; Primary row 10 (ISO-A, no exact duplicate anywhere in the bank) must NOT. Both
 // facts follow directly from the sidecar: Duplicate requires another row with the SAME
@@ -398,8 +399,8 @@ bool FSuperFAISSTutorialArchiveNoveltyParityTest::RunTest(const FString& Paramet
 		Inspector->GetNoveltyResult().Verdict == ESuperFAISSNoveltyVerdict::Duplicate);
 
 	// Archive leg: SAME geometry, opened via the real "Open scratch archive..." seam, no
-	// asset selected on this slot. RED TODAY: GetSelectedBank() is asset-only, so this probe
-	// currently reports "no valid bank selected" regardless of the archive's content.
+	// asset selected on this slot. Before SF34-003's fix, the prior asset-only GetSelectedBank()
+	// read made this probe report "no valid bank selected" regardless of the archive's content.
 	TSharedRef<SSuperFAISSBankInspector> ArchiveInspector = SNew(SSuperFAISSBankInspector);
 	if (!OpenTutorialArchive(*this, ArchiveInspector.Get(), TEXT("Primary"), {}, /*bSecondSlot*/ false))
 	{
@@ -437,7 +438,7 @@ bool FSuperFAISSTutorialArchiveNoveltyParityTest::RunTest(const FString& Paramet
 //
 // MatchK is now pinned to 2 -- the smallest value that breaks the degeneracy while keeping
 // every r_B/r_A term a mean of exactly two hand-countable similarities (full derivation table
-// in the design doc, Claude/Curie/superfaiss-3.3.1-test-design-2026-07-22.md section 1).
+// in the test-design record section 1).
 //
 // Population (six exact-copy singleton pairs at MatchK=2, all hand-derived from the sidecar's
 // closed-form cosine rule):
@@ -464,11 +465,11 @@ bool FSuperFAISSTutorialArchiveNoveltyParityTest::RunTest(const FString& Paramet
 //
 // THE CALIBRATION CLAIM (SF34-006's written basis, D-INSP-20): any threshold strictly inside
 // (0.25, 0.5] separates the two clusters this population produces -- Matched for the five
-// clean pairs, Ambiguous for the near-duplicate pair -- while the shipped 0.0f placeholder
-// puts BOTH clusters above threshold (0.25 >= 0.0), erasing the exact distinction the margin
-// exists to draw. The design doc names 0.375 (the cluster midpoint) as the recommended pin;
-// Brunel's exact choice is the build-time calibration task USuperFAISSInspectorSettings.h's
-// own deferral comment names, constrained to this interval by this test.
+// clean pairs, Ambiguous for the near-duplicate pair -- whereas a 0.0f threshold would put
+// BOTH clusters above it (0.25 >= 0.0), erasing the exact distinction the margin exists to
+// draw. That 0.0f placeholder is HISTORY: the shipped default is 0.375, the cluster midpoint,
+// pinned as kDefaultCslsMarginThreshold in SuperFAISSInspectorSettings.h and held inside this
+// interval by that header's own static_assert and by CslsMarginThresholdLiteralPin.
 // ===========================================================================
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -552,11 +553,12 @@ bool FSuperFAISSTutorialCorrespondenceCalibrationTest::RunTest(const FString& Pa
 		}
 	}
 
-	// THE CALIBRATION ASSERTION -- RED UNTIL A REAL DEFAULT IS PINNED. Restore the shipped,
-	// UNMODIFIED CslsMarginThreshold (do not override it here) and require the two-cluster
-	// classification the margin exists to draw: the clean singleton pairs confidently Matched,
-	// the near-duplicate pair flagged Ambiguous. This is the written basis (the fixture's own
-	// margin distribution, derived above) for whatever finite default Brunel pins -- not an
+	// THE CALIBRATION ASSERTION -- PINNED to the shipped, calibrated default. Restore the
+	// shipped, UNMODIFIED CslsMarginThreshold (do not override it here) and require the
+	// two-cluster classification the margin exists to draw: the clean singleton pairs
+	// confidently Matched, the near-duplicate pair flagged Ambiguous. This is the written
+	// basis (the fixture's own margin distribution, derived above) that the builder's pinned
+	// default (0.375, `SuperFAISSInspectorSettings.h`) was calibrated against -- not an
 	// assertion this test invents.
 	Guard.Settings->CslsMarginThreshold = Guard.OrigThreshold;
 	Inspector->ComputeCorrespondence();
@@ -566,10 +568,10 @@ bool FSuperFAISSTutorialCorrespondenceCalibrationTest::RunTest(const FString& Pa
 			"(row11<->Sec1, margin ~0.5) classifies Matched"),
 			Pair11 != nullptr && Pair11->State == ESuperFAISSMatchState::Matched);
 		const FSuperFAISSMatchPairResult* Pair13 = FindPair(13);
-		TestTrue(TEXT("SF34-006 CALIBRATION (red until a real default is pinned in (0.25, 0.5]): at "
+		TestTrue(TEXT("SF34-006 CALIBRATION (the shipped default, 0.375, sits in (0.25, 0.5]): at "
 			"the shipped default threshold, the near-duplicate pair (row13<->Sec3, margin ~0.25) "
-			"classifies Ambiguous -- fails under the 0.0f placeholder, which puts BOTH clusters "
-			"above threshold and erases the distinction the margin exists to draw"),
+			"classifies Ambiguous -- this would fail under a 0.0f placeholder, which would put "
+			"BOTH clusters above threshold and erase the distinction the margin exists to draw"),
 			Pair13 != nullptr && Pair13->State == ESuperFAISSMatchState::Ambiguous);
 	}
 
@@ -609,7 +611,7 @@ bool FSuperFAISSTutorialCorrespondenceCalibrationTest::RunTest(const FString& Pa
 }
 
 // ===========================================================================
-// Poirot review 3a8c857fd4, finding 2 (Minor, coverage): the plan's dim-4/8 matrix names a
+// Code review 3a8c857fd4, finding 2 (Minor, coverage): the plan's dim-4/8 matrix names a
 // `correspondence x archive x channel-scoped x pruned` cell that no test exercised --
 // TutorialCorrespondenceCalibrationTest above drives only two ASSET banks through
 // ComputeCorrespondence, so the archive branch's cross-call `excludeBits` alignment (the
@@ -708,14 +710,14 @@ bool FSuperFAISSTutorialArchiveCorrespondenceParityTest::RunTest(const FString& 
 	TestTrue(TEXT("dim 4/8 coverage cell: archive leg classifies Matched, matching the asset oracle"),
 		ArchivePair->State == ESuperFAISSMatchState::Matched);
 
-	// THE PARITY ASSERTION (Poirot review finding 2): the archive leg's own margin equals
+	// THE PARITY ASSERTION (the code review's finding 2): the archive leg's own margin equals
 	// the asset leg's, within the same float-noise tolerance the calibration test above
 	// uses -- pruning row 15 (untouched by this pair, on either the forward or the
 	// back-verification pass) leaves the answer identical, proving the archive
 	// BuildAnalysisSample/excludeBits path the review flagged as untested produces the
 	// SAME correspondence answer as the already-proven asset path for an equivalent live
 	// row.
-	TestTrue(TEXT("SF34-005/Poirot-F2: asset<->archive CSLS margin parity for an equivalent live row"),
+	TestTrue(TEXT("SF34-005/review-F2: asset<->archive CSLS margin parity for an equivalent live row"),
 		FMath::Abs(ArchivePair->CslsMargin - AssetPair->CslsMargin) < 1e-4f);
 
 	return true;

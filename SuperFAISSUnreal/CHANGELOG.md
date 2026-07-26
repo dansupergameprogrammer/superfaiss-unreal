@@ -7,7 +7,7 @@ release vendors.
 
 The format follows [Keep a Changelog](https://keepachangelog.com).
 
-## [3.3.1] — 2026-07-22
+## [3.3.1] — 2026-07-26
 
 Correctness release. The Bank Inspector now delivers the archive-inspection workflow the
 3.2/3.3 UI described but did not fully reach — no new search or analysis primitive; every
@@ -32,6 +32,14 @@ The vendored core is unchanged from 3.3.0 (same `VENDORED_VERSION.txt`).
   from the UI. It runs with the rest of the `SuperFAISS.*` suite, checked locally before a
   release is tagged; it is not a CI gate, and it does not parse README, changelog, or tooltip
   prose.
+- **A "Documentation" link on the Correspondence panel**, opening the Bank Inspector README
+  section that documents the correspondence margin threshold's calibration basis — the
+  doc-URL half of SF34-007's tooltip + doc URL acceptance criterion.
+- **`USuperFAISSScratchBank::MeasureChannelFrameBytes(Data, Len, ExpectedChannelCount)`**
+  (public C++ API) — measures the host-side channel-name frame `SaveToBytes` appends after
+  the core archive, crediting a frame only when its parsed channel count agrees with the
+  archive header, the same agreement `LoadFromBytes` requires. Backs the Bank Inspector's
+  trailing-data disclosure.
 
 ### Changed
 - **The correspondence classification threshold now ships a calibrated default** (`0.375`,

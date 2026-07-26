@@ -12,7 +12,8 @@
 // prior forward-declare-only posture to a real include.
 #include "SuperFAISSVectorBank.h"
 // A real include, not a forward-declare: TStrongObjectPtr<USuperFAISSScratchBank> is a
-// widget-class member (PrimaryArchiveBank/SecondArchiveBank below), and its implicit
+// widget-class member (FSuperFAISSArchiveSlotState::Bank, held by PrimaryArchive/
+// SecondArchive below), and its implicit
 // special members (constructed/destroyed wherever a TSharedRef<SSuperFAISSBankInspector>
 // is, including every automation test's SNew(...) call) need the complete type in EVERY
 // translation unit that includes this header, not only this widget's own .cpp.
@@ -202,6 +203,41 @@ struct FSuperFAISSInspectionSource
 	TArray<uint32> GetTombstoneWords() const;
 };
 
+// A single archive slot's state -- the primary and second-bank slots each hold one of
+// these instead of four separately-declared, separately-reset members. Reset() is the
+// slot's whole reset contract: every field a slot needs to describe an opened archive
+// (or the absence of one) lives here, so a field added later is reset by construction
+// rather than by remembering to add it to both OnBankSelected() and
+// OnSecondBankSelected(). (The open-status line was previously left out of that
+// hand-maintained reset list on both handlers -- this struct removes the list.)
+struct FSuperFAISSArchiveSlotState
+{
+	// The slot's open archive, if any -- mutually exclusive with the corresponding
+	// asset-registry combo selection (Reset() below is called on either side of that
+	// exclusion). An OWNED reference (see FSuperFAISSInspectionSource's own class
+	// comment for why this is a TStrongObjectPtr, not a TWeakObjectPtr).
+	TStrongObjectPtr<USuperFAISSScratchBank> Bank;
+	// The archive's display name (its opened filename) -- an archive carries no UObject
+	// asset name to fall back on.
+	FString DisplayName;
+	// T-11 (SF34-007): the geometry PeekScratchArchive reported for the most recently
+	// opened archive on this slot -- "geometry is shown before commit" (SF34-002's own
+	// acceptance criterion).
+	FString PeekGeometry;
+	// The "Open scratch archive..." affordance's own status line (distinct from
+	// StructureStatus/NoveltyStatus/CorrespondenceStatus -- this reports the OPEN action
+	// itself, section 25.9's archive rejection matrix).
+	FString OpenStatus;
+
+	void Reset()
+	{
+		Bank.Reset();
+		DisplayName.Reset();
+		PeekGeometry.Reset();
+		OpenStatus.Reset();
+	}
+};
+
 // Determinism tier: PER-DEVICE for every V3.2 analysis pass (Structure, Novelty,
 // Correspondence) -- fixed sample, fixed order, pinned tie-breaks, inherited directly
 // from graph.h/novelty.h/matching.h's own tier (superfaiss.h). Layouts, cluster ids,
@@ -303,12 +339,13 @@ public:
 	// exercised in slot A and in slot B separately" is explicitly in scope for 4b, not a
 	// per-pane follow-on the way the live channel-weighted query pane is).
 	bool OpenSecondScratchArchiveFromBytes(const TArray<uint8>& Bytes, const FString& DisplayName);
-	const FString& GetArchiveOpenStatus() const { return ArchiveOpenStatus; }
-	const FString& GetSecondArchiveOpenStatus() const { return SecondArchiveOpenStatus; }
+	const FString& GetArchiveOpenStatus() const { return PrimaryArchive.OpenStatus; }
+	const FString& GetSecondArchiveOpenStatus() const { return SecondArchive.OpenStatus; }
 	// T-11 (SF34-007): the peeked geometry line for the slot's current archive (empty if
-	// the slot has never had a successful peek). See ArchivePeekGeometry's own comment.
-	const FString& GetArchivePeekGeometry() const { return ArchivePeekGeometry; }
-	const FString& GetSecondArchivePeekGeometry() const { return SecondArchivePeekGeometry; }
+	// the slot has never had a successful peek). See FSuperFAISSArchiveSlotState's own
+	// comment.
+	const FString& GetArchivePeekGeometry() const { return PrimaryArchive.PeekGeometry; }
+	const FString& GetSecondArchivePeekGeometry() const { return SecondArchive.PeekGeometry; }
 
 	// SF34-002: the peek-gated open/replace/close control flow the "Open Archive..."
 	// button drives -- issues the PeekScratchArchive call for the geometry + archiveBytes
@@ -359,11 +396,31 @@ public:
 	const TArray<FSuperFAISSMatchPairResult>& GetMatchPairResults() const { return MatchPairResults; }
 	const FString& GetCorrespondenceStatus() const { return CorrespondenceStatus; }
 
+	// T-06/T-815: the pre-run cost disclosure CHANGELOG.md's [3.2.0] entry claims
+	// ("Disclosed as the HEAVY pass in the set -- cost scales with both banks' sizes --
+	// before it runs"). Read-only, non-mutating, callable at any time -- in particular
+	// BEFORE ComputeCorrespondence() is ever invoked. Reports on whatever
+	// GetPrimarySource()/GetSecondSource() currently resolve to, independent of the
+	// second-bank compatibility check ComputeCorrespondence() performs -- this
+	// disclosure is about cost, not validity, and the changelog's own claim is
+	// unconditional. Empty when either slot has no resolved source; otherwise a
+	// non-empty string containing "HEAVY" and both sides' live counts.
+	FString GetPendingCorrespondenceDisclosure() const;
+
 	// The View A determinism-tier disclosure copy (section 25.5), exposed so the panel
 	// copy assertion (section 25.9 dim 7 doc cell) does not hand-duplicate the string.
 	static const TCHAR* StructureDisclosureCopy();
 	// The View B Dot-bank verdict-unavailable status text, verbatim (section 25.5).
 	static const TCHAR* DotUnavailableStatus();
+
+	// T-10 (SF34-007), plan §10.2: the Correspondence panel's "Documentation" hyperlink
+	// target -- the plugin's own public README at the anchor for the section that already
+	// documents CslsMarginThreshold's calibration in prose (README.md's "Bank Inspector --
+	// structure, novelty, and correspondence" section). Owner note: this URL's anchor is
+	// derived from that heading's text on the publish repo's main branch. Renaming the
+	// heading changes the anchor GitHub generates for it -- update this constant in the
+	// same commit that renames the heading, or the link silently stops resolving.
+	static const TCHAR* const CorrespondenceDocumentationUrl;
 
 #if WITH_DEV_AUTOMATION_TESTS
 	// Test seam: assigns a bank directly, bypassing the asset-registry enumeration
@@ -419,6 +476,20 @@ public:
 	{
 		return ComputeStructureMemberLabel(SampleIndex);
 	}
+
+	// Test seam (T-07/SF34-007): SourceHeaderLine is private (display-string plumbing, not
+	// part of the public analysis contract) -- this is the only way an automation test can
+	// pin the actual rendered archive metadata line.
+	FString GetSourceHeaderLineForTest() const { return SourceHeaderLine(); }
+
+	// Test seam: sets a channel's slider weight directly, the same shape
+	// SetAnalysisScopeForTest already gives the projection-scope combo -- the only way an
+	// automation test can drive ChannelWeights away from its 1.0f default, since the real
+	// writer (the Slate slider's OnValueChanged lambda) is private with no public accessor.
+	// No-op on an out-of-range index, mirroring the slider lambda's own IsValidIndex guard --
+	// but unlike the slider, this seam does not clamp Weight to [0, 2], so a caller can drive a
+	// value no user's slider drag can produce.
+	void SetChannelWeightForTest(int32 ChannelIndex, float Weight);
 #endif
 
 private:
@@ -645,23 +716,9 @@ private:
 
 	// Slot 4b: the primary slot's open archive, if any -- mutually exclusive with
 	// SelectedBankName above (OnBankSelected()/OpenScratchArchiveFromBytes() each clear
-	// the other). An OWNED reference (see FSuperFAISSInspectionSource's own class
-	// comment for why this is a TStrongObjectPtr, not a TWeakObjectPtr like BankAssets).
-	TStrongObjectPtr<USuperFAISSScratchBank> PrimaryArchiveBank;
-	FString PrimaryArchiveDisplayName;
-	// The "Open scratch archive..." affordance's own status line (distinct from
-	// StructureStatus/NoveltyStatus/CorrespondenceStatus -- this reports the OPEN action
-	// itself, section 25.9's archive rejection matrix), and its second-slot mirror.
-	FString ArchiveOpenStatus;
-	FString SecondArchiveOpenStatus;
-	// T-11 (SF34-007): the geometry PeekScratchArchive reported for the most recently
-	// opened archive on this slot -- "geometry is shown before commit" (SF34-002's own
-	// acceptance criterion). Set on a successful peek (whether or not the subsequent commit
-	// also succeeds); left untouched by a rejected peek (ArchiveOpenStatus alone carries
-	// that failure, so a stale geometry line from a PRIOR successful open is not overwritten
-	// by a later failed attempt -- it still describes the source actually in effect).
-	FString ArchivePeekGeometry;
-	FString SecondArchivePeekGeometry;
+	// the other). FSuperFAISSArchiveSlotState (above) holds the bank, display name, peek
+	// geometry, and open status together behind one Reset().
+	FSuperFAISSArchiveSlotState PrimaryArchive;
 
 	// View C (Correspondence) second-bank slot (section 25.3 E-D1-1): the SAME
 	// asset-registry-enumeration pattern as the primary picker, held separately —
@@ -670,9 +727,8 @@ private:
 	TArray<TWeakObjectPtr<USuperFAISSVectorBank>> SecondBankAssets;
 	TSharedPtr<FString> SelectedSecondBankName;
 	// Slot 4b, second-bank mirror (temper W1): the same archive/asset mutual exclusion as
-	// the primary slot.
-	TStrongObjectPtr<USuperFAISSScratchBank> SecondArchiveBank;
-	FString SecondArchiveDisplayName;
+	// the primary slot, and the same FSuperFAISSArchiveSlotState grouping.
+	FSuperFAISSArchiveSlotState SecondArchive;
 
 	TArray<TSharedPtr<FString>> ResultLines;
 	TSharedPtr<class SListView<TSharedPtr<FString>>> ResultList;
@@ -682,6 +738,39 @@ private:
 	TArray<float> ChannelWeights;
 	TSharedPtr<class SVerticalBox> ChannelSliderBox;
 	void RebuildChannelSliders();
+	// P1 fix: the channel-slider/projection-scope state above is source-dependent (it
+	// describes the PRIMARY source's channels), so every path that changes what the
+	// primary source IS -- an asset pick (OnBankSelected) or a primary archive open
+	// (OpenScratchArchiveFromBytes) -- must keep it current. Reads the current primary
+	// source through GetPrimarySource() (asset OR archive), not GetSelectedBank()
+	// (asset-only), so an archive source's channels populate correctly instead of
+	// leaving the previous source's sliders/scopes stale. Full reset: resets
+	// ChannelWeights/ChannelSliderNames (via ResyncChannelSlidersToPrimarySource()) AND
+	// ProjectionScopes/SelectedProjectionScope (via ResetProjectionScope()). Called
+	// unconditionally by OnBankSelected() -- an asset selection always resets both.
+	void RepopulateChannelState();
+
+	// D-INSP-27: the channel-weight sliders reset to their 1.0 default on EVERY primary-
+	// source change (asset or archive), unconditionally -- no by-name carryover. Also
+	// keeps ChannelSliderNames in lockstep with GetPrimarySource()'s own channel table on
+	// every source change, which RunQuery's positional binding requires:
+	// ChannelSliderNames[C] == GetPrimarySource().GetChannelName(C) for every C, for
+	// every sequence of source changes. Ends by calling RebuildChannelSliders(). Does NOT
+	// touch ProjectionScopes/SelectedProjectionScope -- that is a separate piece of state
+	// with its own (asset-driven, guarded) reset rule; see ResetProjectionScope().
+	void ResyncChannelSlidersToPrimarySource();
+
+	// The projection-scope combo's own reset: rebuilds ProjectionScopes to "(whole row)"
+	// plus one entry per the primary source's own channel name, and resets
+	// SelectedProjectionScope to "(whole row)". Deliberately a SEPARATE piece of state
+	// from the channel-weight sliders (see ResyncChannelSlidersToPrimarySource()): the
+	// asset-driven design (section 25.3, pinned by
+	// SuperFAISS.D.InspectorArchiveChannelScopeSupported and
+	// SuperFAISS.D.ClaimsVsCodeCapabilityMatrix) requires the FIRST primary-archive open
+	// after an asset selection to leave the selected scope undisturbed, so
+	// OpenScratchArchiveFromBytes() calls this only when its own guard says so -- never
+	// unconditionally the way ResyncChannelSlidersToPrimarySource() is.
+	void ResetProjectionScope();
 
 	// Projection state: sampled 2D coords, normalized into [0,1] for the paint pass.
 	TArray<FVector2f> ProjectedPoints;

@@ -370,8 +370,9 @@ component/match ids may differ across machines, no cross-device claim).
 - **Analysis parameters** (the sample cap, structure's k and minimum cluster size,
   novelty's k and lambda, correspondence's match-k and CSLS threshold) live in one
   per-user, per-project editor settings object and persist across sessions; query
-  state (which bank is selected, probe text) stays session-scoped and resets on
-  bank change, same as the rest of the Inspector.
+  state (which bank is selected, probe text, channel weights) stays session-scoped
+  and resets on any primary-source change — an asset selection or an archive open —
+  same as the rest of the Inspector.
 
 ### Profiling (v3.2)
 
@@ -425,9 +426,11 @@ The stripped plugin compiles and the non-demo test groups pass unchanged.
 
 ## Tests
 
-`SuperFAISS.*` automation tests (119 in this plugin — every registered
+`SuperFAISS.*` automation tests (131 in this plugin — every registered
 `IMPLEMENT_*_AUTOMATION_TEST`, run `Session > Automation` in the editor to see the
-current count; 123 with the MCP plugin enabled)
+current count; 135 with the MCP plugin enabled — `SuperFAISS.D.ReadmeTestCountAssertion`
+checks both of these numbers against the registered-test count at runtime and fails the
+build if they drift)
 cover kernel correctness, SIMD/scalar mirror equality, determinism, tie-break
 stability, concurrency, asset round-trips, import rejection, quantizer recall,
 performance guards, query composition (centroid, direction, intersection, margins),
