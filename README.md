@@ -36,7 +36,7 @@ Or headless, from the repo root:
 UnrealEditor-Cmd ExampleProject/ExampleProject.uproject -ExecCmds="Automation RunTests SuperFAISS; Quit" -unattended -nullrhi
 ```
 
-104 automation tests (108 with the MCP toolset plugin enabled): kernel correctness,
+122 automation tests (126 with the MCP toolset plugin enabled): kernel correctness,
 SIMD/scalar mirror equality, determinism, tie-break stability, concurrency, asset
 round-trips, import rejection, quantizer recall, performance guards, query composition
 (centroid, direction, intersection, margins), named-channel queries and decomposition,
