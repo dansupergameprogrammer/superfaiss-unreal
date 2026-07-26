@@ -347,6 +347,18 @@ component/match ids may differ across machines, no cross-device claim).
   margin and a matched/ambiguous state. This is the disclosed HEAVY pass in the set
   — cost scales with both banks' sizes, not sub-second at scale — the panel discloses
   this before you run it.
+- **The CSLS margin threshold's calibration** (the classification split between
+  matched and ambiguous) defaults to `0.375`, calibrated against the hand-authored
+  tutorial-bank correspondence population: five clean singleton pairs at margin 0.5
+  and one deliberate near-duplicate collision (the ISO-B/ISO-B-dup fixture pair) at
+  margin 0.25, at `MatchK=2` — the tutorial fixture's Secondary bank has only 6 rows,
+  so `MatchK` cannot exceed 6 there. Any threshold strictly inside `(0.25, 0.5]`
+  separates that population correctly; `0.375` is the cluster midpoint. This is a
+  tutorial-population calibration, not a re-derivation at the shipped production
+  `MatchK` (10) — the margin distribution is a function of `MatchK`, so `0.375` is
+  systematically more permissive at `MatchK=10` than at the population it was
+  calibrated against. Revisit when a correspondence population large enough to
+  calibrate at `MatchK=10` exists.
 - **Open scratch archive…**, beside the normal asset picker on both the primary and
   second-bank slots, loads a saved `USuperFAISSScratchBank` archive file directly (the
   same format `SaveToBytes`/`LoadFromBytes` round-trip) as a transient inspection
@@ -413,9 +425,9 @@ The stripped plugin compiles and the non-demo test groups pass unchanged.
 
 ## Tests
 
-`SuperFAISS.*` automation tests (113 in this plugin — every registered
+`SuperFAISS.*` automation tests (119 in this plugin — every registered
 `IMPLEMENT_*_AUTOMATION_TEST`, run `Session > Automation` in the editor to see the
-current count; 117 with the MCP plugin enabled)
+current count; 123 with the MCP plugin enabled)
 cover kernel correctness, SIMD/scalar mirror equality, determinism, tie-break
 stability, concurrency, asset round-trips, import rejection, quantizer recall,
 performance guards, query composition (centroid, direction, intersection, margins),
